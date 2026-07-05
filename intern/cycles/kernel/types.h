@@ -83,6 +83,8 @@ enum PathTraceDimension {
   PRNG_SURFACE_AO = 4,
   PRNG_SURFACE_BEVEL = 5,
   PRNG_SURFACE_BSDF_GUIDING = 6,
+  /* Falcon Dispersion wavelength sample (free slot in the surface block). */
+  PRNG_SURFACE_DISPERSION = 7,
 
   /* Guiding RIS */
   PRNG_SURFACE_RIS_GUIDING_0 = 10,

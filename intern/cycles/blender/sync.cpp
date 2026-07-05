@@ -2,6 +2,11 @@
  *
  * SPDX-License-Identifier: Apache-2.0 */
 
+#ifdef WITH_FALCON_SHARC
+#  include <cstdlib>
+#  include <cstring>
+#endif
+
 #include "BKE_appdir.hh"
 #include "DEG_depsgraph_query.hh"
 #include "DNA_world_types.h"
@@ -846,6 +851,46 @@ void BlenderSync::sync_render_passes(blender::RenderLayer &b_rlay,
   }
 
   scene->film->set_pass_alpha_threshold(b_view_layer.pass_alpha_threshold);
+
+#ifdef WITH_FALCON_SHARC
+  /* Falcon SHARC warmup/live deposit into the cache using the Position pass, so
+   * force it on for those modes regardless of the view layer's pass settings
+   * (otherwise the deposit silently finds no Position pass and does nothing).
+   * Only add it if the render layer did not already request it. */
+  {
+    const char *mode = getenv("FALCON_SHARC_MODE");
+    if (mode && (strcmp(mode, "warmup") == 0 || strcmp(mode, "live") == 0)) {
+      bool has_position = false;
+      for (const Pass *pass : scene->passes) {
+        if (pass->get_type() == PASS_POSITION) {
+          has_position = true;
+          break;
+        }
+      }
+      if (!has_position) {
+        pass_add(scene, PASS_POSITION, "Position");
+      }
+      /* Also force the Diffuse Direct/Indirect passes so warmup can measure the
+       * scene's GI dominance (indirect / (direct + indirect)) and auto-gate the
+       * SHARC blend: SHARC helps GI-dominated scenes but hurts direct-lit ones. */
+      bool has_diff_dir = false, has_diff_ind = false;
+      for (const Pass *pass : scene->passes) {
+        if (pass->get_type() == PASS_DIFFUSE_DIRECT) {
+          has_diff_dir = true;
+        }
+        else if (pass->get_type() == PASS_DIFFUSE_INDIRECT) {
+          has_diff_ind = true;
+        }
+      }
+      if (!has_diff_dir) {
+        pass_add(scene, PASS_DIFFUSE_DIRECT, "Diffuse Direct");
+      }
+      if (!has_diff_ind) {
+        pass_add(scene, PASS_DIFFUSE_INDIRECT, "Diffuse Indirect");
+      }
+    }
+  }
+#endif
 }
 
 void BlenderSync::free_data_after_sync(blender::Depsgraph &b_depsgraph)

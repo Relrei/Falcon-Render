@@ -82,6 +82,7 @@ set(ADDON_FILES
   addon/camera.py
   addon/engine.py
   addon/operators.py
+  addon/falcon_photon.py
   addon/osl.py
   addon/presets.py
   addon/properties.py

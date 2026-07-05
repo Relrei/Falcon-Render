@@ -54,6 +54,12 @@ function(cuda_add_common_flags cuda_version arch in_flags out_flags)
     set(flags ${flags} -D WITH_NANOVDB)
   endif()
 
+  # Falcon SHARC changes the KernelIntegrator layout, so the build-time cubin must
+  # be compiled with the same define as the host or KernelParams sizes mismatch.
+  if(WITH_FALCON_SHARC)
+    set(flags ${flags} -D WITH_FALCON_SHARC)
+  endif()
+
   if("${cuda_version}" GREATER_EQUAL 123 AND "${arch}" STREQUAL "sm_120")
     # Enable jump table generation for the SVM switch statement.
     set(flags ${flags} --jump-table-density 80)

@@ -82,6 +82,79 @@ ccl_device bool integrator_init_from_camera(KernelGlobals kg,
   /* Initialize random number seed for path. */
   const uint rng_pixel = path_rng_pixel_init(kg, sample, x, y);
 
+#ifdef __FALCON_SHARC__
+  /* Falcon Photon bake pass: this "render" traces light-emitted photons
+   * instead of camera rays; shade_surface deposits them into the photon cache
+   * at their first diffuse hit. The film output is discarded by the driver. */
+  if (kernel_data.integrator.falcon_photon_pass) {
+    /* White-noise emission RNG: the low-discrepancy pattern quantizes across
+     * pixels at sample 0 (measured: 16.7M photons collapsed onto 37k cells),
+     * photons need plain independent uniforms. */
+    const float2 rp = make_float2(hash_uint3_to_float(x, y, 0x51ab3f27u ^ sample),
+                                  hash_uint3_to_float(x, y, 0x9e3779b9u ^ sample));
+    const float2 rd = make_float2(hash_uint3_to_float(y, x, 0x85ebca6bu ^ sample),
+                                  hash_uint3_to_float(y, x, 0xc2b2ae35u ^ sample));
+    Ray pray;
+    if (kernel_data.integrator.falcon_photon_is_sun) {
+      const ccl_global KernelLight *klight = &kernel_data_fetch(lights, 0);
+      pray.P = make_float3(
+          kernel_data.integrator.falcon_photon_sun_minx +
+              rp.x * kernel_data.integrator.falcon_photon_sun_sizex,
+          kernel_data.integrator.falcon_photon_sun_miny +
+              rp.y * kernel_data.integrator.falcon_photon_sun_sizey,
+          kernel_data.integrator.falcon_photon_sun_z);
+      /* For distant lights co already holds the travel direction (light.cpp
+       * stores -Z of the lamp transform). */
+      pray.D = normalize(klight->co);
+    }
+    else if (kernel_data.integrator.falcon_photon_is_spot) {
+      /* Spot: uniform solid-angle sampling of the cone around spot.dir.
+       * cos(theta) = lerp(1, cos_half, u) is exactly uniform over the cap. */
+      const ccl_global KernelLight *klight = &kernel_data_fetch(lights, 0);
+      /* spot.dir = the light's travel direction (light.cpp stores -Z of the
+       * lamp transform), so photons emit straight along it. */
+      const float3 n = klight->spot.dir;
+      const float cos_theta = 1.0f - rd.x * (1.0f - klight->spot.cos_half_spot_angle);
+      const float sin_theta = sqrtf(max(1.0f - cos_theta * cos_theta, 0.0f));
+      const float phi = M_2PI_F * rd.y;
+      float3 t, b;
+      make_orthonormals(n, &t, &b);
+      pray.P = klight->co;
+      pray.D = normalize(t * (sin_theta * cosf(phi)) + b * (sin_theta * sinf(phi)) +
+                         n * cos_theta);
+    }
+    else {
+      const ccl_global KernelLight *klight = &kernel_data_fetch(lights, 0);
+      const float3 n = klight->area.dir;
+      pray.P = klight->co +
+               klight->area.axis_u * ((rp.x - 0.5f) * klight->area.len_u) +
+               klight->area.axis_v * ((rp.y - 0.5f) * klight->area.len_v) + n * 1e-4f;
+      /* Cosine-hemisphere emission: matches a Lambertian emitter, so every
+       * photon carries equal flux. */
+      float3 t, b;
+      make_orthonormals(n, &t, &b);
+      const float r = sqrtf(rd.x);
+      const float phi = M_2PI_F * rd.y;
+      pray.D = normalize(t * (r * cosf(phi)) + b * (r * sinf(phi)) +
+                         n * sqrtf(max(1.0f - rd.x, 0.0f)));
+    }
+    pray.tmin = 0.0f;
+    pray.tmax = FLT_MAX;
+    pray.time = 0.5f;
+    pray.self.object = OBJECT_NONE;
+    pray.self.prim = PRIM_NONE;
+    pray.self.light_object = OBJECT_NONE;
+    pray.self.light_prim = PRIM_NONE;
+    pray.dP = differential_zero_compact();
+    pray.dD = differential_zero_compact();
+    integrator_state_write_ray(state, &pray);
+    path_state_init_integrator(
+        kg, state, sample, rng_pixel, make_spectrum(kernel_data.integrator.falcon_photon_flux));
+    integrator_path_init(state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST);
+    return true;
+  }
+#endif
+
   /* Generate camera ray. */
   Ray ray;
   Spectrum T = integrate_camera_sample(kg, sample, x, y, rng_pixel, &ray);

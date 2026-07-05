@@ -32,6 +32,7 @@ if "bpy" in locals():
         importlib.reload(presets)
 
 import bpy
+import os
 
 from . import (
     engine,
@@ -41,7 +42,7 @@ from . import (
 
 class CyclesRender(bpy.types.RenderEngine):
     bl_idname = 'CYCLES'
-    bl_label = "Cycles"
+    bl_label = "CyclesF"
     bl_use_eevee_viewport = True
     bl_use_preview = True
     bl_use_exclude_layers = True
@@ -52,11 +53,35 @@ class CyclesRender(bpy.types.RenderEngine):
         super().__init__(*args, **kwargs)
         self.session = None
 
+    # Falcon: bridge the SHARC UI properties (scene.cycles.falcon_sharc_*) to the
+    # FALCON_SHARC_* environment variables the C++/kernel reads. Only in the GUI --
+    # in headless (-b) we leave the env alone so the command-line env workflow is
+    # untouched. Must run before engine.create/reset/render so the sync and
+    # integrator device_update see the values.
+    def _falcon_sharc_env_sync(self, scene):
+        if bpy.app.background:
+            return
+        cscene = getattr(scene, "cycles", None)
+        if cscene is None:
+            return
+        mode = getattr(cscene, "falcon_sharc_mode", 'OFF')
+        if mode == 'OFF':
+            os.environ.pop("FALCON_SHARC_MODE", None)
+            return
+        os.environ["FALCON_SHARC_MODE"] = mode.lower()
+        os.environ["FALCON_SHARC_ALPHA"] = "%.4f" % getattr(cscene, "falcon_sharc_alpha", 0.7)
+        os.environ["FALCON_SHARC_KEEP"] = "%.4f" % getattr(cscene, "falcon_sharc_keep", 0.95)
+        os.environ["FALCON_SHARC_GATE"] = "1" if getattr(cscene, "falcon_sharc_gate", True) else "0"
+        cache = getattr(cscene, "falcon_sharc_cache", "")
+        if cache:
+            os.environ["FALCON_SHARC_CACHE"] = bpy.path.abspath(cache)
+
     def __del__(self):
         engine.free(self)
 
     # final render
     def update(self, data, depsgraph):
+        self._falcon_sharc_env_sync(depsgraph.scene)
         if not self.session:
             if self.is_preview:
                 cscene = bpy.context.scene.cycles
@@ -69,6 +94,7 @@ class CyclesRender(bpy.types.RenderEngine):
         engine.reset(self, data, depsgraph)
 
     def render(self, depsgraph):
+        self._falcon_sharc_env_sync(depsgraph.scene)
         engine.render(self, depsgraph)
 
     def render_frame_finish(self):
@@ -82,6 +108,7 @@ class CyclesRender(bpy.types.RenderEngine):
 
     # viewport render
     def view_update(self, context, depsgraph):
+        self._falcon_sharc_env_sync(context.scene)
         if not self.session:
             # When starting a new render session in viewport (by switching
             # viewport to Rendered shading) unpause the render. The way to think

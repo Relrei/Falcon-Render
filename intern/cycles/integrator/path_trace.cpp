@@ -23,7 +23,35 @@
 #include "util/tbb.h"
 #include "util/time.h"
 
+#ifdef WITH_FALCON_SHARC
+#  include "util/hash.h"
+#  include <cmath>
+#  include <cstdint>
+#  include <cstdio>
+#  include <cstdlib>
+#  include <cstring>
+#endif
+
 CCL_NAMESPACE_BEGIN
+
+#ifdef WITH_FALCON_SHARC
+/* Host-side replica of the SHARC world-space cell hash. Must stay in sync with
+ * falcon_sharc_hash() / falcon_sharc_cell_size() in
+ * kernel/integrator/falcon_sharc.h (constant grid, cell size 0.2, 4M cells). */
+static const float FALCON_SHARC_HOST_CELL_SIZE = 0.2f;
+static const unsigned int FALCON_SHARC_HOST_CELL_COUNT = 1u << 22;
+static const unsigned int FALCON_SHARC_HOST_CELL_MASK = FALCON_SHARC_HOST_CELL_COUNT - 1u;
+static const int FALCON_SHARC_HOST_CELL_STRIDE = 4;
+
+static inline unsigned int falcon_sharc_host_hash(float px, float py, float pz)
+{
+  const float inv = 1.0f / FALCON_SHARC_HOST_CELL_SIZE;
+  const unsigned int gx = (unsigned int)((int)floorf(px * inv));
+  const unsigned int gy = (unsigned int)((int)floorf(py * inv));
+  const unsigned int gz = (unsigned int)((int)floorf(pz * inv));
+  return hash_uint3(gx, gy, gz) & FALCON_SHARC_HOST_CELL_MASK;
+}
+#endif
 
 PathTrace::PathTrace(Device *device,
                      Device *denoise_device,
@@ -213,10 +241,201 @@ void PathTrace::render_pipeline(RenderWork render_work)
     render_scheduler_.set_limit_samples_per_update(limit);
   }
 
+#ifdef WITH_FALCON_SHARC
+  /* In blend mode, load the warmup cache onto the device (read-only) before
+   * rendering so the camera-hit kernel can blend with it. In warmup mode the
+   * device cache stays zero, so the kernel blend is a no-op. */
+  {
+    const char *mode = getenv("FALCON_SHARC_MODE");
+    /* Both "blend" (offline 2-pass) and "live" (viewport temporal accumulation)
+     * seed the device cache from the file before rendering so the camera-hit
+     * kernel can blend with it. In "live" the same file is re-loaded and re-saved
+     * every refresh, so the cache accumulates across frames. */
+    if (mode && (strcmp(mode, "blend") == 0 || strcmp(mode, "live") == 0)) {
+      const char *cache_env = getenv("FALCON_SHARC_CACHE");
+      const char *cache_path = cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin";
+      float *cache = device_scene_->falcon_sharc_cache.data();
+      const size_t cache_floats = device_scene_->falcon_sharc_cache.size();
+      FILE *cf = fopen(cache_path, "rb");
+      size_t got = 0;
+      if (cf) {
+        got = fread(cache, sizeof(float), cache_floats, cf);
+        fclose(cf);
+        device_scene_->falcon_sharc_cache.copy_to_device();
+      }
+      LOG_INFO << "Falcon SHARC: loaded " << got << "/" << cache_floats
+               << " cache floats from " << cache_path << " onto device for in-kernel blend";
+    }
+  }
+#endif
+
   path_trace(render_work);
   if (render_cancel_.is_requested) {
     return;
   }
+
+#ifdef WITH_FALCON_SHARC
+  /* In warmup mode, deposit this render's converged color into the cache and save
+   * it for the blend run (the device blend was a no-op since the cache was empty).
+   * The per-pixel first-hit world position comes from the Position pass (no
+   * kernel-writable buffer, unlike the standalone 5.2 version). In blend mode
+   * there is nothing to do -- the kernel already blended into the combined pass. */
+  if (path_trace_works_.size() == 1) {
+    /* Falcon Photon GPU bake: download the cache the kernel filled and save it
+     * in the same format the host tracer writes. */
+    const char *pmode = getenv("FALCON_PHOTON_MODE");
+    LOG_INFO << "Falcon Photon: save-hook check, pmode=" << (pmode ? pmode : "null")
+             << " cache_size=" << device_scene_->falcon_sharc_cache.size();
+    if (pmode && strcmp(pmode, "bake") == 0 &&
+        device_scene_->falcon_sharc_cache.size() != 0) {
+      device_scene_->falcon_sharc_cache.copy_from_device();
+      const char *cache_env = getenv("FALCON_SHARC_CACHE");
+      const char *cache_path = cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin";
+      FILE *f = fopen(cache_path, "wb");
+      if (f) {
+        fwrite(device_scene_->falcon_sharc_cache.data(),
+               sizeof(float),
+               device_scene_->falcon_sharc_cache.size(),
+               f);
+        fclose(f);
+        LOG_INFO << "Falcon Photon: GPU-baked cache saved to " << cache_path;
+      }
+
+      /* Point map (Round 9): save the raw photon points the bake appended.
+       * Format: {magic 'FPH1', uint32 count} + count * 9 floats. Only when
+       * FALCON_PHOTON_POINTS names the output file. */
+      const char *pts_env = getenv("FALCON_PHOTON_POINTS");
+      if (pts_env && device_scene_->falcon_photon_points.size() != 0 &&
+          device_scene_->falcon_photon_pcount.size() != 0) {
+        device_scene_->falcon_photon_pcount.copy_from_device();
+        uint32_t n = device_scene_->falcon_photon_pcount.data()[0];
+        const uint32_t max_pts = (uint32_t)(device_scene_->falcon_photon_points.size() / 9);
+        if (n > max_pts) {
+          n = max_pts; /* counter keeps counting past the cap; clamp */
+        }
+        device_scene_->falcon_photon_points.copy_from_device();
+        FILE *pf = fopen(pts_env, "wb");
+        if (pf) {
+          const uint32_t header[2] = {0x46504831u, n};
+          fwrite(header, sizeof(uint32_t), 2, pf);
+          fwrite(device_scene_->falcon_photon_points.data(), sizeof(float), (size_t)n * 9, pf);
+          fclose(pf);
+          LOG_INFO << "Falcon Photon: point map saved, " << n << " points to " << pts_env;
+        }
+      }
+    }
+
+    const char *mode = getenv("FALCON_SHARC_MODE");
+    const bool is_warmup = mode && strcmp(mode, "warmup") == 0;
+    const bool is_live = mode && strcmp(mode, "live") == 0;
+    if (is_warmup || is_live) {
+      const char *cache_env = getenv("FALCON_SHARC_CACHE");
+      const char *cache_path = cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin";
+      path_trace_works_[0]->copy_render_buffers_from_device();
+      const RenderBuffers *rb = path_trace_works_[0]->get_render_buffers();
+      const BufferParams &p = rb->params;
+      const int combined_offset = p.get_pass_offset(PASS_COMBINED);
+      const int position_offset = p.get_pass_offset(PASS_POSITION);
+      if (combined_offset == PASS_UNUSED || position_offset == PASS_UNUSED) {
+        LOG_INFO << "Falcon SHARC: needs both the Combined and Position passes "
+                 << "(enable the Position pass); skipping deposit";
+      }
+      else {
+        const float *buf = rb->buffer.data();
+        float *cache = device_scene_->falcon_sharc_cache.data();
+        const size_t cache_floats = device_scene_->falcon_sharc_cache.size();
+        const int w = p.width, h = p.height, stride = p.stride;
+        const int pass_stride = p.pass_stride;
+        const int num_samples = max(render_scheduler_.get_num_rendered_samples(), 1);
+        const float inv_s = 1.0f / num_samples;
+        size_t deposited = 0;
+        if (is_warmup) {
+          /* Warmup rebuilds the cache from scratch each render. */
+          memset(cache, 0, cache_floats * sizeof(float));
+        }
+        else {
+          /* Live temporal accumulation: decay every cell once so old frames fade
+           * out with an exponential recency window (FALCON_SHARC_KEEP, default
+           * 0.9). Decaying sum and count together leaves sum/count (the estimate)
+           * unchanged but bounds how much history a cell keeps -- this is what
+           * lets a static viewport converge while a moving one still adapts. */
+          float keep = 0.9f;
+          const char *keep_env = getenv("FALCON_SHARC_KEEP");
+          if (keep_env) {
+            keep = (float)atof(keep_env);
+            keep = keep < 0.0f ? 0.0f : (keep > 1.0f ? 1.0f : keep);
+          }
+          for (size_t i = 0; i < cache_floats; i++) {
+            cache[i] *= keep;
+          }
+        }
+        for (int y = 0; y < h; y++) {
+          for (int x = 0; x < w; x++) {
+            const int idx = p.offset + x + y * stride;
+            const float *pos = buf + (size_t)idx * pass_stride + position_offset;
+            /* Position pass is overwrite (not sample-averaged); (0,0,0) means the
+             * camera ray missed all geometry, so skip it. */
+            if (pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) {
+              continue;
+            }
+            const unsigned int cell = falcon_sharc_host_hash(pos[0], pos[1], pos[2]);
+            const float *px = buf + (size_t)idx * pass_stride + combined_offset;
+            const size_t cbase = (size_t)cell * FALCON_SHARC_HOST_CELL_STRIDE;
+            cache[cbase + 0] += px[0] * inv_s;
+            cache[cbase + 1] += px[1] * inv_s;
+            cache[cbase + 2] += px[2] * inv_s;
+            cache[cbase + 3] += 1.0f;
+            deposited++;
+          }
+        }
+        if (is_live) {
+          /* Push the updated cache back so this session's next frame blends with
+           * it (the file save keeps cross-process/headless accumulation working
+           * too). */
+          device_scene_->falcon_sharc_cache.copy_to_device();
+        }
+        FILE *cf = fopen(cache_path, "wb");
+        if (cf) {
+          fwrite(cache, sizeof(float), cache_floats, cf);
+          fclose(cf);
+          LOG_INFO << "Falcon SHARC " << (is_live ? "live" : "warmup") << ": " << num_samples
+                   << " spp, deposited " << deposited << " pixels, cache " << cache_path;
+        }
+
+        /* Measure GI dominance for the auto-gate: luminance of Diffuse Indirect
+         * over Diffuse Direct + Indirect. SHARC (a radiance cache) helps when
+         * indirect light dominates and hurts direct-lit scenes (Phase0 data), so
+         * the blend run reads this ratio to scale alpha. Written as a one-float
+         * sidecar next to the cache; the blend run picks it up. */
+        const int dd_offset = p.get_pass_offset(PASS_DIFFUSE_DIRECT);
+        const int di_offset = p.get_pass_offset(PASS_DIFFUSE_INDIRECT);
+        if (dd_offset != PASS_UNUSED && di_offset != PASS_UNUSED) {
+          double sum_direct = 0.0, sum_indirect = 0.0;
+          for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+              const int idx = p.offset + x + y * stride;
+              const float *dd = buf + (size_t)idx * pass_stride + dd_offset;
+              const float *di = buf + (size_t)idx * pass_stride + di_offset;
+              /* Rec.709 luminance, scaled to converged (per-sample) value. */
+              sum_direct += (0.2126 * dd[0] + 0.7152 * dd[1] + 0.0722 * dd[2]) * inv_s;
+              sum_indirect += (0.2126 * di[0] + 0.7152 * di[1] + 0.0722 * di[2]) * inv_s;
+            }
+          }
+          const double total = sum_direct + sum_indirect;
+          const float gi_ratio = total > 1e-6 ? (float)(sum_indirect / total) : 0.0f;
+          string meta_path = string(cache_path) + ".meta";
+          FILE *mf = fopen(meta_path.c_str(), "w");
+          if (mf) {
+            fprintf(mf, "%.6f\n", gi_ratio);
+            fclose(mf);
+            LOG_INFO << "Falcon SHARC: GI ratio " << gi_ratio << " (indirect/total), "
+                     << meta_path;
+          }
+        }
+      }
+    }
+  }
+#endif
 
   /* Update the guiding field using the training data/samples collected during the rendering
    * iteration/progression. */

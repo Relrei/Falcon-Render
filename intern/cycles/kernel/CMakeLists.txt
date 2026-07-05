@@ -177,6 +177,8 @@ set(SRC_KERNEL_FILM_HEADERS
 
 set(SRC_KERNEL_INTEGRATOR_HEADERS
   integrator/displacement_shader.h
+  integrator/falcon_dispersion.h
+  integrator/falcon_sharc.h
   integrator/init_from_bake.h
   integrator/init_from_camera.h
   integrator/intersect_dedicated_light.h

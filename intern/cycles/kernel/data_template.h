@@ -229,6 +229,72 @@ KERNEL_STRUCT_MEMBER(integrator, int, use_volume_guiding)
 KERNEL_STRUCT_MEMBER(integrator, int, use_guiding_direct_light)
 KERNEL_STRUCT_MEMBER(integrator, int, use_guiding_mis_weights)
 
+/* Falcon SHARC. `falcon_sharc_active` is 1 only when FALCON_SHARC_MODE selects
+ * warmup/blend; it gates the in-kernel blend so a normal render is a complete
+ * no-op (no cache lookup at all). `falcon_sharc_alpha` is the runtime blend
+ * factor (FALCON_SHARC_ALPHA), tunable without a kernel recompile. */
+#ifdef WITH_FALCON_SHARC
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_sharc_active)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_sharc_alpha)
+/* Falcon DAS: gates the per-pixel threshold scale in the adaptive sampling
+ * convergence check. `falcon_das_strength` lerps the map's effect (0 = off,
+ * 1 = map as-is) so it can be tuned without rebuilding the map. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_das_active)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_das_strength)
+/* Falcon Photon Cache: additive caustic lookup at any surface vertex (the
+ * cache then holds photon-estimated caustic radiance, not path radiance).
+ * `falcon_sharc_cell_size` makes the grid resolution a runtime knob shared by
+ * SHARC and the photon cache (FALCON_SHARC_CELL, default 0.2). */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_add)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_sharc_cell_size)
+/* Falcon Photon GPU bake pass: camera rays are replaced by light-emitted
+ * photons that deposit caustic radiance into the (const-cast) sharc cache at
+ * their first diffuse hit. flux = per-photon power (host: light watts * k /
+ * photon count). Sun photons launch as parallel rays over the scene-footprint
+ * rectangle at z = sun_z. 8 members keep the falcon block a multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_pass)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_flux)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_is_sun)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_minx)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_miny)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_sizex)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_sizey)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_z)
+/* Falcon Dispersion v0: global Cauchy-B strength (um^2) applied to every
+ * smooth refractive microfacet closure; 0 disables (FALCON_DISPERSION.md).
+ * Paired with falcon_pad0 to keep the falcon block a multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_dispersion_b)
+/* Falcon Photon map: caustic deposit radius in cells (fixed-radius kernel
+ * density estimation; 0/1 = legacy 2x2x2 splat). Wider = smoother caustics
+ * from fewer photons, at more deposits/photon during the bake. */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_radius)
+/* Falcon Photon POINT map (Round 9, LuxCore-faithful): photons stored as raw
+ * points (pos/flux/normal), density estimated at lookup over a host-built
+ * neighbor grid. point_store gates the bake-time append; point_mode gates the
+ * add-time gather. radius (m), cos (normal-angle rejection) and gain are
+ * RENDER-TIME knobs -- retuning them never needs a rebake. 8 members keep the
+ * falcon block a multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_point_store)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_point_max)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_point_mode)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_point_radius)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_point_cos)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_point_gain)
+/* Spot photon emission: is_spot selects cone emission from the light origin
+ * (uniform in solid angle; flux = watts * Omega/(4 pi) / N, i.e. the point
+ * light's intensity W/(4 pi) integrated over the cone). */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_is_spot)
+/* Falcon Light Tracing (FQ, cache-free caustics): when set, the photon bake
+ * pass splats the first-diffuse-hit flux DIRECTLY to the camera pixel (project
+ * + connect) instead of depositing into the map. gain is a labeled brightness
+ * knob until the camera importance We is calibrated. 4 members keep the block a
+ * multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lighttrace)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_lighttrace_gain)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_direct)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_samples)
+#endif
+
 /* Padding. */
 KERNEL_STRUCT_MEMBER(integrator, int, pad1)
 KERNEL_STRUCT_MEMBER(integrator, int, pad2)

@@ -386,6 +386,12 @@ if(WITH_CYCLES_DEBUG_NAN)
   add_definitions(-DWITH_CYCLES_DEBUG_NAN)
 endif()
 
+# Falcon experimental spatial hash radiance cache (read-only cache + in-kernel blend).
+option(WITH_FALCON_SHARC "Enable Falcon experimental spatial hash radiance cache" OFF)
+if(WITH_FALCON_SHARC)
+  add_definitions(-DWITH_FALCON_SHARC)
+endif()
+
 if(WITH_PUGIXML OR OPENIMAGEIO_PUGIXML_FOUND)
   add_definitions(-DWITH_PUGIXML)
   if((NOT OPENIMAGEIO_PUGIXML_FOUND) OR WIN32)

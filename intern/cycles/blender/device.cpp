@@ -108,8 +108,23 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
   preferences_device = cpu_device;
 
   /* Test if we are using GPU devices. */
-  const ComputeDevice compute_device = (ComputeDevice)get_enum(
+  ComputeDevice compute_device = (ComputeDevice)get_enum(
       cpreferences, "compute_device_type", COMPUTE_DEVICE_NUM, COMPUTE_DEVICE_CPU);
+
+  /* Falcon: OptiX x Vulkan viewport interop is broken in this environment (gray
+   * viewport, crash when switching device). Keep all interactive work -- viewport
+   * "Rendered" shading and material previews -- on CUDA, and reserve OptiX for the
+   * final (background) render where it is ~1.35x faster. This lets the user set
+   * OptiX as the default device and have both paths just work. Opt back in to
+   * OptiX for the viewport with FALCON_VIEWPORT_OPTIX=1. */
+  bool falcon_viewport_downgrade = false;
+  if (compute_device == COMPUTE_DEVICE_OPTIX && !background) {
+    const char *force = getenv("FALCON_VIEWPORT_OPTIX");
+    if (!(force && force[0] == '1')) {
+      compute_device = COMPUTE_DEVICE_CUDA;
+      falcon_viewport_downgrade = true;
+    }
+  }
 
   if (compute_device != COMPUTE_DEVICE_CPU) {
     /* Query GPU devices with matching types. */
@@ -149,6 +164,19 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
       }
     }
     blender::RNA_property_collection_end(&rna_iter);
+
+    /* Falcon: when we downgraded OptiX->CUDA for the viewport, the user has the
+     * OptiX device entries enabled in preferences, not the CUDA ones, so the
+     * match above yields nothing and we would silently fall back to CPU. Use
+     * every available CUDA GPU instead (correct on a single-GPU machine, a sane
+     * default otherwise). */
+    if (falcon_viewport_downgrade && used_devices.empty()) {
+      for (const DeviceInfo &info : devices) {
+        if (info.type != DEVICE_CPU) {
+          used_devices.push_back(info);
+        }
+      }
+    }
 
     if (!used_devices.empty()) {
       const int threads = blender_device_threads(b_scene);

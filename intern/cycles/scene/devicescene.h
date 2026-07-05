@@ -91,6 +91,21 @@ class DeviceScene {
   device_vector<int> volume_tree_root_ids;
   device_vector<float> volume_step_size;
 
+  /* Falcon SHARC read-only radiance cache (host-filled during warmup). */
+  device_vector<float> falcon_sharc_cache;
+
+  /* Falcon Photon point map (Round 9): raw photon points + append counter
+   * (bake), and the host-built neighbor grid (add-mode lookup). */
+  device_vector<float> falcon_photon_points;
+  device_vector<uint> falcon_photon_pcount;
+  device_vector<uint> falcon_photon_grid_start;
+  device_vector<uint> falcon_photon_grid_count;
+  device_vector<uint> falcon_photon_index;
+
+  /* Falcon DAS per-pixel adaptive-threshold scale map (host-loaded from
+   * FALCON_DAS_MAP, built by the OIDN probe script). */
+  device_vector<float> falcon_das_scale;
+
   KernelData data;
 
   DeviceScene(Device *device);

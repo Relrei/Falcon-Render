@@ -129,20 +129,26 @@ static void blender_version_init()
 
   const char *version_suffix = BKE_blender_version_is_lts() ? " LTS" : "";
 
+  /* Falcon custom build tag so the modified Blender is identifiable at a glance
+   * (version reads e.g. "5.1.2.C1" instead of stock "5.1.2"). */
+  const char *falcon_custom_tag = ".C1";
+
   SNPRINTF_UTF8(blender_version_string,
-                "%d.%01d.%d%s%s",
+                "%d.%01d.%d%s%s%s",
                 BLENDER_VERSION / 100,
                 BLENDER_VERSION % 100,
                 BLENDER_VERSION_PATCH,
                 version_suffix,
-                version_cycle);
+                version_cycle,
+                falcon_custom_tag);
 
   SNPRINTF_UTF8(blender_version_string_compact,
-                "%d.%01d.%d%s",
+                "%d.%01d.%d%s%s",
                 BLENDER_VERSION / 100,
                 BLENDER_VERSION % 100,
                 BLENDER_VERSION_PATCH,
-                version_cycle_compact);
+                version_cycle_compact,
+                falcon_custom_tag);
 }
 
 const char *BKE_blender_version_string()

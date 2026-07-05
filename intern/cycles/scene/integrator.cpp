@@ -4,6 +4,14 @@
 
 #include "device/device.h"
 
+#ifdef WITH_FALCON_SHARC
+#  include <cmath>
+#  include <cstdio>
+#  include <cstdlib>
+#  include <cstring>
+#  include <vector>
+#endif
+
 #include "scene/background.h"
 #include "scene/bake.h"
 #include "scene/camera.h"
@@ -350,12 +358,513 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
   kintegrator->has_shadow_catcher = scene->has_shadow_catcher();
 
   dscene->sample_pattern_lut.clear_modified();
+
+#ifdef WITH_FALCON_SHARC
+  /* Falcon SHARC is only active when FALCON_SHARC_MODE selects warmup or blend.
+   * Everything below is gated on this so a normal render pays nothing: no 64 MB
+   * cache allocation and (via falcon_sharc_active) no in-kernel cache lookup. */
+  {
+    const char *mode = getenv("FALCON_SHARC_MODE");
+    const bool sharc_active = mode &&
+                              (strcmp(mode, "warmup") == 0 || strcmp(mode, "blend") == 0 ||
+                               strcmp(mode, "live") == 0);
+    kintegrator->falcon_sharc_active = sharc_active ? 1 : 0;
+
+    /* Grid resolution shared by SHARC and the photon cache. Runtime knob so
+     * caustic-scale grids (0.05-0.1) need no rebuild; must match the cell
+     * size the host tracer used when depositing. */
+    float cell = 0.2f;
+    const char *cell_env = getenv("FALCON_SHARC_CELL");
+    if (cell_env) {
+      cell = (float)atof(cell_env);
+      cell = cell > 1e-4f ? cell : 0.2f;
+    }
+    kintegrator->falcon_sharc_cell_size = cell;
+
+    /* Falcon Dispersion v0: global on-demand spectral knob. Cauchy B in um^2
+     * (BK7 0.0042 / flint 0.013 / movie 0.030); 0 = off, zero overhead. */
+    float dispersion_b = 0.0f;
+    const char *dispersion_env = getenv("FALCON_DISPERSION_B");
+    if (dispersion_env) {
+      dispersion_b = (float)atof(dispersion_env);
+      dispersion_b = dispersion_b > 0.0f ? dispersion_b : 0.0f;
+    }
+    kintegrator->falcon_dispersion_b = dispersion_b;
+
+    /* Falcon Photon map deposit radius (cells). FALCON_PHOTON_RADIUS, default 3
+     * = kernel density estimation footprint; <=1 falls back to the 2x2x2 splat. */
+    float photon_radius = 3.0f;
+    const char *pradius_env = getenv("FALCON_PHOTON_RADIUS");
+    if (pradius_env) {
+      const float pr = (float)atof(pradius_env);
+      photon_radius = pr > 0.0f ? pr : 3.0f;
+    }
+    kintegrator->falcon_photon_radius = photon_radius;
+
+    /* Falcon Photon Cache: FALCON_PHOTON_MODE=add + FALCON_SHARC_CACHE file
+     * (written by tools/falcon_photon_trace.py). Loads into the same buffer as
+     * SHARC -- the two modes share storage and are not meant to run together. */
+    kintegrator->falcon_photon_add = 0;
+    kintegrator->falcon_photon_pass = 0;
+    kintegrator->falcon_photon_point_store = 0;
+    kintegrator->falcon_photon_point_mode = 0;
+    kintegrator->falcon_photon_point_max = 0;
+    kintegrator->falcon_photon_point_gain = 1.0f;
+    kintegrator->falcon_lighttrace = 0;
+    kintegrator->falcon_lighttrace_gain = 1.0f;
+    kintegrator->falcon_lt_direct = 0;
+    kintegrator->falcon_lt_samples = 1;
+    const char *photon_mode = getenv("FALCON_PHOTON_MODE");
+
+    /* Falcon Light Tracing (FQ): FALCON_PHOTON_MODE=bake + FALCON_LIGHTTRACE=1.
+     * The bake pass, instead of depositing, projects the first diffuse caustic
+     * hit to the camera and splats (see falcon_lighttrace.h). The bake operator
+     * renders at CAMERA resolution and keeps the film. GAIN is a labeled knob
+     * until the camera importance We is calibrated. */
+    if (getenv("FALCON_LIGHTTRACE") && strcmp(getenv("FALCON_LIGHTTRACE"), "1") == 0) {
+      kintegrator->falcon_lighttrace = 1;
+      const char *ltg = getenv("FALCON_LIGHTTRACE_GAIN");
+      kintegrator->falcon_lighttrace_gain = ltg ? (float)atof(ltg) : 1.0f;
+      /* FALCON_LT_DIRECT=1 also splats the bounce-0 direct diffuse hit (not a
+       * caustic) so its floor radiance can be matched to E*albedo/pi -- the
+       * absolute-brightness calibration control. Off for real caustic renders. */
+      kintegrator->falcon_lt_direct = getenv("FALCON_LT_DIRECT") ? 1 : 0;
+      /* SPP of the driving render: the splat is multiplied by it to cancel the
+       * combined pass's /sample_count divide (see falcon_lighttrace.h). Must
+       * match cs.samples; fixed (non-adaptive) sampling only. */
+      const char *lts = getenv("FALCON_LIGHTTRACE_SAMPLES");
+      kintegrator->falcon_lt_samples = lts ? atoi(lts) : 1;
+    }
+
+    /* GPU photon bake: the render becomes a photon pass (init_from_camera
+     * emits from the first light, shade_surface deposits into the cache,
+     * path_trace saves it). FALCON_PHOTON_N = total photons (pixels*samples of
+     * the driving render), FALCON_PHOTON_GAIN = calibration knob. */
+    Light *photon_light = nullptr;
+    Object *photon_light_ob = nullptr;
+    if (photon_mode && strcmp(photon_mode, "bake") == 0) {
+      for (Object *ob : scene->objects) {
+        if (ob->get_geometry() && ob->get_geometry()->is_light()) {
+          Light *l = static_cast<Light *>(ob->get_geometry());
+          if (l->get_is_enabled()) {
+            photon_light = l;
+            photon_light_ob = ob;
+            break;
+          }
+        }
+      }
+    }
+    /* Multi-light bake (operators.py): each light gets its own fully independent
+     * bake call (separate cache/point files); the host merges the resulting
+     * files afterward. An earlier attempt kept ONE device buffer alive across
+     * repeated bpy.ops.render.render() calls (skipping the reset below on all
+     * but the first light) to accumulate on-device -- this reliably crashed
+     * the CUDA queue on the second render call ("Illegal address ... in
+     * integrator_sorted_paths_array"), so device_vector state apparently isn't
+     * safe to keep across separate render invocations. File-level merging
+     * avoids touching that lifecycle at all. Kept as `false` rather than
+     * removed so the reset logic stays in one place if revisited. */
+    const bool accumulate = false;
+    if (photon_light) {
+      const size_t floats = (size_t(1) << 22) * 4;
+      if (dscene->falcon_sharc_cache.size() != floats) {
+        if (dscene->falcon_sharc_cache.size() != 0) {
+          dscene->falcon_sharc_cache.free();
+        }
+        dscene->falcon_sharc_cache.alloc(floats);
+      }
+      if (!accumulate) {
+        memset(dscene->falcon_sharc_cache.data(), 0, floats * sizeof(float));
+        dscene->falcon_sharc_cache.copy_to_device();
+      }
+      dscene->falcon_sharc_cache.clear_modified();
+
+      Light *light = photon_light;
+      const float3 strength = light->get_strength();
+      const float watts = (strength.x + strength.y + strength.z) / 3.0f;
+      double n_photons = 1e6;
+      const char *n_env = getenv("FALCON_PHOTON_N");
+      if (n_env) {
+        n_photons = atof(n_env);
+      }
+      float gain = 1.0f;
+      const char *gain_env = getenv("FALCON_PHOTON_GAIN");
+      if (gain_env) {
+        gain = (float)atof(gain_env);
+      }
+      kintegrator->falcon_photon_pass = 1;
+      kintegrator->falcon_photon_is_sun = (light->get_light_type() == LIGHT_DISTANT) ? 1 : 0;
+      kintegrator->falcon_photon_is_spot = (light->get_light_type() == LIGHT_SPOT) ? 1 : 0;
+      kintegrator->falcon_photon_flux = (float)(watts * gain / n_photons);
+
+      if (kintegrator->falcon_photon_is_spot) {
+        /* Blender spot = point light (intensity W / 4 pi) clipped to the cone,
+         * so the power actually leaving through the cone is W * Omega/(4 pi),
+         * Omega = 2 pi (1 - cos(half angle)). Uniform cone sampling in the
+         * kernel then gives every photon equal flux. */
+        const float cos_half = cosf(light->get_spot_angle() * 0.5f);
+        const float omega = M_2PI_F * (1.0f - cos_half);
+        kintegrator->falcon_photon_flux = (float)(watts * (omega / (4.0f * M_PI_F)) * gain /
+                                                  n_photons);
+      }
+
+      if (kintegrator->falcon_photon_is_sun) {
+        /* Parallel photons over the scene footprint. */
+        BoundBox bbox = BoundBox::empty;
+        for (Object *ob : scene->objects) {
+          if (ob->get_geometry() && ob->bounds.valid()) {
+            bbox.grow(ob->bounds);
+          }
+        }
+        if (bbox.valid()) {
+          kintegrator->falcon_photon_sun_minx = bbox.min.x;
+          kintegrator->falcon_photon_sun_miny = bbox.min.y;
+          kintegrator->falcon_photon_sun_sizex = bbox.max.x - bbox.min.x;
+          kintegrator->falcon_photon_sun_sizey = bbox.max.y - bbox.min.y;
+          kintegrator->falcon_photon_sun_z = bbox.max.z + 1.0f;
+          /* Sun energy is irradiance; power over the footprint = E*cos*A.
+           * The emission direction is the light object's -Z axis. */
+          const Transform tfm = photon_light_ob->get_tfm();
+          const float3 dir = -transform_get_column(&tfm, 2);
+          const float3 ndir = normalize(dir);
+          const float cos_zen = fabsf(ndir.z);
+
+          /* FALCON_PHOTON_TARGET="cx,cy,cz,r": shrink the launch square to the
+           * specular targets' bounding sphere instead of the whole scene
+           * footprint (a 40 m floor wastes 99.9% of the photons on direct
+           * floor hits that never deposit -- the GPU twin of the CPU tracer's
+           * Round 8 sun fix). The sphere center is projected UP the sun
+           * direction onto the launch plane so diagonal travel still hits it,
+           * and the radius is stretched by 1/cos_zen (slanted footprint of a
+           * sphere) plus 15% margin. Host-only: the kernel still launches from
+           * an axis-aligned horizontal square. */
+          const char *tgt_env = getenv("FALCON_PHOTON_TARGET");
+          float tc[4];
+          if (tgt_env && ndir.z < -0.05f &&
+              sscanf(tgt_env, "%f,%f,%f,%f", &tc[0], &tc[1], &tc[2], &tc[3]) == 4) {
+            const float t_up = (kintegrator->falcon_photon_sun_z - tc[2]) / (-ndir.z);
+            const float cx = tc[0] - ndir.x * t_up;
+            const float cy = tc[1] - ndir.y * t_up;
+            const float pad = tc[3] * 1.15f / cos_zen;
+            kintegrator->falcon_photon_sun_minx = cx - pad;
+            kintegrator->falcon_photon_sun_miny = cy - pad;
+            kintegrator->falcon_photon_sun_sizex = 2.0f * pad;
+            kintegrator->falcon_photon_sun_sizey = 2.0f * pad;
+            LOG_INFO << "Falcon Photon: sun launch targeted at (" << tc[0] << ", " << tc[1]
+                     << ", " << tc[2] << ") r " << tc[3] << ", pad " << pad;
+          }
+
+          const float area = kintegrator->falcon_photon_sun_sizex *
+                             kintegrator->falcon_photon_sun_sizey;
+          kintegrator->falcon_photon_flux = (float)(watts * cos_zen * area * gain / n_photons);
+        }
+      }
+      LOG_INFO << "Falcon Photon: GPU bake pass, flux/photon "
+               << kintegrator->falcon_photon_flux << " sun " << kintegrator->falcon_photon_is_sun;
+
+      /* Point map (Round 9): allocate the raw-photon append buffer + counter.
+       * FALCON_PHOTON_MAXPTS caps it (default 12M points = 432 MB); 0 disables
+       * point storage (grid-only bake). Contents beyond the counter are never
+       * read, so no zeroing of the point buffer itself. */
+      int max_pts = 12000000;
+      const char *maxpts_env = getenv("FALCON_PHOTON_MAXPTS");
+      if (maxpts_env) {
+        max_pts = atoi(maxpts_env);
+      }
+      if (max_pts > 0) {
+        const size_t pfloats = (size_t)max_pts * 9;
+        const bool points_realloc = dscene->falcon_photon_points.size() != pfloats;
+        if (points_realloc) {
+          if (dscene->falcon_photon_points.size() != 0) {
+            dscene->falcon_photon_points.free();
+          }
+          dscene->falcon_photon_points.alloc(pfloats);
+        }
+        if (!accumulate || points_realloc) {
+          /* Skipped when accumulating into an existing device buffer: the host
+           * copy is stale (photon deposits only ever land device-side), so
+           * uploading it here would overwrite the previous light's points with
+           * whatever garbage/zeros the host array holds. */
+          dscene->falcon_photon_points.copy_to_device();
+        }
+        dscene->falcon_photon_points.clear_modified();
+        if (dscene->falcon_photon_pcount.size() != 1) {
+          if (dscene->falcon_photon_pcount.size() != 0) {
+            dscene->falcon_photon_pcount.free();
+          }
+          dscene->falcon_photon_pcount.alloc(1);
+        }
+        if (!accumulate) {
+          dscene->falcon_photon_pcount.data()[0] = 0;
+          dscene->falcon_photon_pcount.copy_to_device();
+        }
+        dscene->falcon_photon_pcount.clear_modified();
+        kintegrator->falcon_photon_point_store = 1;
+        kintegrator->falcon_photon_point_max = max_pts;
+        LOG_INFO << "Falcon Photon: point buffer ready, cap " << max_pts << " points"
+                 << (accumulate ? " (accumulating)" : "");
+      }
+    }
+    if (photon_mode && strcmp(photon_mode, "add") == 0 && !sharc_active) {
+      /* Point map (Round 9) takes priority: FALCON_PHOTON_POINTS file =
+       * header {magic 'FPH1', uint32 count} + count * 9 floats (pos3, flux3,
+       * normal3). The neighbor grid is rebuilt here every scene update, so the
+       * lookup radius is a pure render-time knob. */
+      const char *pts_env = getenv("FALCON_PHOTON_POINTS");
+      FILE *pf = pts_env ? fopen(pts_env, "rb") : nullptr;
+      if (pf) {
+        uint32_t header[2] = {0, 0};
+        size_t count = 0;
+        if (fread(header, sizeof(uint32_t), 2, pf) == 2 && header[0] == 0x46504831u) {
+          count = header[1];
+        }
+        if (count > 0) {
+          const size_t pfloats = count * 9;
+          if (dscene->falcon_photon_points.size() != pfloats) {
+            if (dscene->falcon_photon_points.size() != 0) {
+              dscene->falcon_photon_points.free();
+            }
+            dscene->falcon_photon_points.alloc(pfloats);
+          }
+          float *pts = dscene->falcon_photon_points.data();
+          if (fread(pts, sizeof(float), pfloats, pf) == pfloats) {
+            float radius = 0.03f;
+            const char *radius_env = getenv("FALCON_PHOTON_RADIUS_M");
+            if (radius_env) {
+              radius = (float)atof(radius_env);
+            }
+            radius = radius > 1e-4f ? radius : 1e-4f;
+            float normal_deg = 30.0f;
+            const char *ndeg_env = getenv("FALCON_PHOTON_NORMAL_DEG");
+            if (ndeg_env) {
+              normal_deg = (float)atof(ndeg_env);
+            }
+            float gain = 1.0f;
+            const char *gain_env2 = getenv("FALCON_PHOTON_GAIN");
+            if (gain_env2) {
+              gain = (float)atof(gain_env2);
+            }
+
+            /* Counting sort of photon indices into the uniform neighbor grid
+             * (cell = radius; slot = hash_uint3 of cell coords). */
+            const uint32_t GRID = 1u << 22;
+            const uint32_t MASK = GRID - 1u;
+            std::vector<uint32_t> keys(count);
+            const float inv = 1.0f / radius;
+            for (size_t i = 0; i < count; i++) {
+              const float *p = pts + i * 9;
+              const uint gx = (uint)((int)floorf(p[0] * inv));
+              const uint gy = (uint)((int)floorf(p[1] * inv));
+              const uint gz = (uint)((int)floorf(p[2] * inv));
+              keys[i] = hash_uint3(gx, gy, gz) & MASK;
+            }
+            if (dscene->falcon_photon_grid_start.size() != GRID) {
+              if (dscene->falcon_photon_grid_start.size() != 0) {
+                dscene->falcon_photon_grid_start.free();
+                dscene->falcon_photon_grid_count.free();
+              }
+              dscene->falcon_photon_grid_start.alloc(GRID);
+              dscene->falcon_photon_grid_count.alloc(GRID);
+            }
+            uint *gstart = dscene->falcon_photon_grid_start.data();
+            uint *gcount = dscene->falcon_photon_grid_count.data();
+            memset(gcount, 0, GRID * sizeof(uint));
+            for (size_t i = 0; i < count; i++) {
+              gcount[keys[i]]++;
+            }
+            uint32_t run = 0;
+            for (uint32_t k = 0; k < GRID; k++) {
+              gstart[k] = run;
+              run += gcount[k];
+            }
+            if (dscene->falcon_photon_index.size() != count) {
+              if (dscene->falcon_photon_index.size() != 0) {
+                dscene->falcon_photon_index.free();
+              }
+              dscene->falcon_photon_index.alloc(count);
+            }
+            uint *gindex = dscene->falcon_photon_index.data();
+            std::vector<uint32_t> cursor(gstart, gstart + GRID);
+            for (size_t i = 0; i < count; i++) {
+              gindex[cursor[keys[i]]++] = (uint32_t)i;
+            }
+
+            dscene->falcon_photon_points.copy_to_device();
+            dscene->falcon_photon_points.clear_modified();
+            dscene->falcon_photon_grid_start.copy_to_device();
+            dscene->falcon_photon_grid_start.clear_modified();
+            dscene->falcon_photon_grid_count.copy_to_device();
+            dscene->falcon_photon_grid_count.clear_modified();
+            dscene->falcon_photon_index.copy_to_device();
+            dscene->falcon_photon_index.clear_modified();
+
+            kintegrator->falcon_photon_add = 1;
+            kintegrator->falcon_photon_point_mode = 1;
+            kintegrator->falcon_photon_point_radius = radius;
+            kintegrator->falcon_photon_point_cos = cosf(normal_deg * (float)M_PI / 180.0f);
+            kintegrator->falcon_photon_point_gain = gain;
+            LOG_INFO << "Falcon Photon: point map loaded, " << count << " points from "
+                     << pts_env << " (radius " << radius << " m, normal " << normal_deg
+                     << " deg, gain " << gain << ")";
+          }
+        }
+        fclose(pf);
+      }
+
+      if (!kintegrator->falcon_photon_point_mode) {
+        const char *cache_env = getenv("FALCON_SHARC_CACHE");
+        const char *path = cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin";
+        FILE *f = fopen(path, "rb");
+        if (f) {
+          const size_t floats = (size_t(1) << 22) * 4;
+          if (dscene->falcon_sharc_cache.size() != floats) {
+            if (dscene->falcon_sharc_cache.size() != 0) {
+              dscene->falcon_sharc_cache.free();
+            }
+            dscene->falcon_sharc_cache.alloc(floats);
+          }
+          if (fread(dscene->falcon_sharc_cache.data(), sizeof(float), floats, f) == floats) {
+            dscene->falcon_sharc_cache.copy_to_device();
+            dscene->falcon_sharc_cache.clear_modified();
+            kintegrator->falcon_photon_add = 1;
+            LOG_INFO << "Falcon Photon: additive caustic cache loaded from " << path
+                     << " (cell " << cell << ")";
+          }
+          fclose(f);
+        }
+      }
+    }
+
+    if (sharc_active) {
+      /* Allocate and zero the spatial hash radiance cache. Size must match
+       * FALCON_SHARC_CELL_COUNT * FALCON_SHARC_CELL_STRIDE in
+       * kernel/integrator/falcon_sharc.h (4M cells * 4 floats = 64 MB). Read-only
+       * from the kernel; the host fills it during the warmup pass. */
+      const size_t falcon_sharc_floats = (size_t(1) << 22) * 4;
+      if (dscene->falcon_sharc_cache.size() != falcon_sharc_floats) {
+        if (dscene->falcon_sharc_cache.size() != 0) {
+          dscene->falcon_sharc_cache.free();
+        }
+        float *cache = (float *)dscene->falcon_sharc_cache.alloc(falcon_sharc_floats);
+        memset(cache, 0, falcon_sharc_floats * sizeof(float));
+        dscene->falcon_sharc_cache.copy_to_device();
+      }
+      dscene->falcon_sharc_cache.clear_modified();
+
+      /* Blend factor: runtime knob via FALCON_SHARC_ALPHA (default 0.7, clamped
+       * to [0,1]). Uploaded in kernel_data so tuning needs no recompile. */
+      float alpha = 0.7f;
+      const char *alpha_env = getenv("FALCON_SHARC_ALPHA");
+      if (alpha_env) {
+        alpha = (float)atof(alpha_env);
+        alpha = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
+      }
+
+      /* Auto GI gate: SHARC helps GI-dominated scenes but hurts direct-lit ones
+       * (Phase0 data), so scale alpha by the scene's GI dominance measured during
+       * warmup (indirect / (direct + indirect), stored in <cache>.meta). The gate
+       * smoothsteps from off below GATE_LOW to full above GATE_HIGH, so a direct-
+       * lit scene self-disables SHARC. Only for blend/live (warmup's blend is a
+       * no-op). Missing meta or FALCON_SHARC_GATE=0 -> no gating (alpha as-is). */
+      const bool is_blend = strcmp(mode, "blend") == 0 || strcmp(mode, "live") == 0;
+      const char *gate_env = getenv("FALCON_SHARC_GATE");
+      const bool gate_on = !(gate_env && strcmp(gate_env, "0") == 0);
+      if (is_blend && gate_on) {
+        const char *cache_env = getenv("FALCON_SHARC_CACHE");
+        const string meta_path = string(cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin") +
+                                 ".meta";
+        FILE *mf = fopen(meta_path.c_str(), "r");
+        if (mf) {
+          float gi_ratio = 1.0f;
+          if (fscanf(mf, "%f", &gi_ratio) == 1) {
+            float low = 0.15f, high = 0.40f;
+            const char *lo = getenv("FALCON_SHARC_GATE_LOW");
+            const char *hi = getenv("FALCON_SHARC_GATE_HIGH");
+            if (lo) {
+              low = (float)atof(lo);
+            }
+            if (hi) {
+              high = (float)atof(hi);
+            }
+            float t = (high > low) ? (gi_ratio - low) / (high - low) : (gi_ratio >= high);
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            const float gate = t * t * (3.0f - 2.0f * t);
+            LOG_INFO << "Falcon SHARC: GI gate " << gate << " (ratio " << gi_ratio << ", alpha "
+                     << alpha << " -> " << (alpha * gate) << ")";
+            alpha *= gate;
+          }
+          fclose(mf);
+        }
+      }
+      kintegrator->falcon_sharc_alpha = alpha;
+    }
+    else {
+      /* Not active: release the cache if a previous active render allocated it,
+       * so a normal render reserves no extra VRAM. (Not when the photon cache
+       * is using the same buffer -- add mode reads it, bake mode writes it.) */
+      if (!kintegrator->falcon_photon_add && !kintegrator->falcon_photon_pass &&
+          dscene->falcon_sharc_cache.size() != 0) {
+        dscene->falcon_sharc_cache.free();
+      }
+      kintegrator->falcon_sharc_alpha = 0.0f;
+    }
+  }
+
+  /* Falcon DAS (denoiser-aware sampling). FALCON_DAS_MAP points at a per-pixel
+   * threshold-scale map built by the OIDN probe (raw file: int32 width, int32
+   * height, then width*height float32 scales, render_pixel_index order). Only
+   * valid for full-frame renders at exactly that resolution: the kernel indexes
+   * the map by render_pixel_index, so border/tiled renders would misalign. */
+  {
+    kintegrator->falcon_das_active = 0;
+    kintegrator->falcon_das_strength = 0.0f;
+    const char *map_path = getenv("FALCON_DAS_MAP");
+    if (map_path && map_path[0]) {
+      FILE *f = fopen(map_path, "rb");
+      if (f) {
+        int32_t dims[2] = {0, 0};
+        if (fread(dims, sizeof(int32_t), 2, f) == 2 && dims[0] > 0 && dims[1] > 0) {
+          const size_t count = (size_t)dims[0] * (size_t)dims[1];
+          if (dscene->falcon_das_scale.size() != count) {
+            if (dscene->falcon_das_scale.size() != 0) {
+              dscene->falcon_das_scale.free();
+            }
+            dscene->falcon_das_scale.alloc(count);
+          }
+          float *map = dscene->falcon_das_scale.data();
+          if (fread(map, sizeof(float), count, f) == count) {
+            dscene->falcon_das_scale.copy_to_device();
+            dscene->falcon_das_scale.clear_modified();
+            float strength = 1.0f;
+            const char *strength_env = getenv("FALCON_DAS_STRENGTH");
+            if (strength_env) {
+              strength = (float)atof(strength_env);
+            }
+            kintegrator->falcon_das_active = 1;
+            kintegrator->falcon_das_strength = strength;
+            LOG_INFO << "Falcon DAS: loaded " << dims[0] << "x" << dims[1]
+                     << " threshold-scale map (strength " << strength << ")";
+          }
+        }
+        fclose(f);
+      }
+    }
+    if (!kintegrator->falcon_das_active && dscene->falcon_das_scale.size() != 0) {
+      dscene->falcon_das_scale.free();
+    }
+  }
+#endif
+
   clear_modified();
 }
 
 void Integrator::device_free(Device * /*unused*/, DeviceScene *dscene, bool force_free)
 {
   dscene->sample_pattern_lut.free_if_need_realloc(force_free);
+#ifdef WITH_FALCON_SHARC
+  dscene->falcon_sharc_cache.free_if_need_realloc(force_free);
+  dscene->falcon_das_scale.free_if_need_realloc(force_free);
+#endif
 }
 
 bool Integrator::is_modified() const

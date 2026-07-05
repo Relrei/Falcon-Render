@@ -57,7 +57,14 @@ DeviceScene::DeviceScene(Device *device)
       volume_tree_nodes(device, "volume_tree_nodes", MEM_GLOBAL),
       volume_tree_roots(device, "volume_tree_roots", MEM_GLOBAL),
       volume_tree_root_ids(device, "volume_tree_root_ids", MEM_GLOBAL),
-      volume_step_size(device, "volume_step_size", MEM_GLOBAL)
+      volume_step_size(device, "volume_step_size", MEM_GLOBAL),
+      falcon_sharc_cache(device, "falcon_sharc_cache", MEM_GLOBAL),
+      falcon_photon_points(device, "falcon_photon_points", MEM_GLOBAL),
+      falcon_photon_pcount(device, "falcon_photon_pcount", MEM_GLOBAL),
+      falcon_photon_grid_start(device, "falcon_photon_grid_start", MEM_GLOBAL),
+      falcon_photon_grid_count(device, "falcon_photon_grid_count", MEM_GLOBAL),
+      falcon_photon_index(device, "falcon_photon_index", MEM_GLOBAL),
+      falcon_das_scale(device, "falcon_das_scale", MEM_GLOBAL)
 {
   memset((void *)&data, 0, sizeof(data));
 }

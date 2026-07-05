@@ -242,6 +242,10 @@ string CUDADevice::compile_kernel_get_common_cflags(const uint kernel_features)
   cflags += " -DWITH_CYCLES_DEBUG";
 #  endif
 
+#  ifdef WITH_FALCON_SHARC
+  cflags += " -DWITH_FALCON_SHARC";
+#  endif
+
   return cflags;
 }
 

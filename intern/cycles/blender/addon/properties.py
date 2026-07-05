@@ -371,6 +371,17 @@ def update_world(self, context):
     context.scene.world.update_tag()
 
 
+def _falcon_point_env_update(self, context):
+    # Live-retune the active Falcon photon point map: only touch the env when a
+    # bake is already wired up (mode=add + points file present), so moving the
+    # sliders before any bake stays inert. Render-time knobs — no rebake.
+    import os
+    if (os.environ.get("FALCON_PHOTON_MODE") == "add"
+            and os.environ.get("FALCON_PHOTON_POINTS")):
+        os.environ["FALCON_PHOTON_RADIUS_M"] = "%.4f" % self.falcon_photon_point_radius
+        os.environ["FALCON_PHOTON_GAIN"] = "%.3f" % self.falcon_photon_point_gain
+
+
 def update_pause(self, context):
     context.area.tag_redraw()
 
@@ -432,7 +443,11 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
     denoising_use_gpu: BoolProperty(
         name="Denoise on GPU",
         description="Perform denoising on GPU devices configured in the system tab in the user preferences. This is significantly faster than on CPU, but requires additional GPU memory. When large scenes need more GPU memory, this option can be disabled",
-        default=False,
+        # CyclesF: default True (stock: False). Measured 2026-07-02: OIDN CPU
+        # dominates total render time at low spp (5.3x slower overall at
+        # 720p/16spp), so the fast path is the default and OOM-constrained
+        # scenes opt out instead of everyone paying the CPU price.
+        default=True,
     )
 
     use_preview_denoising: BoolProperty(
@@ -1097,6 +1112,124 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         name="Adaptive Compile",
         description=adaptive_compile_description,
         default=False)
+
+    # Falcon SHARC (experimental spatial hash radiance cache) UI controls.
+    # Bridged to the FALCON_SHARC_* env vars by CyclesRender in __init__.py.
+    falcon_sharc_mode: EnumProperty(
+        name="SHARC Mode",
+        description="Falcon spatial hash radiance cache mode. Warmup renders at high "
+                    "samples and bakes a radiance cache to disk; Blend renders at low "
+                    "samples and blends that cache in-kernel to cut noise",
+        items=(
+            ('OFF', "Off", "Normal Cycles, no radiance cache (identical to stock)"),
+            ('WARMUP', "Warmup (bake cache)", "Deposit converged radiance into the cache and save it"),
+            ('BLEND', "Blend (use cache)", "Load the cache and blend it in-kernel at the camera hit"),
+            ('LIVE', "Live (viewport accumulate)",
+             "Accumulate the radiance cache across frames while blending it in-kernel. "
+             "Best in the viewport with denoising on: GI keeps converging the longer the "
+             "camera holds still. Most effective on GI-heavy interiors"),
+        ),
+        default='OFF',
+    )
+    falcon_sharc_alpha: FloatProperty(
+        name="SHARC Blend",
+        description="How strongly the cached radiance is blended in (0 = pure path trace, "
+                    "1 = pure cache). The optimum is scene-dependent",
+        min=0.0, max=1.0, default=0.7,
+    )
+    falcon_sharc_keep: FloatProperty(
+        name="SHARC Keep",
+        description="Live mode only: how much of the accumulated cache survives each frame "
+                    "(0 = forget instantly, 1 = never forget). Higher keeps more history so a "
+                    "still camera converges further, but adapts slower when the view changes",
+        min=0.0, max=1.0, default=0.95,
+    )
+    falcon_sharc_cache: StringProperty(
+        name="SHARC Cache File",
+        description="Cache file written by Warmup and read by Blend. Leave empty for the "
+                    "default (/tmp/falcon_sharc_cache.bin)",
+        subtype='FILE_PATH', default="",
+    )
+    falcon_photon_photons: IntProperty(
+        name="Photons",
+        description="Photon count for the caustics bake. More photons = smoother "
+                    "caustics and less chroma sparkle with dispersion; bake time "
+                    "scales linearly on CPU (~2.5min per million); the GPU bake "
+                    "does billions in seconds (1B ~= 9s)",
+        min=10000, max=2000000000, default=2000000,
+    )
+    falcon_photon_cell: FloatProperty(
+        name="Cell Size",
+        description="Photon cache cell size in meters. Smaller = sharper caustic "
+                    "detail but needs more photons to stay smooth (0.025-0.05 for "
+                    "tabletop/pool scale, 0.1+ for rooms)",
+        min=0.001, max=1.0, default=0.05,
+    )
+    falcon_photon_dispersion: FloatProperty(
+        name="Dispersion",
+        description="Chromatic dispersion: per-wavelength IOR spread for refracted "
+                    "photons (0 = off, 0.02 = subtle rainbow fringes, glass-like)",
+        min=0.0, max=0.1, default=0.0,
+    )
+    falcon_photon_radius: FloatProperty(
+        name="Caustic Smoothness",
+        description="Photon-map density-estimation radius in cells. Larger spreads "
+                    "each photon over a wider disk: smoother caustics and rainbow "
+                    "rays from fewer photons, but softer detail and a slower bake "
+                    "(more deposits per photon). 1 = legacy sharp 2x2x2 splat",
+        min=1.0, max=8.0, default=3.0,
+    )
+    falcon_photon_gpu: BoolProperty(
+        name="GPU",
+        description="Trace the photon pass on the GPU (renders a one-sample photon "
+                    "frame) instead of the CPU Python tracer: ~100x+ faster, matches "
+                    "the CPU cache. Dispersion works on the GPU too (the Dispersion "
+                    "value drives per-wavelength photon refraction). The light must "
+                    "be visible to the camera-side emission",
+        default=False,
+    )
+    falcon_photon_point: BoolProperty(
+        name="Point Map",
+        description="LuxCore-style point-based photon map (Round 9): the GPU bake "
+                    "stores raw photon points and the render density-estimates at "
+                    "the exact shading point — no grid quantization, so colored "
+                    "cell speckle is gone and radius/gain are render-time knobs "
+                    "(no rebake needed). GPU bake only",
+        default=True,
+    )
+    falcon_photon_point_maxpts: IntProperty(
+        name="Point Cap",
+        description="Max photon points kept by the bake (432 bytes/point). Higher "
+                    "= smoother/sharper caustics at the same photon count, more "
+                    "VRAM and slower gather at render time. Quality-first (FQ) "
+                    "default is generous since bake time isn't the bottleneck",
+        min=1000000, max=200000000, default=40000000,
+    )
+    falcon_photon_point_radius: FloatProperty(
+        name="Radius (m)",
+        description="Point-map lookup radius in meters. Smaller = crisper caustic "
+                    "filaments but needs more photons to stay solid; larger = "
+                    "smoother/softer. Takes effect on the next render, WITHOUT "
+                    "rebaking (0.008-0.015 tabletop, 0.03+ rooms)",
+        min=0.001, max=0.5, default=0.010,
+        update=_falcon_point_env_update,
+    )
+    falcon_photon_point_gain: FloatProperty(
+        name="Gain",
+        description="Caustic brightness multiplier applied at lookup time (labeled "
+                    "artistic knob: 1 = physically calibrated). Takes effect on the "
+                    "next render, WITHOUT rebaking",
+        min=0.0, max=32.0, default=1.0,
+        update=_falcon_point_env_update,
+    )
+    falcon_sharc_gate: BoolProperty(
+        name="Auto GI Gate",
+        description="Automatically scale the SHARC blend by how much the scene is dominated by "
+                    "indirect light, measured during Warmup. SHARC helps GI-heavy scenes but "
+                    "hurts direct-lit ones, so a direct-lit scene disables it on its own. Turn "
+                    "off to always blend at the full amount",
+        default=True,
+    )
 
     @classmethod
     def register(cls):

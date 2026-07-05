@@ -18,6 +18,9 @@
 
 #include "kernel/integrator/mnee.h"
 
+#include "kernel/integrator/falcon_sharc.h"
+#include "kernel/integrator/falcon_dispersion.h"
+#include "kernel/integrator/falcon_lighttrace.h"
 #include "kernel/integrator/guiding.h"
 #include "kernel/integrator/shadow_linking.h"
 #include "kernel/integrator/subsurface.h"
@@ -490,6 +493,34 @@ ccl_device_forceinline int integrate_surface_bsdf_bssrdf_bounce(
     return integrate_surface_ray_portal(kg, state, sd, sc);
   }
 
+#ifdef __FALCON_SHARC__
+  /* Falcon Dispersion (FALCON_DISPERSION.md): on-demand spectral split at a
+   * smooth refractive/glass closure. On the path's first such scatter, sample a
+   * wavelength, tint the throughput by its white-balanced weight (mean over the
+   * band = white, so energy is preserved) and remember it; then refract with
+   * the Cauchy-offset IOR for that wavelength. Later dispersive hits reuse the
+   * stored wavelength. Reflections inherit the tint (chroma noise that
+   * converges with spp; documented, accepted). Runs for camera and photon-bake
+   * paths alike, so baked caustics get rainbows for free. */
+  if (kernel_data.integrator.falcon_dispersion_b > 0.0f &&
+      (CLOSURE_IS_REFRACTION(sc->type) || CLOSURE_IS_GLASS(sc->type)))
+  {
+    ccl_private MicrofacetBsdf *mbsdf = (ccl_private MicrofacetBsdf *)sc;
+    if (mbsdf->alpha_x * mbsdf->alpha_y <= BSDF_ROUGHNESS_SQ_THRESH) {
+      float lambda = INTEGRATOR_STATE(state, path, dispersion_lambda);
+      if (lambda == 0.0f) {
+        const float u = path_state_rng_1D(kg, rng_state, PRNG_SURFACE_DISPERSION);
+        lambda = FALCON_DISPERSION_LAMBDA_MIN + u * FALCON_DISPERSION_LAMBDA_SPAN;
+        INTEGRATOR_STATE_WRITE(state, path, dispersion_lambda) = lambda;
+        INTEGRATOR_STATE_WRITE(state, path, throughput) *= rgb_to_spectrum(
+            falcon_dispersion_cie_weight(lambda));
+      }
+      mbsdf->ior += falcon_dispersion_ior_offset(kernel_data.integrator.falcon_dispersion_b,
+                                                 lambda);
+    }
+  }
+#endif
+
   /* BSDF closure, sample direction. */
   float bsdf_pdf = 0.0f;
   float unguided_bsdf_pdf = 0.0f;
@@ -763,6 +794,170 @@ ccl_device int integrate_surface(KernelGlobals kg,
       }
     }
 
+#ifdef __FALCON_SHARC__
+    /* Falcon SHARC in-kernel render-buffer feedback blend (GPU offload).
+     * At the camera first hit, look up the read-only cache (filled by a host
+     * warmup run). If the cell is valid, write alpha * L_cache straight into the
+     * pixel and scale the path throughput by (1 - alpha); after film accumulation
+     * the pixel converges to lerp(L_path, L_cache, alpha) with no extra pass.
+     * When the cache is empty (warmup), the lookup fails and rendering is
+     * untouched, so the same build serves both warmup and blend. Unlike the
+     * standalone 5.2 version there is no per-pixel cell buffer: the host warmup
+     * deposits via the Position pass instead. */
+    if ((path_flag & PATH_RAY_CAMERA) && kernel_data.integrator.falcon_sharc_active) {
+      const float cell_size = falcon_sharc_cell_size(kernel_data.integrator.falcon_sharc_cell_size);
+      ccl_global const float *cache = kernel_data_array(falcon_sharc_cache);
+      float3 cached;
+      if (falcon_sharc_lookup(cache, sd.P, cell_size, &cached)) {
+        const float alpha = kernel_data.integrator.falcon_sharc_alpha;
+        ccl_global float *pixel = film_pass_pixel_render_buffer(kg, state, render_buffer);
+        const int sample = INTEGRATOR_STATE(state, path, sample);
+        film_write_combined_pass(kg, path_flag, sample, rgb_to_spectrum(alpha * cached), pixel);
+        INTEGRATOR_STATE_WRITE(state, path, throughput) *= (1.0f - alpha);
+      }
+    }
+
+    /* Falcon Photon Cache: additive caustic radiance (FALCON_PHOTON_MODE=add).
+     * The cache holds photon-estimated *caustic-only* outgoing radiance of
+     * diffuse surfaces (host photon pass, caustic photons only), so it is
+     * added like emission the path cannot find on its own: at any surface
+     * vertex, pixel += throughput * L_cache. Throughput is left untouched --
+     * this is extra transport, not a reweighting. Photons are only deposited
+     * on diffuse surfaces, so lookups on specular hits mostly miss; residual
+     * false positives at shared cells are an accepted v1 approximation
+     * (FALCON_PHOTON.md). Avoid combining with MNEE on the same lights:
+     * refractive-direct caustics would be counted twice. */
+    if (kernel_data.integrator.falcon_photon_add) {
+      const float3 n_off = (dot(sd.Ng, sd.wi) > 0.0f) ? sd.Ng : -sd.Ng;
+      float3 cached;
+      bool hit = false;
+      if (kernel_data.integrator.falcon_photon_point_mode) {
+        /* Point map (Round 9): fixed-radius gather at the exact shading point,
+         * radius/normal-angle/gain are render-time knobs. */
+        if (falcon_photon_point_lookup(kernel_data_array(falcon_photon_points),
+                                       kernel_data_array(falcon_photon_grid_start),
+                                       kernel_data_array(falcon_photon_grid_count),
+                                       kernel_data_array(falcon_photon_index),
+                                       sd.P,
+                                       n_off,
+                                       kernel_data.integrator.falcon_photon_point_radius,
+                                       kernel_data.integrator.falcon_photon_point_cos,
+                                       &cached)) {
+          cached *= kernel_data.integrator.falcon_photon_point_gain;
+          hit = true;
+        }
+      }
+      else {
+        const float cell_size = falcon_sharc_cell_size(
+            kernel_data.integrator.falcon_sharc_cell_size);
+        ccl_global const float *cache = kernel_data_array(falcon_sharc_cache);
+        /* Same half-cell normal offset and stencil as the deposit so the gather
+         * reads the field the splat wrote (front side w.r.t. the viewing ray). */
+        const float3 Pq = sd.P + n_off * (0.5f * cell_size);
+        hit = falcon_photon_lookup(
+            cache, Pq, cell_size, falcon_photon_normal_axis(n_off), &cached);
+      }
+      if (hit) {
+        const Spectrum throughput = INTEGRATOR_STATE(state, path, throughput);
+        ccl_global float *pixel = film_pass_pixel_render_buffer(kg, state, render_buffer);
+        const int sample = INTEGRATOR_STATE(state, path, sample);
+        film_write_combined_pass(
+            kg, path_flag, sample, throughput * rgb_to_spectrum(cached), pixel);
+      }
+    }
+
+    /* Falcon Photon bake pass: this path IS a photon (see init_from_camera).
+     * Diffuse receiver -> deposit caustic radiance (only if the photon has
+     * bounced off something specular first; direct light is the path tracer's
+     * job) and terminate. Specular surface -> fall through, the regular BSDF
+     * sampling continues the refract/reflect chain. Deposit mirrors the host
+     * tracer: half-cell offset along the normal (flat receivers sit on cell
+     * boundaries), L = flux * albedo / (pi * h^2). */
+    if (kernel_data.integrator.falcon_photon_pass) {
+      const float3 diff = spectrum_to_rgb(surface_shader_diffuse(kg, &sd));
+      const float3 spec = spectrum_to_rgb(surface_shader_glossy(kg, &sd)) +
+                          spectrum_to_rgb(surface_shader_transmission(kg, &sd));
+      const float d_avg = (diff.x + diff.y + diff.z) / 3.0f;
+      const float s_avg = (spec.x + spec.y + spec.z) / 3.0f;
+      /* Receiver test: any diffuse component -> deposit and terminate. The old
+       * `d_avg >= s_avg` compared FRESNEL-WEIGHTED closures, so grazing hits on
+       * a dark floor always counted as specular and the whole far caustic field
+       * (shallow exit rays, r > ~1.6 m on the ring scene = 25% of the flux) was
+       * silently dropped -- the reason dark-floor hero bakes starved for
+       * photons at ANY emission count. Pure speculars (d = 0, s > 0) still fall
+       * through to BSDF sampling; dead surfaces (d = 0, s = 0) terminate. */
+      if (d_avg > 0.0f || s_avg == 0.0f) {
+        const int bounce = INTEGRATOR_STATE(state, path, bounce);
+        if (kernel_data.integrator.falcon_lighttrace) {
+          /* Light tracing (FQ): connect the diffuse hit directly to the camera
+           * and splat (see falcon_lighttrace.h). Caustic paths need >=1 specular
+           * bounce; FALCON_LT_DIRECT=1 also splats the bounce-0 direct hit, whose
+           * floor radiance E*albedo/pi is analytically known and PT-confirmed --
+           * the absolute calibration control. No visibility ray yet (open-floor
+           * test has nothing between the diffuse hit and the camera; occlusion is
+           * P4). */
+          if (d_avg > 0.0f && (bounce > 0 || kernel_data.integrator.falcon_lt_direct)) {
+            const float fcap = 4.0f * kernel_data.integrator.falcon_photon_flux;
+            const float3 flux = min(
+                spectrum_to_rgb(INTEGRATOR_STATE(state, path, throughput)),
+                make_float3(fcap, fcap, fcap));
+            int px, py;
+            if (falcon_lt_project(kg, sd.P, &px, &py)) {
+              const float3 L = falcon_lt_connect(kg, sd.P, sd.N, flux, diff);
+              falcon_lt_splat(kg, render_buffer, px, py, L);
+            }
+          }
+          return LABEL_NONE;
+        }
+        if (bounce > 0 && d_avg > 0.0f) {
+          const float cell_size =
+              falcon_sharc_cell_size(kernel_data.integrator.falcon_sharc_cell_size);
+          ccl_global float *cache =
+              (ccl_global float *)kernel_data_array(falcon_sharc_cache);
+          const float3 n_off = (dot(sd.Ng, sd.wi) > 0.0f) ? sd.Ng : -sd.Ng;
+          const float3 Pd = sd.P + n_off * (0.5f * cell_size);
+          /* Photon energy clamp: along a physical specular chain the flux can
+           * only shrink (Fresnel/albedo <= 1), so any growth is a microfacet
+           * eval/pdf spike (the PT firefly mechanism) that would otherwise be
+           * baked into the cache as a permanent bright dot (measured: p50
+           * 2.4e-7 vs max 3.7e-2 = 150000x on the cushion scene). Clamp per
+           * channel at 4x emission flux (headroom for dispersion's
+           * single-channel packing). */
+          const float fcap = 4.0f * kernel_data.integrator.falcon_photon_flux;
+          const float3 flux = min(
+              spectrum_to_rgb(INTEGRATOR_STATE(state, path, throughput)),
+              make_float3(fcap, fcap, fcap));
+
+          const float radius_cells = kernel_data.integrator.falcon_photon_radius;
+          if (radius_cells > 1.0f) {
+            /* Photon-map density estimation: cone supplies 1/(pi r^2). */
+            falcon_photon_deposit_wide(cache, Pd, cell_size, radius_cells, flux * diff,
+                                       falcon_photon_normal_axis(n_off));
+          }
+          else {
+            const float inv_area = 1.0f / (M_PI_F * cell_size * cell_size);
+            falcon_photon_deposit(
+                cache, Pd, cell_size, flux * diff * inv_area, falcon_photon_normal_axis(n_off));
+          }
+          if (kernel_data.integrator.falcon_photon_point_store) {
+            /* Point map (Round 9): also store the raw photon (exact position,
+             * flux * receiver albedo, deposit normal) for lookup-time density
+             * estimation. */
+            ccl_global float *pts = (ccl_global float *)kernel_data_array(falcon_photon_points);
+            ccl_global uint *cnt = (ccl_global uint *)kernel_data_array(falcon_photon_pcount);
+            falcon_photon_point_append(pts,
+                                       cnt,
+                                       kernel_data.integrator.falcon_photon_point_max,
+                                       sd.P,
+                                       flux * diff,
+                                       n_off);
+          }
+        }
+        return LABEL_NONE;
+      }
+    }
+#endif
+
 #ifdef __SUBSURFACE__
     if (path_flag & PATH_RAY_SUBSURFACE) {
       /* When coming from inside subsurface scattering, setup a diffuse
@@ -816,9 +1011,15 @@ ccl_device int integrate_surface(KernelGlobals kg,
       guiding_write_debug_passes(kg, state, &sd, render_buffer);
     }
 #endif
-    /* Direct light. */
-    PROFILING_EVENT(PROFILING_SHADE_SURFACE_DIRECT_LIGHT);
-    integrate_surface_direct_light<node_feature_mask>(kg, state, &sd, &rng_state);
+    /* Direct light. (Skipped for photon-bake paths: photons carry flux
+     * forward only; next-event estimation would write garbage to the film.) */
+#ifdef __FALCON_SHARC__
+    if (!kernel_data.integrator.falcon_photon_pass)
+#endif
+    {
+      PROFILING_EVENT(PROFILING_SHADE_SURFACE_DIRECT_LIGHT);
+      integrate_surface_direct_light<node_feature_mask>(kg, state, &sd, &rng_state);
+    }
 
 #if defined(__AO__)
     /* Ambient occlusion pass. */

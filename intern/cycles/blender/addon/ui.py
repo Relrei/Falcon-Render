@@ -2510,11 +2510,123 @@ def get_panels():
     return panels
 
 
+class CYCLES_RENDER_PT_falcon(CyclesButtonsPanel, Panel):
+    bl_label = "CyclesF"
+
+    def draw(self, context):
+        layout = self.layout
+        cscene = context.scene.cycles
+        prefs = context.preferences.addons[__package__].preferences
+
+        # 状態は「異常な時だけ喋る」。正常時はGPUの1行のみ。
+        col = layout.column(align=True)
+        gpu_on = (cscene.device == 'GPU' and prefs.compute_device_type != 'NONE' and
+                  prefs.has_active_device())
+        if gpu_on:
+            col.label(text="GPU: %s" % prefs.compute_device_type, icon='CHECKMARK')
+        else:
+            col.label(text="CPUレンダー中 — デバイスをGPUコンピュートに", icon='ERROR')
+        if not (cscene.use_denoising and cscene.denoising_use_gpu):
+            col.label(text="最終デノイズがGPUではない (下のプリセットで解決)", icon='ERROR')
+        if not (cscene.use_preview_denoising and cscene.preview_denoising_use_gpu):
+            col.label(text="ビューポートデノイズ OFF", icon='INFO')
+        if cscene.falcon_sharc_mode != 'OFF':
+            col.label(text="SHARC: %s" % cscene.falcon_sharc_mode, icon='OUTLINER_OB_LIGHT')
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="用途プリセット")
+        col.operator("cycles.falcon_near_realtime",
+                     text="ビューポート高速化", icon='SHADERFX')
+        col.operator("cycles.falcon_still_quality",
+                     text="静止画 高品質", icon='RENDER_STILL')
+        col.operator("cycles.falcon_final_quality",
+                     text="アニメーション用", icon='RENDER_ANIMATION')
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="コースティクス (Falcon Photon)")
+        import os as _os
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_photon_photons", text="光子数")
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_photon_cell", text="セル")
+        row.prop(cscene, "falcon_photon_dispersion", text="分散")
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_photon_gpu", text="GPU (速い)")
+        row.prop(cscene, "falcon_photon_point", text="点マップ")
+        if cscene.falcon_photon_point and cscene.falcon_photon_gpu:
+            # Round 9 point map: these two are render-time knobs (no rebake)
+            row = col.row(align=True)
+            row.prop(cscene, "falcon_photon_point_radius", text="半径(m)")
+            row.prop(cscene, "falcon_photon_point_gain", text="ゲイン")
+            row = col.row(align=True)
+            row.prop(cscene, "falcon_photon_point_maxpts", text="点上限")
+        else:
+            row = col.row(align=True)
+            row.prop(cscene, "falcon_photon_radius", text="滑らかさ")
+        col.operator("cycles.falcon_photon_bake", icon='LIGHT_SUN')
+        if _os.environ.get("FALCON_PHOTON_MODE") == "add":
+            r = col.row(align=True)
+            if _os.environ.get("FALCON_PHOTON_POINTS"):
+                r.label(text="合成: 有効 (点マップ)", icon='CHECKMARK')
+            else:
+                r.label(text="合成: 有効", icon='CHECKMARK')
+            r.operator("cycles.falcon_photon_clear", text="", icon='X')
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="アニメのちらつき除去 (Falcon Temporal)")
+        col.operator("cycles.falcon_temporal_setup",
+                     text="除去用の素材を自動保存する", icon='NODE_COMPOSITING')
+        col.label(text="レンダー後 tools/falcon_temporal.py で適用", icon='INFO')
+
+
+class CYCLES_RENDER_PT_falcon_sharc(CyclesButtonsPanel, Panel):
+    bl_label = "SHARC キャッシュ (実験的)"
+    bl_parent_id = "CYCLES_RENDER_PT_falcon"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        cscene = context.scene.cycles
+        mode = cscene.falcon_sharc_mode
+
+        col = layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(cscene, "falcon_sharc_mode", text="モード")
+
+        sub = col.column()
+        sub.active = mode != 'OFF'
+        sub.prop(cscene, "falcon_sharc_alpha", text="ブレンド", slider=True)
+        if mode in {'BLEND', 'LIVE'}:
+            sub.prop(cscene, "falcon_sharc_gate", text="自動GIゲート")
+        if mode == 'LIVE':
+            sub.prop(cscene, "falcon_sharc_keep", text="履歴保持", slider=True)
+        sub.prop(cscene, "falcon_sharc_cache", text="キャッシュ")
+
+        if mode == 'WARMUP':
+            layout.label(text="高sppで一度レンダー後、Blendに切替", icon='INFO')
+        elif mode == 'BLEND':
+            # 実測(2026-07-02): OIDN併用のfinalでは全ブレンド量で悪化(cellバイアス)。
+            if cscene.use_denoising:
+                layout.label(text="Blend+デノイズはfinalで逆効果 — Live(ビューポート)推奨", icon='ERROR')
+            else:
+                layout.label(text="デノイズ無しのGI重シーン向け", icon='INFO')
+        elif mode == 'LIVE':
+            layout.label(text="ビューポート専用: カメラ静止中にGIが収束し続ける", icon='INFO')
+            if not (cscene.use_preview_denoising and cscene.preview_denoising_use_gpu):
+                layout.label(text="「ビューポート高速化」併用で効果大", icon='ERROR')
+
+
 classes = (
     CYCLES_PT_sampling_presets,
     CYCLES_PT_viewport_sampling_presets,
     CYCLES_PT_integrator_presets,
     CYCLES_PT_performance_presets,
+    CYCLES_RENDER_PT_falcon,
+    CYCLES_RENDER_PT_falcon_sharc,
     CYCLES_RENDER_PT_sampling,
     CYCLES_RENDER_PT_sampling_viewport,
     CYCLES_RENDER_PT_sampling_viewport_denoise,

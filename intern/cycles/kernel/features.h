@@ -160,6 +160,12 @@ CCL_NAMESPACE_BEGIN
 #  define __VOLUME_RECORD_ALL__
 #endif /* !__KERNEL_GPU__ */
 
+/* Falcon SHARC runs on both CPU and GPU, so it is enabled outside the
+ * !__KERNEL_GPU__ guard above. */
+#if defined(WITH_FALCON_SHARC)
+#  define __FALCON_SHARC__
+#endif
+
 /* MNEE caused "Compute function exceeds available temporary registers" in macOS < 13 due to a bug
  * in spill buffer allocation sizing. */
 #if defined(__KERNEL_METAL__) && (__KERNEL_METAL_MACOS__ < 13)

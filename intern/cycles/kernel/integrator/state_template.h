@@ -56,6 +56,11 @@ KERNEL_STRUCT_MEMBER(path, float, min_ray_pdf, KERNEL_FEATURE_PATH_TRACING)
 KERNEL_STRUCT_MEMBER(path, float, continuation_probability, KERNEL_FEATURE_PATH_TRACING)
 /* Throughput. */
 KERNEL_STRUCT_MEMBER(path, PackedSpectrum, throughput, KERNEL_FEATURE_PATH_TRACING)
+#ifdef __FALCON_SHARC__
+/* Falcon Dispersion: wavelength (nm) assigned at the path's first smooth
+ * refractive scatter; 0 = unassigned. Reused by later dispersive hits. */
+KERNEL_STRUCT_MEMBER(path, float, dispersion_lambda, KERNEL_FEATURE_PATH_TRACING)
+#endif
 /* Factor to multiple with throughput to get remove any guiding PDFS.
  * Such throughput without guiding PDFS is used for Russian roulette termination. */
 KERNEL_STRUCT_MEMBER(path, float, unguided_throughput, KERNEL_FEATURE_PATH_GUIDING)

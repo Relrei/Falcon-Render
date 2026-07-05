@@ -63,6 +63,9 @@ ccl_device_inline void path_state_init_integrator(KernelGlobals kg,
   INTEGRATOR_STATE_WRITE(state, path, continuation_probability) = 1.0f;
   INTEGRATOR_STATE_WRITE(state, path, throughput) = throughput;
   INTEGRATOR_STATE_WRITE(state, path, optical_depth) = 0.0f;
+#ifdef __FALCON_SHARC__
+  INTEGRATOR_STATE_WRITE(state, path, dispersion_lambda) = 0.0f;
+#endif
 #if defined(__PATH_GUIDING__)
   if ((kernel_data.kernel_features & KERNEL_FEATURE_PATH_GUIDING)) {
     INTEGRATOR_STATE_WRITE(state, path, unguided_throughput) = 1.0f;
