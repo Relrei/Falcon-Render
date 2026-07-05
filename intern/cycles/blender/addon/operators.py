@@ -592,6 +592,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                  cscene.transmission_bounces, cscene.glossy_bounces,
                  r.filepath, img_set.file_format, img_set.color_depth,
                  img_set.color_mode)
+        saved_denoise = cscene.use_denoising
 
         def _load_rgba(path):
             img = bpy.data.images.load(path)
@@ -622,6 +623,9 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             os.environ.pop("FALCON_PHOTON_POINTS", None)
 
             cscene.use_adaptive_sampling = False  # SPP cancellation needs fixed
+            # Denoising the LT layer eats ~12% of its energy and blurs the
+            # fine filaments; only the beauty pass gets the user's setting.
+            cscene.use_denoising = False
             cscene.max_bounces = max(cscene.max_bounces, 32)
             cscene.transmission_bounces = max(cscene.transmission_bounces, 32)
             cscene.glossy_bounces = max(cscene.glossy_bounces, 16)
@@ -653,6 +657,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             (cscene.use_adaptive_sampling, cscene.max_bounces,
              cscene.transmission_bounces, cscene.glossy_bounces,
              _, _, _, _) = saved
+            cscene.use_denoising = saved_denoise
             img_set.file_format = 'OPEN_EXR'
             img_set.color_depth = '32'
             img_set.color_mode = 'RGBA'
@@ -688,6 +693,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
              cscene.transmission_bounces, cscene.glossy_bounces,
              r.filepath, img_set.file_format, img_set.color_depth,
              img_set.color_mode) = saved
+            cscene.use_denoising = saved_denoise
 
         self.report({'INFO'}, "LT合成完了 (%d灯, %dspp, %.0f秒) → 画像「Falcon LT合成」 %s"
                     % (len(lights), spp, time.time() - t0, out_path))
