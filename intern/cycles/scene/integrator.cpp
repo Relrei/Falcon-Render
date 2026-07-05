@@ -443,6 +443,11 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
         const float r = (float)atof(ltsr);
         kintegrator->falcon_lt_splat_radius = r > 0.0f ? r : 0.0f;
       }
+      /* FALCON_LT_VISIBILITY: occlusion ray vertex->camera before splatting.
+       * Needs the raytrace kernel variant -- get_kernel_features() adds
+       * KERNEL_FEATURE_NODE_RAYTRACE and intersect_closest routes all shading
+       * there while this is set. */
+      kintegrator->falcon_lt_visibility = getenv("FALCON_LT_VISIBILITY") ? 1 : 0;
     }
 
     /* GPU photon bake: the render becomes a photon pass (init_from_camera
@@ -924,6 +929,13 @@ uint Integrator::get_kernel_features() const
 
   if (get_use_light_tree()) {
     kernel_features |= KERNEL_FEATURE_LIGHT_TREE;
+  }
+
+  /* Falcon light tracing with the visibility ray traces vertex->camera from
+   * shade_surface: the raytrace kernel variant must be in the pipeline (on
+   * OptiX the plain kernel cannot trace). */
+  if (getenv("FALCON_LIGHTTRACE") && getenv("FALCON_LT_VISIBILITY")) {
+    kernel_features |= KERNEL_FEATURE_NODE_RAYTRACE;
   }
 
   return kernel_features;

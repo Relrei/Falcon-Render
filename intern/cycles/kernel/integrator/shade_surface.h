@@ -893,9 +893,7 @@ ccl_device int integrate_surface(KernelGlobals kg,
            * and splat (see falcon_lighttrace.h). Caustic paths need >=1 specular
            * bounce; FALCON_LT_DIRECT=1 also splats the bounce-0 direct hit, whose
            * floor radiance E*albedo/pi is analytically known and PT-confirmed --
-           * the absolute calibration control. No visibility ray yet (open-floor
-           * test has nothing between the diffuse hit and the camera; occlusion is
-           * P4). */
+           * the absolute calibration control. */
           if (d_avg > 0.0f && (bounce > 0 || kernel_data.integrator.falcon_lt_direct)) {
             const float fcap = 4.0f * kernel_data.integrator.falcon_photon_flux;
             const float3 flux = min(
@@ -903,8 +901,38 @@ ccl_device int integrate_surface(KernelGlobals kg,
                 make_float3(fcap, fcap, fcap));
             int px, py;
             if (falcon_lt_project(kg, sd.P, &px, &py)) {
-              const float3 L = falcon_lt_connect(kg, sd.P, sd.N, flux, diff);
-              falcon_lt_splat(kg, render_buffer, px, py, L);
+              bool occluded = false;
+              /* FALCON_LT_VISIBILITY: occlusion ray vertex->camera. Kills
+               * splats whose vertex the camera cannot actually see -- both
+               * behind occluders (energy otherwise painted ON the occluder's
+               * pixels) and seen THROUGH glass (an L-S-D-S-eye path light
+               * tracing cannot place; the point map/MNEE own that case).
+               * Compiled only into the raytrace kernel variant;
+               * intersect_closest routes ALL shading there while the knob is
+               * on (the plain cubin kernel must never trace on an OptiX
+               * device -- it has no BVH2 to walk). */
+              IF_KERNEL_FEATURE(NODE_RAYTRACE) {
+                if (kernel_data.integrator.falcon_lt_visibility) {
+                  Ray vis_ray;
+                  vis_ray.self.object = sd.object;
+                  vis_ray.self.prim = sd.prim;
+                  vis_ray.self.light_object = OBJECT_NONE;
+                  vis_ray.self.light_prim = PRIM_NONE;
+                  vis_ray.P = sd.P;
+                  vis_ray.D = normalize_len(camera_position(kg) - sd.P, &vis_ray.tmax);
+                  vis_ray.tmin = 0.0f;
+                  vis_ray.tmax *= 0.9999f;
+                  vis_ray.dP = differential_make_compact(sd.dP);
+                  vis_ray.dD = differential_zero_compact();
+                  vis_ray.time = sd.time;
+                  Intersection vis_isect;
+                  occluded = scene_intersect(kg, &vis_ray, PATH_RAY_CAMERA, &vis_isect);
+                }
+              }
+              if (!occluded) {
+                const float3 L = falcon_lt_connect(kg, sd.P, sd.N, flux, diff);
+                falcon_lt_splat(kg, render_buffer, px, py, L);
+              }
             }
           }
           return LABEL_NONE;
