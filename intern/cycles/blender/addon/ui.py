@@ -2576,6 +2576,16 @@ class CYCLES_RENDER_PT_falcon(CyclesButtonsPanel, Panel):
 
         layout.separator()
         col = layout.column(align=True)
+        col.label(text="ライトトレース (Falcon LT・FQ静止画)")
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_lt_blur", text="ぼかし(px)")
+        row.prop(cscene, "falcon_lt_gain", text="ゲイン")
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_lt_visibility", text="可視性 (遮蔽/ガラス越し除去)")
+        col.operator("cycles.falcon_lighttrace_render", icon='RENDER_STILL')
+
+        layout.separator()
+        col = layout.column(align=True)
         col.label(text="アニメのちらつき除去 (Falcon Temporal)")
         col.operator("cycles.falcon_temporal_setup",
                      text="除去用の素材を自動保存する", icon='NODE_COMPOSITING')

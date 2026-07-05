@@ -306,6 +306,38 @@ def _falcon_merge_grid(files, out_path):
     return False
 
 
+def _falcon_sun_target(scene):
+    """FALCON_PHOTON_TARGET string: bounding sphere over objects whose first
+    material is refractive/metallic (the photon-worthy specular casters), or
+    None if the scene has none."""
+    from mathutils import Vector
+    corners = []
+    for ob in scene.objects:
+        if ob.type != 'MESH' or ob.hide_render or not ob.material_slots:
+            continue
+        mat = ob.material_slots[0].material
+        if mat is None or not mat.use_nodes:
+            continue
+        spec = False
+        for n in mat.node_tree.nodes:
+            if n.type == 'BSDF_PRINCIPLED':
+                if (n.inputs['Transmission Weight'].default_value > 0.5
+                        or n.inputs['Metallic'].default_value > 0.5):
+                    spec = True
+            elif n.type in ('BSDF_GLASS', 'BSDF_REFRACTION', 'BSDF_GLOSSY'):
+                spec = True
+        if spec:
+            corners += [ob.matrix_world @ Vector(c) for c in ob.bound_box]
+    if not corners:
+        return None
+    cx = sum(c.x for c in corners) / len(corners)
+    cy = sum(c.y for c in corners) / len(corners)
+    cz = sum(c.z for c in corners) / len(corners)
+    rad = max(((c.x - cx) ** 2 + (c.y - cy) ** 2 + (c.z - cz) ** 2) ** 0.5
+              for c in corners) + 0.05
+    return "%.4f,%.4f,%.4f,%.4f" % (cx, cy, cz, rad)
+
+
 class CYCLES_OT_falcon_photon_bake(Operator):
     """このシーンでフォトントレースを実行し、コースティクス(ガラス/水/鏡の集光)を"""     """キャッシュに焼く。完了後のレンダーに自動で合成される(加算・レンダー時間ほぼ増なし)。"""     """対象: Principledの透過(ガラス/水)・滑らかな金属。光源は最初のライト1灯(SUN対応)。"""     """注意: 水/ガラスの「透明の影」をOFFにすると物理的に正しい合成になる"""
     bl_idname = "cycles.falcon_photon_bake"
@@ -402,36 +434,12 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                     # Sun bakes: aim the launch square at the specular targets
                     # instead of the whole scene footprint (a big floor eats
                     # 99.9% of photons as direct hits that never deposit).
-                    # Bounding sphere over objects with a refractive/metallic
-                    # first material. Recomputed per light (direction-dependent).
+                    # Recomputed per light (direction-dependent).
                     os.environ.pop("FALCON_PHOTON_TARGET", None)
                     if light.data.type == 'SUN':
-                        corners = []
-                        for ob in scene.objects:
-                            if ob.type != 'MESH' or ob.hide_render or not ob.material_slots:
-                                continue
-                            mat = ob.material_slots[0].material
-                            if mat is None or not mat.use_nodes:
-                                continue
-                            spec = False
-                            for n in mat.node_tree.nodes:
-                                if n.type == 'BSDF_PRINCIPLED':
-                                    if (n.inputs['Transmission Weight'].default_value > 0.5
-                                            or n.inputs['Metallic'].default_value > 0.5):
-                                        spec = True
-                                elif n.type in ('BSDF_GLASS', 'BSDF_REFRACTION', 'BSDF_GLOSSY'):
-                                    spec = True
-                            if spec:
-                                from mathutils import Vector
-                                corners += [ob.matrix_world @ Vector(c) for c in ob.bound_box]
-                        if corners:
-                            cx = sum(c.x for c in corners) / len(corners)
-                            cy = sum(c.y for c in corners) / len(corners)
-                            cz = sum(c.z for c in corners) / len(corners)
-                            rad = max(((c.x - cx) ** 2 + (c.y - cy) ** 2 + (c.z - cz) ** 2) ** 0.5
-                                      for c in corners) + 0.05
-                            os.environ["FALCON_PHOTON_TARGET"] = ("%.4f,%.4f,%.4f,%.4f"
-                                                                  % (cx, cy, cz, rad))
+                        tgt = _falcon_sun_target(scene)
+                        if tgt:
+                            os.environ["FALCON_PHOTON_TARGET"] = tgt
 
                     r.resolution_x = r.resolution_y = res
                     r.resolution_percentage = 100
@@ -535,6 +543,157 @@ class CYCLES_OT_falcon_photon_clear(Operator):
         return {'FINISHED'}
 
 
+class CYCLES_OT_falcon_lighttrace_render(Operator):
+    """ライトトレース合成レンダー(FQ静止画)。光源から光子を追いカメラへ直接つなぐ"""     """キャッシュ無しコースティクス: サンプル数で本当に収束する(点マップのドット無し)。"""     """各ライトのLTパス+通常レンダーを実行し、加算合成した画像を保存する。"""     """重い: サンプル数=シーンのサンプル数。まず低サンプルで試す。固定サンプリングで実行される"""
+    bl_idname = "cycles.falcon_lighttrace_render"
+    bl_label = "ライトトレース合成レンダー"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def execute(self, context):
+        import os
+        import time
+        import tempfile
+        import numpy as np
+
+        scene = context.scene
+        cscene = scene.cycles
+        r = scene.render
+        if r.engine != 'CYCLES':
+            self.report({'ERROR'}, "レンダーエンジンがCYCLESではありません")
+            return {'CANCELLED'}
+        lights = [o for o in scene.objects if o.type == 'LIGHT' and not o.hide_render
+                  and o.data.type in ('SUN', 'AREA', 'SPOT')]
+        if not lights:
+            self.report({'ERROR'}, "対応ライトがありません (SUN/AREA/SPOT)")
+            return {'CANCELLED'}
+        w = int(r.resolution_x * r.resolution_percentage / 100)
+        h = int(r.resolution_y * r.resolution_percentage / 100)
+        if max(w, h) > 4096:
+            # falcon_lt_splat assumes a single full-frame tile.
+            self.report({'ERROR'}, "LTは4096px以下のみ (スプラットが1タイル前提)")
+            return {'CANCELLED'}
+        spp = cscene.samples
+
+        stem = os.path.join(
+            tempfile.gettempdir(),
+            "falcon_lt_%s" % (bpy.path.basename(bpy.data.filepath) or "scene"))
+
+        env_keys = ("FALCON_PHOTON_MODE", "FALCON_LIGHTTRACE", "FALCON_LIGHTTRACE_SAMPLES",
+                    "FALCON_PHOTON_N", "FALCON_LIGHTTRACE_GAIN", "FALCON_LT_SPLAT_RADIUS",
+                    "FALCON_LT_VISIBILITY", "FALCON_PHOTON_MAXPTS", "FALCON_PHOTON_TARGET",
+                    "FALCON_PHOTON_POINTS")
+        saved_env = {k: os.environ.get(k) for k in env_keys}
+        saved_hide = {li.name: li.hide_render for li in lights}
+        img_set = r.image_settings
+        saved = (cscene.use_adaptive_sampling, cscene.max_bounces,
+                 cscene.transmission_bounces, cscene.glossy_bounces,
+                 r.filepath, img_set.file_format, img_set.color_depth,
+                 img_set.color_mode)
+
+        def _load_rgba(path):
+            img = bpy.data.images.load(path)
+            px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+            bpy.data.images.remove(img)
+            return px
+
+        t0 = time.time()
+        lt_sum = None
+        try:
+            # --- LT pass, one render per light (integrator emits from the
+            # first enabled light; layers add linearly) ---
+            os.environ["FALCON_PHOTON_MODE"] = "bake"
+            os.environ["FALCON_LIGHTTRACE"] = "1"
+            os.environ["FALCON_LIGHTTRACE_SAMPLES"] = str(spp)
+            os.environ["FALCON_PHOTON_N"] = str(w * h * spp)
+            os.environ["FALCON_LIGHTTRACE_GAIN"] = "%.3f" % cscene.falcon_lt_gain
+            if cscene.falcon_lt_blur > 0.0:
+                os.environ["FALCON_LT_SPLAT_RADIUS"] = "%.2f" % cscene.falcon_lt_blur
+            else:
+                os.environ.pop("FALCON_LT_SPLAT_RADIUS", None)
+            if cscene.falcon_lt_visibility:
+                os.environ["FALCON_LT_VISIBILITY"] = "1"
+            else:
+                os.environ.pop("FALCON_LT_VISIBILITY", None)
+            # no point buffer during LT (432 MB VRAM it never reads)
+            os.environ["FALCON_PHOTON_MAXPTS"] = "0"
+            os.environ.pop("FALCON_PHOTON_POINTS", None)
+
+            cscene.use_adaptive_sampling = False  # SPP cancellation needs fixed
+            cscene.max_bounces = max(cscene.max_bounces, 32)
+            cscene.transmission_bounces = max(cscene.transmission_bounces, 32)
+            cscene.glossy_bounces = max(cscene.glossy_bounces, 16)
+            img_set.file_format = 'OPEN_EXR'
+            img_set.color_depth = '32'
+            img_set.color_mode = 'RGB'
+
+            for i, light in enumerate(lights):
+                for other in lights:
+                    other.hide_render = (other is not light)
+                os.environ.pop("FALCON_PHOTON_TARGET", None)
+                if light.data.type == 'SUN':
+                    tgt = _falcon_sun_target(scene)
+                    if tgt:
+                        os.environ["FALCON_PHOTON_TARGET"] = tgt
+                r.filepath = "%s_pass%d.exr" % (stem, i)
+                bpy.ops.render.render(write_still=True)
+                layer = _load_rgba(r.filepath)[:, :, :3]
+                lt_sum = layer if lt_sum is None else (lt_sum + layer)
+
+            # --- beauty pass with the user's own settings/envs restored ---
+            for li in lights:
+                li.hide_render = saved_hide[li.name]
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            (cscene.use_adaptive_sampling, cscene.max_bounces,
+             cscene.transmission_bounces, cscene.glossy_bounces,
+             _, _, _, _) = saved
+            img_set.file_format = 'OPEN_EXR'
+            img_set.color_depth = '32'
+            img_set.color_mode = 'RGBA'
+            r.filepath = stem + "_beauty.exr"
+            bpy.ops.render.render(write_still=True)
+            beauty = _load_rgba(r.filepath)
+
+            # --- additive composite (LT carries only caustic paths the camera
+            # tracer cannot find, same no-double-count argument as photon add) ---
+            comp = beauty.copy()
+            comp[:, :, :3] += lt_sum
+            out_path = stem + "_composite.exr"
+            name = "Falcon LT合成"
+            if name in bpy.data.images:
+                bpy.data.images.remove(bpy.data.images[name])
+            out = bpy.data.images.new(name, w, h, alpha=True, float_buffer=True)
+            out.pixels[:] = comp.ravel()
+            out.filepath_raw = out_path
+            out.file_format = 'OPEN_EXR'
+            out.save()
+        except Exception as e:
+            self.report({'ERROR'}, "LTレンダー失敗: %s" % e)
+            return {'CANCELLED'}
+        finally:
+            for li in lights:
+                li.hide_render = saved_hide[li.name]
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            (cscene.use_adaptive_sampling, cscene.max_bounces,
+             cscene.transmission_bounces, cscene.glossy_bounces,
+             r.filepath, img_set.file_format, img_set.color_depth,
+             img_set.color_mode) = saved
+
+        self.report({'INFO'}, "LT合成完了 (%d灯, %dspp, %.0f秒) → 画像「Falcon LT合成」 %s"
+                    % (len(lights), spp, time.time() - t0, out_path))
+        return {'FINISHED'}
+
+
 class CYCLES_OT_falcon_temporal_setup(Operator):
     """アニメレンダー中、各フレームの画像とモーションベクトルを<レンダー出力>/temporal/に自動保存する設定を組み込む(このボタン自体はレンダーしない)。保存した素材に tools/falcon_temporal.py を掛けるとちらつきを除去できる(実測: 16spp+フィルタが64spp生より安定)"""
     bl_idname = "cycles.falcon_temporal_setup"
@@ -601,6 +760,7 @@ classes = (
     CYCLES_OT_falcon_still_quality,
     CYCLES_OT_falcon_photon_bake,
     CYCLES_OT_falcon_photon_clear,
+    CYCLES_OT_falcon_lighttrace_render,
     CYCLES_OT_falcon_temporal_setup,
 )
 

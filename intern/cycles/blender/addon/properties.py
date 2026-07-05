@@ -1222,6 +1222,30 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         min=0.0, max=32.0, default=1.0,
         update=_falcon_point_env_update,
     )
+    falcon_lt_blur: FloatProperty(
+        name="LT Blur",
+        description="Light-tracing splat blur in pixels (0 = physically exact "
+                    "single-pixel splat). Energy-preserving Gaussian: makes few "
+                    "samples look smooth (16spp at blur 2 beats 256spp physical "
+                    "on caustic noise) at the cost of slight caustic softness. "
+                    "Labeled non-physical knob for heavy scenes",
+        min=0.0, max=4.0, default=0.0,
+    )
+    falcon_lt_gain: FloatProperty(
+        name="LT Gain",
+        description="Light-traced caustic brightness multiplier (labeled artistic "
+                    "knob: 1 = physically calibrated against E*albedo/pi)",
+        min=0.0, max=32.0, default=1.0,
+    )
+    falcon_lt_visibility: BoolProperty(
+        name="LT Visibility",
+        description="Occlusion-test each caustic splat against the camera "
+                    "(vertex->camera shadow ray). Needed when anything sits "
+                    "between the caustic and the camera; also correctly removes "
+                    "through-glass splats light tracing cannot place. Small cost, "
+                    "keep on unless chasing raw speed on open scenes",
+        default=True,
+    )
     falcon_sharc_gate: BoolProperty(
         name="Auto GI Gate",
         description="Automatically scale the SHARC blend by how much the scene is dominated by "
