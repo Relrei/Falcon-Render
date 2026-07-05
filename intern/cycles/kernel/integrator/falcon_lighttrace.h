@@ -125,16 +125,10 @@ ccl_device_inline float3 falcon_lt_connect(KernelGlobals kg,
   return flux * diff * ((1.0f / M_PI_F) * w * g);
 }
 
-/* Atomic-splat an RGB contribution into the combined pass of pixel (px,py).
- * Single full-frame tile assumed (offset 0, stride = width) -- the light-trace
- * render is one tile (camera res <= 4096). */
-ccl_device_inline void falcon_lt_splat(KernelGlobals kg,
-                                       ccl_global float *render_buffer,
-                                       const int px,
-                                       const int py,
-                                       const float3 rgb)
+ccl_device_inline void falcon_lt_splat_px(
+    KernelGlobals kg, ccl_global float *render_buffer, const int x, const int y, const float3 rgb)
 {
-  const uint64_t idx = (uint64_t)(px + py * (int)kernel_data.cam.width);
+  const uint64_t idx = (uint64_t)(x + y * (int)kernel_data.cam.width);
   ccl_global float *buf = render_buffer + idx * kernel_data.film.pass_stride +
                           kernel_data.film.pass_combined;
   atomic_add_and_fetch_float(buf + 0, rgb.x);
@@ -142,6 +136,64 @@ ccl_device_inline void falcon_lt_splat(KernelGlobals kg,
   atomic_add_and_fetch_float(buf + 2, rgb.z);
   /* Alpha/weight left untouched: the splat adds emission-like energy the camera
    * path tracer did not already account for (caustic-only paths). */
+}
+
+/* Atomic-splat an RGB contribution into the combined pass around pixel (px,py).
+ * Single full-frame tile assumed (offset 0, stride = width) -- the light-trace
+ * render is one tile (camera res <= 4096).
+ *
+ * FALCON_LT_SPLAT_RADIUS > 0 spreads the splat over a Gaussian footprint
+ * (sigma = radius/2, footprint clamped to 9x9): the image-space reconstruction
+ * blur that makes FEW photons/SPP look smooth -- a labeled NON-physical knob
+ * (default 0 = physical single-pixel splat; LuxCore ships light tracing with
+ * the pixel filter forced OFF for the same physical baseline). Weights are
+ * normalized over the in-bounds pixels only, so total energy is preserved even
+ * at the frame edge. Fireflies are already tamed upstream by the 4x flux clamp,
+ * so the blur does not smear unclamped spikes. */
+ccl_device_inline void falcon_lt_splat(KernelGlobals kg,
+                                       ccl_global float *render_buffer,
+                                       const int px,
+                                       const int py,
+                                       const float3 rgb)
+{
+  const float radius = kernel_data.integrator.falcon_lt_splat_radius;
+  if (radius < 0.5f) {
+    falcon_lt_splat_px(kg, render_buffer, px, py, rgb);
+    return;
+  }
+
+  const int W = (int)kernel_data.cam.width;
+  const int H = (int)kernel_data.cam.height;
+  const int R = min((int)ceilf(radius), 4);
+  /* sigma = radius/2 -> 1/(2 sigma^2) = 2/radius^2. */
+  const float k = 2.0f / (radius * radius);
+
+  float wsum = 0.0f;
+  for (int dy = -R; dy <= R; dy++) {
+    for (int dx = -R; dx <= R; dx++) {
+      const int x = px + dx;
+      const int y = py + dy;
+      if (x < 0 || x >= W || y < 0 || y >= H) {
+        continue;
+      }
+      wsum += expf(-(float)(dx * dx + dy * dy) * k);
+    }
+  }
+  if (!(wsum > 0.0f)) {
+    return;
+  }
+  const float inv_wsum = 1.0f / wsum;
+  for (int dy = -R; dy <= R; dy++) {
+    for (int dx = -R; dx <= R; dx++) {
+      const int x = px + dx;
+      const int y = py + dy;
+      if (x < 0 || x >= W || y < 0 || y >= H) {
+        continue;
+      }
+      const float w = expf(-(float)(dx * dx + dy * dy) * k) * inv_wsum;
+      falcon_lt_splat_px(kg, render_buffer, x, y, rgb * w);
+    }
+  }
 }
 
 #endif /* __FALCON_SHARC__ */

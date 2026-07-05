@@ -414,6 +414,8 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
     kintegrator->falcon_lighttrace_gain = 1.0f;
     kintegrator->falcon_lt_direct = 0;
     kintegrator->falcon_lt_samples = 1;
+    kintegrator->falcon_lt_splat_radius = 0.0f;
+    kintegrator->falcon_lt_visibility = 0;
     const char *photon_mode = getenv("FALCON_PHOTON_MODE");
 
     /* Falcon Light Tracing (FQ): FALCON_PHOTON_MODE=bake + FALCON_LIGHTTRACE=1.
@@ -434,6 +436,13 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
        * match cs.samples; fixed (non-adaptive) sampling only. */
       const char *lts = getenv("FALCON_LIGHTTRACE_SAMPLES");
       kintegrator->falcon_lt_samples = lts ? atoi(lts) : 1;
+      /* FALCON_LT_SPLAT_RADIUS (px): Gaussian splat-reconstruction blur, the
+       * labeled non-physical smoothness-for-photons trade (0 = physical). */
+      const char *ltsr = getenv("FALCON_LT_SPLAT_RADIUS");
+      if (ltsr) {
+        const float r = (float)atof(ltsr);
+        kintegrator->falcon_lt_splat_radius = r > 0.0f ? r : 0.0f;
+      }
     }
 
     /* GPU photon bake: the render becomes a photon pass (init_from_camera

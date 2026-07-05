@@ -293,6 +293,15 @@ KERNEL_STRUCT_MEMBER(integrator, int, falcon_lighttrace)
 KERNEL_STRUCT_MEMBER(integrator, float, falcon_lighttrace_gain)
 KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_direct)
 KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_samples)
+/* Light-tracing performance knobs (labeled non-physical): splat_radius (px,
+ * 0 = physical single-pixel splat) spreads each splat over an energy-
+ * normalized Gaussian footprint so few photons/SPP look smooth. visibility
+ * gates the vertex->camera occlusion ray (reserved, wired in the next step).
+ * 4 members keep the block a multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_lt_splat_radius)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_visibility)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_pad1)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_pad2)
 #endif
 
 /* Padding. */
