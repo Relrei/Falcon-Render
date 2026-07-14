@@ -6,6 +6,8 @@
  * \ingroup edmesh
  */
 
+#include <algorithm>
+
 #include "MEM_guardedalloc.h"
 
 #include "DNA_key_types.h"
@@ -18,6 +20,7 @@
 #include "BLI_math_matrix.h"
 #include "BLI_math_vector.h"
 
+#include "BKE_attribute.h"
 #include "BKE_context.hh"
 #include "BKE_customdata.hh"
 #include "BKE_editmesh.hh"
@@ -197,22 +200,18 @@ bool EDBM_op_callf(BMEditMesh *em, wmOperator *op, const char *fmt, ...)
   return EDBM_op_finish(em, &bmop, op, true);
 }
 
-bool EDBM_op_call_and_selectf(BMEditMesh *em,
-                              wmOperator *op,
-                              const char *select_slot_out,
-                              const bool select_extend,
-                              const char *fmt,
-                              ...)
+bool EDBM_op_vcall_and_selectf(BMEditMesh *em,
+                               wmOperator *op,
+                               const char *select_slot_out,
+                               const bool select_extend,
+                               const char *fmt,
+                               va_list list)
 {
   BMesh *bm = em->bm;
   BMOperator bmop;
-  va_list list;
-
-  va_start(list, fmt);
 
   if (!BMO_op_vinitf(bm, &bmop, BMO_FLAG_DEFAULTS, fmt, list)) {
     BKE_reportf(op->reports, RPT_ERROR, "Parse error in %s", __func__);
-    va_end(list);
     return false;
   }
 
@@ -229,8 +228,21 @@ bool EDBM_op_call_and_selectf(BMEditMesh *em,
   BMO_slot_buffer_hflag_enable(
       em->bm, bmop.slots_out, select_slot_out, hflag, BM_ELEM_SELECT, true);
 
-  va_end(list);
   return EDBM_op_finish(em, &bmop, op, true);
+}
+
+bool EDBM_op_call_and_selectf(BMEditMesh *em,
+                              wmOperator *op,
+                              const char *select_slot_out,
+                              const bool select_extend,
+                              const char *fmt,
+                              ...)
+{
+  va_list list;
+  va_start(list, fmt);
+  const bool result = EDBM_op_vcall_and_selectf(em, op, select_slot_out, select_extend, fmt, list);
+  va_end(list);
+  return result;
 }
 
 bool EDBM_op_call_silentf(BMEditMesh *em, const char *fmt, ...)
@@ -273,7 +285,7 @@ bool EDBM_op_call_silentf(BMEditMesh *em, const char *fmt, ...)
 static int object_shapenr_basis_index_ensured(const Object *ob)
 {
   const Mesh *mesh = id_cast<const Mesh *>(ob->data);
-  if (UNLIKELY((ob->shapenr == 0) && (mesh->key && !BLI_listbase_is_empty(&mesh->key->block)))) {
+  if (UNLIKELY((ob->shapenr == 0) && (mesh->key && !mesh->key->block.is_empty()))) {
     return 1;
   }
   return ob->shapenr;
@@ -296,6 +308,9 @@ void EDBM_mesh_make_from_mesh(Object *ob,
   /* Clamp the index, so the behavior of enter & exit edit-mode matches, see #43998. */
   const int shapenr = object_shapenr_basis_index_ensured(ob);
 
+  AttributeOwner owner = AttributeOwner::from_id(const_cast<ID *>(&mesh->id));
+  const std::string attributes_active_name = BKE_attributes_active_name_get(owner).value_or("");
+
   BMesh *bm = BKE_mesh_to_bmesh(src_mesh, shapenr, add_key_index, &create_params);
 
   if (mesh->runtime->edit_mesh) {
@@ -314,6 +329,25 @@ void EDBM_mesh_make_from_mesh(Object *ob,
 
   /* we need to flush selection because the mode may have changed from when last in editmode */
   EDBM_selectmode_flush(mesh->runtime->edit_mesh.get());
+
+  /* Conversion to edit-mesh may have modified the attribute layers.
+   * Re-resolve the active attribute by name to keep it stable. */
+  if (!attributes_active_name.empty()) {
+    /* Invalid active attributes can happen because of wrong DNA default, see comment
+     * on the Mesh.attributes_active_index declaration. */
+    if (bke::allow_procedural_attribute_access(attributes_active_name)) {
+      BKE_attributes_active_set(owner, attributes_active_name);
+    }
+    else {
+      mesh->attributes_active_index = -1;
+    }
+  }
+  else {
+    /* 0 can happen for newly created meshes. See comment on Mesh.attributes_active_index
+     * declaration. */
+    BLI_assert(ELEM(mesh->attributes_active_index, 0, -1));
+    mesh->attributes_active_index = -1;
+  }
 }
 
 void EDBM_mesh_load_ex(Main *bmain, Object *ob, bool free_data)
@@ -781,7 +815,7 @@ static void bm_uv_build_islands(UvElementMap *element_map,
   UvElement *islandbuf = MEM_new_array_zeroed<UvElement>(totuv, __func__);
   /* Island number for BMFaces. */
   int *island_number = MEM_new_array_zeroed<int>(bm->totface, __func__);
-  copy_vn_i(island_number, bm->totface, INVALID_ISLAND);
+  std::fill_n(island_number, bm->totface, INVALID_ISLAND);
 
   const BMUVOffsets uv_offsets = BM_uv_map_offsets_get(bm);
 
@@ -1319,7 +1353,7 @@ void EDBM_verts_mirror_cache_begin_ex(BMEditMesh *em,
   const float maxdist_sq = square_f(maxdist);
 
   /* one or the other is used depending if topo is enabled */
-  KDTree_3d *tree = nullptr;
+  KDTree<float3> *tree = nullptr;
   MirrTopoStore_t mesh_topo_store = {nullptr, -1, -1, false};
 
   BM_mesh_elem_table_ensure(bm, BM_VERT);
@@ -1346,15 +1380,15 @@ void EDBM_verts_mirror_cache_begin_ex(BMEditMesh *em,
     ED_mesh_mirrtopo_init(em, nullptr, &mesh_topo_store, true);
   }
   else {
-    tree = kdtree_3d_new(bm->totvert);
+    tree = kdtree_new<float3>(bm->totvert);
     BM_ITER_MESH_INDEX (v, &iter, bm, BM_VERTS_OF_MESH, i) {
       if (respecthide && BM_elem_flag_test(v, BM_ELEM_HIDDEN)) {
         continue;
       }
 
-      kdtree_3d_insert(tree, i, v->co);
+      kdtree_insert<float3>(tree, i, v->co);
     }
-    kdtree_3d_balance(tree);
+    kdtree_balance<float3>(tree);
   }
 
 #define VERT_INTPTR(_v, _i) \
@@ -1388,7 +1422,7 @@ void EDBM_verts_mirror_cache_begin_ex(BMEditMesh *em,
       co[axis] *= -1.0f;
 
       v_mirr = nullptr;
-      i_mirr = kdtree_3d_find_nearest(tree, co, nullptr);
+      i_mirr = kdtree_find_nearest<float3>(tree, co, nullptr);
       if (i_mirr != -1) {
         BMVert *v_test = BM_vert_at_index(bm, i_mirr);
         if (len_squared_v3v3(co, v_test->co) < maxdist_sq) {
@@ -1414,7 +1448,7 @@ void EDBM_verts_mirror_cache_begin_ex(BMEditMesh *em,
     ED_mesh_mirrtopo_free(&mesh_topo_store);
   }
   else {
-    kdtree_3d_free(tree);
+    kdtree_free<float3>(tree);
   }
 }
 
@@ -1891,12 +1925,17 @@ BMElem *EDBM_elem_from_index_any(BMEditMesh *em, uint index)
   return nullptr;
 }
 
-int EDBM_elem_to_index_any_multi(
-    const Scene *scene, ViewLayer *view_layer, BMEditMesh *em, BMElem *ele, int *r_object_index)
+int EDBM_elem_to_index_any_multi(const Main &bmain,
+                                 const Scene *scene,
+                                 ViewLayer *view_layer,
+                                 BMEditMesh *em,
+                                 BMElem *ele,
+                                 int *r_object_index)
 {
   int elem_index = -1;
   *r_object_index = -1;
-  Vector<Base *> bases = BKE_view_layer_array_from_bases_in_edit_mode(scene, view_layer, nullptr);
+  Vector<Base *> bases = BKE_view_layer_array_from_bases_in_edit_mode(
+      bmain, scene, view_layer, nullptr);
   for (const int base_index : bases.index_range()) {
     Base *base_iter = bases[base_index];
     if (BKE_editmesh_from_object(base_iter->object) == em) {
@@ -1908,13 +1947,15 @@ int EDBM_elem_to_index_any_multi(
   return elem_index;
 }
 
-BMElem *EDBM_elem_from_index_any_multi(const Scene *scene,
+BMElem *EDBM_elem_from_index_any_multi(const Main &bmain,
+                                       const Scene *scene,
                                        ViewLayer *view_layer,
                                        uint object_index,
                                        uint elem_index,
                                        Object **r_obedit)
 {
-  Vector<Base *> bases = BKE_view_layer_array_from_bases_in_edit_mode(scene, view_layer, nullptr);
+  Vector<Base *> bases = BKE_view_layer_array_from_bases_in_edit_mode(
+      bmain, scene, view_layer, nullptr);
   *r_obedit = nullptr;
   Object *obedit = (object_index < bases.size()) ? bases[object_index]->object : nullptr;
   if (obedit != nullptr) {
@@ -1934,10 +1975,14 @@ BMElem *EDBM_elem_from_index_any_multi(const Scene *scene,
 /** \name BMesh BVH API
  * \{ */
 
-static BMFace *edge_ray_cast(
-    const BMBVHTree *tree, const float co[3], const float dir[3], float *r_hitout, const BMEdge *e)
+static BMFace *edge_ray_cast(const BMBVHTree *tree,
+                             const float co[3],
+                             const float dir[3],
+                             float *r_hitout,
+                             const BMEdge *e,
+                             float *r_dist)
 {
-  BMFace *f = BKE_bmbvh_ray_cast(tree, co, dir, 0.0f, nullptr, r_hitout, nullptr);
+  BMFace *f = BKE_bmbvh_ray_cast(tree, co, dir, 0.0f, r_dist, r_hitout, nullptr);
 
   if (f && BM_edge_in_face(e, f)) {
     return nullptr;
@@ -1988,6 +2033,11 @@ bool BMBVH_EdgeVisible(const BMBVHTree *tree,
   sub_v3_v3v3(dir2, origin, co2);
   sub_v3_v3v3(dir3, origin, co3);
 
+  /* This prevents the ray shooting behind the camera. */
+  float dist1 = len_v3(dir1);
+  float dist2 = len_v3(dir2);
+  float dist3 = len_v3(dir3);
+
   normalize_v3_length(dir1, epsilon);
   normalize_v3_length(dir2, epsilon);
   normalize_v3_length(dir3, epsilon);
@@ -2003,11 +2053,11 @@ bool BMBVH_EdgeVisible(const BMBVHTree *tree,
   normalize_v3(dir3);
 
   /* do three samplings: left, middle, right */
-  f = edge_ray_cast(tree, co1, dir1, nullptr, e);
-  if (f && !edge_ray_cast(tree, co2, dir2, nullptr, e)) {
+  f = edge_ray_cast(tree, co1, dir1, nullptr, e, &dist1);
+  if (f && !edge_ray_cast(tree, co2, dir2, nullptr, e, &dist2)) {
     return true;
   }
-  if (f && !edge_ray_cast(tree, co3, dir3, nullptr, e)) {
+  if (f && !edge_ray_cast(tree, co3, dir3, nullptr, e, &dist3)) {
     return true;
   }
   if (!f) {

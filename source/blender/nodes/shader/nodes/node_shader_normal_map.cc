@@ -23,16 +23,16 @@ namespace nodes::node_shader_normal_map_cc {
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_input<decl::Float>("Strength")
+  b.add_input<decl::Float>("Strength"_ustr)
       .default_value(1.0f)
       .min(0.0f)
       .max(10.0f)
       .description("Strength of the normal mapping effect")
       .translation_context(BLT_I18NCONTEXT_AMOUNT);
-  b.add_input<decl::Color>("Color")
+  b.add_input<decl::Color>("Color"_ustr)
       .default_value({0.5f, 0.5f, 1.0f, 1.0f})
       .description("Color that encodes the normal map in the specified space");
-  b.add_output<decl::Vector>("Normal");
+  b.add_output<decl::Vector>("Normal"_ustr);
 }
 
 static void node_shader_buts_normal_map(ui::Layout &layout, bContext *C, PointerRNA *ptr)
@@ -41,9 +41,7 @@ static void node_shader_buts_normal_map(ui::Layout &layout, bContext *C, Pointer
   layout.prop(ptr, "convention", ui::ITEM_R_SPLIT_EMPTY_NAME, "", ICON_NONE);
 
   if (RNA_enum_get(ptr, "space") == SHD_SPACE_TANGENT) {
-    if (BKE_scene_uses_cycles(CTX_data_scene(C))) {
-      layout.prop(ptr, "base", ui::ITEM_R_SPLIT_EMPTY_NAME, "", ICON_NONE);
-    }
+    layout.prop(ptr, "base", ui::ITEM_R_SPLIT_EMPTY_NAME, "", ICON_NONE);
 
     PointerRNA obptr = CTX_data_pointer_get(C, "active_object");
     Object *object = static_cast<Object *>(obptr.data);
@@ -104,6 +102,13 @@ static int gpu_shader_normal_map(GPUMaterial *mat,
     GPU_link(mat, "color_invert_green_channel", newnormal, &newnormal);
   }
 
+  const char *input_fn_name = (nm->base == SHD_NORMAL_MAP_BASE_DISPLACED) ?
+                                  "input_normal_displaced" :
+                                  "input_normal_original";
+
+  GPUNodeLink *input_normal;
+  GPU_link(mat, input_fn_name, &input_normal);
+
   switch (nm->space) {
     case SHD_SPACE_TANGENT:
       GPU_material_flag_set(mat, GPU_MATFLAG_OBJECT_INFO);
@@ -114,6 +119,7 @@ static int gpu_shader_normal_map(GPUMaterial *mat,
                GPU_attribute(mat, CD_TANGENT, nm->uv_map),
                strength,
                newnormal,
+               input_normal,
                &out[0].link);
       return true;
     case SHD_SPACE_OBJECT:
@@ -198,7 +204,7 @@ void register_node_type_sh_normal_map()
 
   static bke::bNodeType ntype;
 
-  sh_node_type_base(&ntype, "ShaderNodeNormalMap", SH_NODE_NORMAL_MAP);
+  sh_node_type_base(&ntype, "ShaderNodeNormalMap"_ustr, SH_NODE_NORMAL_MAP);
   ntype.ui_name = "Normal Map";
   ntype.ui_description =
       "Generate a perturbed normal from an RGB normal map image. Typically used for faking highly "
@@ -207,7 +213,7 @@ void register_node_type_sh_normal_map()
   ntype.nclass = NODE_CLASS_OP_VECTOR;
   ntype.declare = file_ns::node_declare;
   ntype.draw_buttons = file_ns::node_shader_buts_normal_map;
-  bke::node_type_size_preset(ntype, bke::eNodeSizePreset::Middle);
+  ntype.default_width = bke::NodeWidth::_160;
   ntype.initfunc = file_ns::node_shader_init_normal_map;
   bke::node_type_storage(
       ntype, "NodeShaderNormalMap", node_free_standard_storage, node_copy_standard_storage);

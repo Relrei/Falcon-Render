@@ -159,7 +159,13 @@ class Prepass : Overlay {
                                        res.select_id(ob_ref);
 
             gpu::Batch *geom = DRW_cache_particles_get_hair(ob, &psys, nullptr);
-            mesh_ps_->draw(geom, handle, select_id.get());
+            if (res.is_selection()) {
+              /* Conservative shader needs expanded draw-call. */
+              mesh_ps_->draw_expand(geom, GPU_PRIM_TRIS, 1, 1, handle, select_id.get());
+            }
+            else {
+              mesh_ps_->draw(geom, handle, select_id.get());
+            }
             break;
           }
           break;
@@ -228,7 +234,7 @@ class Prepass : Overlay {
           geom_single = DRW_cache_mesh_surface_get(ob_ref.object);
 
           if (res.is_selection() && !use_material_slot_selection_ &&
-              FlatObjectRef::flat_axis_index_get(ob_ref.object) != -1)
+              FlatObjectRef::flat_axis_index_get(ob_ref) != -1)
           {
             /* Avoid losing flat objects when in ortho views (see #56549) */
             mesh_flat_ps_->draw(DRW_cache_mesh_all_edges_get(ob_ref.object),

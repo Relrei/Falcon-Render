@@ -197,6 +197,12 @@ Note that these properties can only be assigned basic Python types:
 - array of ints or floats
 - dictionary (only string keys are supported, values must be basic types too)
 
+.. note::
+
+   Using dictionaries allow to nest data into other data.
+   There is a hard limit of 1024 levels to the supported nesting depth.
+   Deeper nesting will lead to error messages and loss of data.
+
 These properties are valid outside of Python. They can be animated by curves or used in driver paths.
 
 For a list of types that support custom properties see:
@@ -268,7 +274,7 @@ For example, calling ``bpy.ops.view3d.render_border()`` from the console raises 
 
 In this case the context must be the 3D Viewport with an active camera.
 
-To avoid using try-except clauses wherever operators are called, you can call the operators
+To avoid using try-except clauses wherever operators are called, you can call the operator's
 own ``poll()`` function to check if it can run the operator in the current context.
 
 .. code-block:: python
@@ -293,7 +299,7 @@ In Python, this is done by defining a class, which is a subclass of an existing 
 Example Operator
 ----------------
 
-.. literalinclude:: __/__/__/scripts/templates_py/operator_simple.py
+.. literalinclude:: __/__/__/scripts/templates_py/Operator/simple.py
 
 Once this script runs, ``SimpleOperator`` is registered with Blender
 and can be called from Operator Search or added to the toolbar.
@@ -325,7 +331,7 @@ Example Panel
 Panels are registered as a class, like an operator.
 Notice the extra ``bl_`` variables used to set the context they display in.
 
-.. literalinclude:: __/__/__/scripts/templates_py/ui_panel_simple.py
+.. literalinclude:: __/__/__/scripts/templates_py/UI/panel_simple.py
 
 To run the script:
 

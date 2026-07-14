@@ -8,7 +8,12 @@
 #endif
 
 #include "BKE_appdir.hh"
+#include "BKE_geometry_set.hh"
+#include "BKE_object_types.hh"
+#include "BKE_scene.hh"
 #include "DEG_depsgraph_query.hh"
+#include "DNA_scene_types.h"
+#include "DNA_userdef_types.h"
 #include "DNA_world_types.h"
 #include "RNA_prototypes.hh"
 #include "RNA_types.hh"
@@ -190,7 +195,7 @@ void BlenderSync::sync_recalc(blender::Depsgraph &b_depsgraph,
           }
 
           if (updated_geometry) {
-            if (!BLI_listbase_is_empty(&b_ob->particlesystem)) {
+            if (!b_ob->particlesystem.is_empty()) {
               particle_system_map.set_recalc(b_ob);
             }
           }
@@ -227,7 +232,7 @@ void BlenderSync::sync_recalc(blender::Depsgraph &b_depsgraph,
       }
       shader_map.set_recalc(b_id);
     }
-    /* World */
+    /* Scene */
     else if (GS(b_id->name) == blender::ID_SCE) {
       shader_map.set_recalc(b_id);
     }
@@ -306,8 +311,14 @@ void BlenderSync::sync_data(blender::RenderData &b_render,
 {
   /* For auto refresh images. */
   ImageManager *image_manager = scene->image_manager.get();
-  const int frame = b_scene->r.cfra;
+  const float frame = BKE_scene_frame_get(b_scene);
+  const bool frame_update = frame_last_synced != frame;
   const bool auto_refresh_update = image_manager->set_animation_frame_update(frame);
+
+  if (frame_update) {
+    frame_last_synced = frame;
+    has_updates_ = true;
+  }
 
   if (!has_updates_ && !auto_refresh_update) {
     return;
@@ -321,20 +332,17 @@ void BlenderSync::sync_data(blender::RenderData &b_render,
    * implicit check on whether it is a background render or not. What is the nicer thing here? */
   const bool background = !b_v3d;
 
+  sync_scene_attributes();
   sync_view_layer(b_view_layer);
   sync_integrator(b_view_layer, background, denoise_device_info);
   sync_film(b_view_layer, b_screen, b_v3d);
-  sync_shaders(b_depsgraph, b_screen, b_v3d, auto_refresh_update);
+  sync_shaders(b_depsgraph, b_screen, b_v3d, auto_refresh_update, frame_update);
   sync_images();
 
   geometry_synced.clear(); /* use for objects and motion sync */
 
-  if (scene->need_motion() == Scene::MOTION_NONE || scene->need_motion() == Scene::MOTION_PASS ||
-      scene->camera->get_motion_position() == MOTION_POSITION_CENTER)
-  {
-    sync_objects(b_depsgraph, b_screen, b_v3d);
-  }
-  sync_motion(b_render, b_depsgraph, b_screen, b_v3d, b_rv3d, width, height, python_thread_state);
+  sync_objects_and_motion(
+      b_render, b_depsgraph, b_screen, b_v3d, b_rv3d, width, height, python_thread_state);
 
   geometry_synced.clear();
 
@@ -380,6 +388,27 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
   integrator->set_caustics_reflective(get_boolean(cscene, "caustics_reflective"));
   integrator->set_caustics_refractive(get_boolean(cscene, "caustics_refractive"));
   integrator->set_filter_glossy(get_float(cscene, "blur_glossy"));
+
+  integrator->set_use_pixel_jitter(get_boolean(cscene, "use_pixel_jitter"));
+
+  bool use_custom_pixel_jitter_sample = false;
+  blender::PropertyRNA *override_pixel_jitter_sample_prop = RNA_struct_find_property(
+      &scene_rna_ptr, "[\"override_pixel_jitter_sample\"]");
+  if (override_pixel_jitter_sample_prop) {
+    const int array_length = RNA_property_array_length(&scene_rna_ptr,
+                                                       override_pixel_jitter_sample_prop);
+    if (array_length == 2) {
+      array<float> pixel_jitter_sample_arr(2);
+      RNA_property_float_get_array(
+          &scene_rna_ptr, override_pixel_jitter_sample_prop, &pixel_jitter_sample_arr[0]);
+      integrator->set_custom_pixel_jitter_sample(pixel_jitter_sample_arr);
+      use_custom_pixel_jitter_sample = true;
+    }
+    else if (array_length != 0) {
+      printf("%s: scene.custom_pixel_jitter_sample length is not 0 or 2.\n", __func__);
+    }
+  }
+  integrator->set_use_custom_pixel_jitter_sample(use_custom_pixel_jitter_sample);
 
   int seed = get_int(cscene, "seed");
   if (get_boolean(cscene, "use_animated_seed")) {
@@ -555,15 +584,30 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
     integrator->set_denoiser_type(denoise_params.type);
     integrator->set_denoise_use_gpu(denoise_params.use_gpu);
     integrator->set_denoise_start_sample(denoise_params.start_sample);
-    integrator->set_use_denoise_pass_albedo(denoise_params.use_pass_albedo);
-    integrator->set_use_denoise_pass_normal(denoise_params.use_pass_normal);
+    integrator->set_denoiser_passes(denoise_params.passes);
     integrator->set_denoiser_prefilter(denoise_params.prefilter);
     integrator->set_denoiser_quality(denoise_params.quality);
+    integrator->set_denoiser_upscale_factor(denoise_params.upscale_factor);
+    integrator->set_denoiser_carry_history(denoise_params.carry_history);
   }
 
   /* UPDATE_NONE as we don't want to tag the integrator as modified (this was done by the
    * set calls above), but we need to make sure that the dependent things are tagged. */
   integrator->tag_update(scene, Integrator::UPDATE_NONE);
+}
+
+/* Scene Attributes */
+
+void BlenderSync::sync_scene_attributes()
+{
+  SceneAttributes *scene_attribute = scene->scene_attribute;
+
+  blender::Scene *scene = b_scene;
+  float frame = BKE_scene_frame_get(b_scene);
+  float time = FRA2TIME(frame);
+
+  scene_attribute->set_time(time);
+  scene_attribute->set_frame(frame);
 }
 
 /* Film */
@@ -619,6 +663,41 @@ void BlenderSync::sync_film(blender::ViewLayer &b_view_layer,
   else {
     film->set_use_approximate_shadow_catcher(!get_boolean(crl, "use_pass_shadow_catcher"));
   }
+
+  /* Denoising passes. */
+  bool follow_reflections = get_boolean(crl, "denoising_pass_follow_reflections");
+  /* Followed guides are Monte-Carlo noisy on specular/refractive surfaces
+   * (each sample defers along a randomly sampled lobe). OIDN prefilters its
+   * guides so it copes; DLSS-RR consumes them raw and bakes the guide noise
+   * into glass as speckle. Force first-surface guides when the active
+   * denoiser is DLSS.
+   *
+   * This is not just a glass-vs-metal trade: following the reflections is worse
+   * for polished metal too (classroom frame 20 vs a 1024spp reference: chrome
+   * chair legs 29.59 -> 29.19 dB, whole frame 29.82 -> 29.71). The guide noise
+   * costs more than the reflected detail buys. FALCON_DLSS_FOLLOW_REFLECTIONS
+   * re-enables them to re-run that comparison. */
+  const bool active_dlss = get_boolean(cscene,
+                                       preview ? "use_preview_denoising" : "use_denoising") &&
+                           get_enum(cscene,
+                                    preview ? "preview_denoiser" : "denoiser",
+                                    DENOISER_NUM,
+                                    DENOISER_NONE) == DENOISER_DLSS;
+  if (active_dlss && getenv("FALCON_DLSS_FOLLOW_REFLECTIONS") == nullptr) {
+    follow_reflections = false;
+  }
+  film->set_denoising_pass_follow_reflections(follow_reflections);
+  film->set_denoising_pass_use_albedo_roughness_weighting(
+      get_boolean(crl, "denoising_pass_use_albedo_roughness_weighting"));
+
+  /* Primary surface replacement: give DLSS-RR the virtual image behind a delta mirror instead of
+   * the mirror itself, which is the hole NVIDIA left open in their own Cycles integration
+   * ("specular motion vectors... deferred for now... the quality of reflections suffers a bit").
+   *
+   * Off by default: it fires correctly (the guides change only on mirror pixels) but measurably
+   * costs quality on the mirror test scene -- 0.5 to 1.4 dB against a 1024spp reference, with the
+   * same temporal flicker. FALCON_DLSS_PSR=1 turns it on to keep investigating. */
+  film->set_denoising_pass_psr(active_dlss && getenv("FALCON_DLSS_PSR") != nullptr);
 }
 
 /* Render Layer */
@@ -739,8 +818,11 @@ static bool get_known_pass_type(blender::RenderPass &b_pass, PassType &type, Pas
   MAP_PASS("BakeDifferential", PASS_BAKE_DIFFERENTIAL, false);
 
   MAP_PASS("Denoising Albedo", PASS_DENOISING_ALBEDO, true);
+  MAP_PASS("Denoising Specular Albedo", PASS_DENOISING_SPECULAR_ALBEDO, true);
   MAP_PASS("Denoising Normal", PASS_DENOISING_NORMAL, true);
+  MAP_PASS("Denoising Roughness", PASS_DENOISING_ROUGHNESS, true);
   MAP_PASS("Denoising Depth", PASS_DENOISING_DEPTH, true);
+  MAP_PASS("Denoising Backward Motion", PASS_DENOISING_BACKWARD_MOTION, true);
 
   MAP_PASS("Shadow Catcher", PASS_SHADOW_CATCHER, false);
   MAP_PASS("Noisy Shadow Catcher", PASS_SHADOW_CATCHER, true);
@@ -835,7 +917,7 @@ void BlenderSync::sync_render_passes(blender::RenderLayer &b_rlay,
     PassMode pass_mode = PassMode::DENOISED;
 
     if (!get_known_pass_type(b_pass, pass_type, pass_mode)) {
-      if (!expected_passes.count(b_pass.name)) {
+      if (!expected_passes.contains(b_pass.name)) {
         LOG_ERROR << "Unknown pass " << b_pass.name;
       }
       continue;
@@ -940,7 +1022,10 @@ void BlenderSync::free_data_after_sync(blender::Depsgraph &b_depsgraph)
   {
     /* Grease pencil render requires all evaluated objects available as-is after Cycles is done
      * with its part. */
-    if (b_ob->type == blender::OB_GREASE_PENCIL) {
+    if (b_ob->type == blender::OB_GREASE_PENCIL ||
+        (b_ob->runtime->contained_geometry_types &
+         (1 << int(blender::bke::GeometryComponent::Type::GreasePencil))))
+    {
       continue;
     }
     BKE_object_free_caches(b_ob);
@@ -950,7 +1035,9 @@ void BlenderSync::free_data_after_sync(blender::Depsgraph &b_depsgraph)
 
 /* Scene Parameters */
 
-SceneParams BlenderSync::get_scene_params(blender::Scene &b_scene,
+SceneParams BlenderSync::get_scene_params(blender::UserDef &b_preferences,
+                                          blender::Main &b_data,
+                                          blender::Scene &b_scene,
                                           const bool background,
                                           const bool use_developer_ui)
 {
@@ -983,23 +1070,32 @@ SceneParams BlenderSync::get_scene_params(blender::Scene &b_scene,
   params.hair_shape = (CurveShapeType)get_enum(
       csscene, "shape", CURVE_NUM_SHAPE_TYPES, CURVE_THICK);
 
+  float texture_resolution;
   int texture_limit;
   if (background) {
+    texture_resolution = RNA_float_get(&cscene, "texture_resolution_render");
     texture_limit = RNA_enum_get(&cscene, "texture_limit_render");
   }
   else {
+    texture_resolution = RNA_float_get(&cscene, "texture_resolution");
     texture_limit = RNA_enum_get(&cscene, "texture_limit");
   }
-  if (texture_limit > 0 && (b_scene.r.mode & blender::R_SIMPLIFY) != 0) {
-    params.texture_limit = 1 << (texture_limit + 6);
+  if ((b_scene.r.mode & blender::R_SIMPLIFY) != 0) {
+    params.texture_resolution = (texture_resolution < 1.0f) ? texture_resolution : 1.0f;
+    params.texture_limit = (texture_limit > 0) ? (1 << (texture_limit + 6)) : 0;
   }
   else {
+    params.texture_resolution = 1.0f;
     params.texture_limit = 0;
   }
 
   params.bvh_layout = DebugFlags().cpu.bvh_layout;
 
   params.background = background;
+  params.use_texture_cache = b_scene.r.scemode & blender::R_USE_TEXTURE_CACHE;
+  params.auto_texture_cache = b_scene.r.scemode & blender::R_TEXTURE_CACHE_AUTO_GENERATE;
+  params.texture_cache_path = blender_absolute_path(
+      b_data, nullptr, b_preferences.texture_cachedir);
 
   return params;
 }
@@ -1116,6 +1212,13 @@ SessionParams BlenderSync::get_session_params(blender::RenderEngine &b_engine,
   }
   else {
     params.use_auto_tile = false;
+
+    if (get_boolean(cscene, "use_preview_denoising") &&
+        get_enum(cscene, "preview_denoiser", DENOISER_NUM, DENOISER_NONE) == DENOISER_DLSS)
+    {
+      /* Disable resolution divider with DLSS */
+      params.use_resolution_divider = false;
+    }
   }
 
   return params;
@@ -1132,6 +1235,16 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
     DENOISER_INPUT_RGB_ALBEDO_NORMAL = 3,
 
     DENOISER_INPUT_NUM,
+  };
+
+  enum DenoiserDLSSQuality {
+    DENOISER_DLSS_MODE_DLAA = 0,
+    DENOISER_DLSS_MODE_QUALITY = 1,
+    DENOISER_DLSS_MODE_BALANCED = 2,
+    DENOISER_DLSS_MODE_PERF = 3,
+    DENOISER_DLSS_MODE_ULTRA_PERF = 4,
+
+    DENOISER_DLSS_MODE_NUM,
   };
 
   DenoiseParams denoising;
@@ -1161,6 +1274,57 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
         denoising.use = false;
       }
     }
+
+    if (denoising.type == DENOISER_DLSS) {
+      /* Final-render DLSS-RR (experimental): full guide-pass set, mirroring the
+       * viewport configuration below. The upscale mode defaults to None (DLAA);
+       * the reduced-resolution modes trade fidelity for render time. */
+      denoising.start_sample = 0;
+      /* Carry the RR history across animation frames (measured best temporal
+       * stability); OFF restores the old per-frame reset. */
+      denoising.carry_history = get_boolean(cscene, "denoising_carry_history");
+
+      switch ((DenoiserDLSSQuality)get_enum(
+          cscene, "denoising_upscale_quality", DENOISER_DLSS_MODE_NUM, DENOISER_DLSS_MODE_DLAA))
+      {
+        default:
+        case DENOISER_DLSS_MODE_DLAA:
+          denoising.quality = DENOISER_QUALITY_HIGH;
+          denoising.upscale_factor = 1.0f;
+          break;
+        case DENOISER_DLSS_MODE_QUALITY:
+          denoising.quality = DENOISER_QUALITY_HIGH;
+          denoising.upscale_factor = 1.0f / 0.66666667f;
+          break;
+        case DENOISER_DLSS_MODE_BALANCED:
+          denoising.quality = DENOISER_QUALITY_BALANCED;
+          denoising.upscale_factor = 1.0f / 0.58f;
+          break;
+        case DENOISER_DLSS_MODE_PERF:
+          denoising.quality = DENOISER_QUALITY_FAST;
+          denoising.upscale_factor = 2.0f;
+          break;
+        case DENOISER_DLSS_MODE_ULTRA_PERF:
+          denoising.quality = DENOISER_QUALITY_FAST;
+          denoising.upscale_factor = 3.0f;
+          break;
+      }
+
+      denoising.passes = DENOISER_PASS_ALBEDO | DENOISER_PASS_SPECULAR_ALBEDO |
+                         DENOISER_PASS_NORMAL | DENOISER_PASS_ROUGHNESS | DENOISER_PASS_DEPTH |
+                         DENOISER_PASS_MOTION | DENOISER_PASS_SPECULAR_MOTION;
+      /* Transmission passes feed the ColorBeforeTransparency guide, which tells
+       * RR which part of the pixel came through a transmissive surface. */
+      if (getenv("FALCON_DLSS_NO_TRANSP_GUIDE") == nullptr) {
+        denoising.passes |= DENOISER_PASS_TRANSMISSION;
+      }
+      /* Specular hit distance: RR builds the specular motion from it, so
+       * reflections move with what they reflect instead of with the surface. */
+      if (getenv("FALCON_DLSS_NO_SPECULAR_HIT_DISTANCE") == nullptr) {
+        denoising.passes |= DENOISER_PASS_SPECULAR_HIT_DISTANCE;
+      }
+      return denoising;
+    }
   }
   else {
     /* Viewport Denoising */
@@ -1184,22 +1348,75 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
         denoising.use = false;
       }
     }
+
+    if (denoising.type == DENOISER_DLSS) {
+      /* Disable denoising when DLSS is not supported. */
+      if (!Denoiser::is_device_supported(denoising.type, denoise_device_info)) {
+        denoising.use = false;
+      }
+
+      denoising.start_sample = 0;
+      /* Carry the RR history across navigation restarts, aligned by the
+       * interactive motion passes (see MOTION_PASS_INTERACTIVE). OFF restores
+       * the old reset-on-restart behaviour. */
+      denoising.carry_history = get_boolean(cscene, "preview_denoising_carry_history");
+
+      switch ((DenoiserDLSSQuality)get_enum(cscene,
+                                            "preview_denoising_upscale_quality",
+                                            DENOISER_DLSS_MODE_NUM,
+                                            DENOISER_DLSS_MODE_BALANCED))
+      {
+        case DENOISER_DLSS_MODE_DLAA:
+          denoising.quality = DENOISER_QUALITY_HIGH;
+          denoising.upscale_factor = 1.0f;
+          break;
+        case DENOISER_DLSS_MODE_QUALITY:
+          denoising.quality = DENOISER_QUALITY_HIGH;
+          denoising.upscale_factor = 1.0f / 0.66666667f;
+          break;
+        default:
+        case DENOISER_DLSS_MODE_BALANCED:
+          denoising.quality = DENOISER_QUALITY_BALANCED;
+          denoising.upscale_factor = 1.0f / 0.58f;
+          break;
+        case DENOISER_DLSS_MODE_PERF:
+          denoising.quality = DENOISER_QUALITY_FAST;
+          denoising.upscale_factor = 2.0f;
+          break;
+        case DENOISER_DLSS_MODE_ULTRA_PERF:
+          denoising.quality = DENOISER_QUALITY_FAST;
+          denoising.upscale_factor = 3.0f;
+          break;
+      }
+
+      denoising.passes = DENOISER_PASS_ALBEDO | DENOISER_PASS_SPECULAR_ALBEDO |
+                         DENOISER_PASS_NORMAL | DENOISER_PASS_ROUGHNESS | DENOISER_PASS_DEPTH |
+                         DENOISER_PASS_MOTION | DENOISER_PASS_SPECULAR_MOTION;
+      /* Transmission passes feed the ColorBeforeTransparency guide, which tells
+       * RR which part of the pixel came through a transmissive surface. */
+      if (getenv("FALCON_DLSS_NO_TRANSP_GUIDE") == nullptr) {
+        denoising.passes |= DENOISER_PASS_TRANSMISSION;
+      }
+      /* Specular hit distance: RR builds the specular motion from it, so
+       * reflections move with what they reflect instead of with the surface. */
+      if (getenv("FALCON_DLSS_NO_SPECULAR_HIT_DISTANCE") == nullptr) {
+        denoising.passes |= DENOISER_PASS_SPECULAR_HIT_DISTANCE;
+      }
+      return denoising;
+    }
   }
 
   switch (input_passes) {
     case DENOISER_INPUT_RGB:
-      denoising.use_pass_albedo = false;
-      denoising.use_pass_normal = false;
+      denoising.passes = DENOISER_PASS_NONE;
       break;
 
     case DENOISER_INPUT_RGB_ALBEDO:
-      denoising.use_pass_albedo = true;
-      denoising.use_pass_normal = false;
+      denoising.passes = DENOISER_PASS_ALBEDO;
       break;
 
     case DENOISER_INPUT_RGB_ALBEDO_NORMAL:
-      denoising.use_pass_albedo = true;
-      denoising.use_pass_normal = true;
+      denoising.passes = DENOISER_PASS_ALBEDO | DENOISER_PASS_NORMAL;
       break;
 
     default:

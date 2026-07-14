@@ -64,7 +64,7 @@ def playback_controls(layout, context):
         )
 
     if is_sequencer:
-        layout.prop(context.workspace, "use_scene_time_sync", text="Sync Scene Time")
+        layout.prop(context.workspace, "use_scene_time_sync")
 
     layout.separator_spacer()
 
@@ -95,7 +95,7 @@ def playback_controls(layout, context):
             row.operator("screen.animation_play", text="", icon='PLAY')
     else:
         row.scale_x = 2
-        row.operator("screen.animation_play", text="", icon='PAUSE')
+        row.operator("screen.animation_pause", text="", icon='PAUSE')
         row.scale_x = 1
 
     row.operator("screen.keyframe_jump", text="", icon='NEXT_KEYFRAME').next = True
@@ -238,7 +238,11 @@ class TIME_PT_playback(TimelinePanelButtons, Panel):
 
         col = layout.column(heading="Playback")
         col.prop(scene, "lock_frame_selection_to_range", text="Limit to Frame Range")
+        row = col.row()
+        row.active = not scene.lock_frame_selection_to_range
+        row.prop(scene, "allow_preroll")
         col.prop(screen, "use_follow", text="Follow Current Frame")
+        col.prop(scene, "playback_loop_mode", text="Loop")
 
         col = layout.column(heading="Play In")
         col.prop(screen, "use_play_top_left_3d_editor", text="Active Editor")
@@ -252,6 +256,8 @@ class TIME_PT_playback(TimelinePanelButtons, Panel):
         col.prop(screen, "use_play_spreadsheet_editors", text="Spreadsheet")
 
         col = layout.column(heading="Show")
+        if st.type == 'SEQUENCE_EDITOR':
+            col.prop(st, "show_scrubbing_region", text="Scrubbing Region")
         col.prop(scene, "show_subframe", text="Subframes")
 
         layout.separator()

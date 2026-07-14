@@ -20,12 +20,12 @@ NODE_STORAGE_FUNCS(NodeCombSepColor)
 static void node_declare(NodeDeclarationBuilder &b)
 {
   b.is_function_node();
-  b.add_input<decl::Float>("Red")
+  b.add_input<decl::Float>("Red"_ustr)
       .default_value(0.0f)
       .min(0.0f)
       .max(1.0f)
       .subtype(PROP_FACTOR)
-      .label_fn([](bNode node) {
+      .label_fn([](const bNode &node) {
         switch (node_storage(node).mode) {
           case NODE_COMBSEP_COLOR_RGB:
           default:
@@ -35,12 +35,12 @@ static void node_declare(NodeDeclarationBuilder &b)
             return IFACE_("Hue");
         }
       });
-  b.add_input<decl::Float>("Green")
+  b.add_input<decl::Float>("Green"_ustr)
       .default_value(0.0f)
       .min(0.0f)
       .max(1.0f)
       .subtype(PROP_FACTOR)
-      .label_fn([](bNode node) {
+      .label_fn([](const bNode &node) {
         switch (node_storage(node).mode) {
           case NODE_COMBSEP_COLOR_RGB:
           default:
@@ -50,12 +50,12 @@ static void node_declare(NodeDeclarationBuilder &b)
             return IFACE_("Saturation");
         }
       });
-  b.add_input<decl::Float>("Blue")
+  b.add_input<decl::Float>("Blue"_ustr)
       .default_value(0.0f)
       .min(0.0f)
       .max(1.0f)
       .subtype(PROP_FACTOR)
-      .label_fn([](bNode node) {
+      .label_fn([](const bNode &node) {
         switch (node_storage(node).mode) {
           case NODE_COMBSEP_COLOR_RGB:
           default:
@@ -66,8 +66,12 @@ static void node_declare(NodeDeclarationBuilder &b)
             return IFACE_("Lightness");
         }
       });
-  b.add_input<decl::Float>("Alpha").default_value(1.0f).min(0.0f).max(1.0f).subtype(PROP_FACTOR);
-  b.add_output<decl::Color>("Color");
+  b.add_input<decl::Float>("Alpha"_ustr)
+      .default_value(1.0f)
+      .min(0.0f)
+      .max(1.0f)
+      .subtype(PROP_FACTOR);
+  b.add_output<decl::Color>("Color"_ustr);
 };
 
 static void node_layout(ui::Layout &layout, bContext * /*C*/, PointerRNA *ptr)
@@ -136,7 +140,7 @@ static void node_register()
 {
   static bke::bNodeType ntype;
 
-  fn_node_type_base(&ntype, "FunctionNodeCombineColor", FN_NODE_COMBINE_COLOR);
+  fn_node_type_base(&ntype, "FunctionNodeCombineColor"_ustr, FN_NODE_COMBINE_COLOR);
   ntype.ui_name = "Combine Color";
   ntype.ui_description =
       "Combine four channels into a single color, based on a particular color model";

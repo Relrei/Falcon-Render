@@ -403,7 +403,11 @@ ccl_device_inline bool falcon_photon_point_lookup(ccl_global const float *points
   if (!any) {
     return false;
   }
-  const float cone = 3.0f / (M_PI_F * r2);
+  /* Density estimation gives E * albedo (the albedo is baked into the stored
+   * flux); the outgoing radiance of a Lambertian receiver is E * albedo / pi.
+   * This 1/pi was missing: the point map measured pi x the calibrated LT
+   * layer on the same scene (audit 2026-07-05, ratio 2.91 ~= pi). */
+  const float cone = 3.0f / (M_PI_F * M_PI_F * r2);
   *radiance = make_float3(acc.x * cone, acc.y * cone, acc.z * cone);
   return true;
 }

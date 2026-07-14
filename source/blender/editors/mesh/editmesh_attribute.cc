@@ -67,6 +67,12 @@ static bool mesh_active_attribute_poll(bContext *C)
     return false;
   }
   const Mesh *mesh = ED_mesh_context(C);
+  if (mesh == nullptr) {
+    return false;
+  }
+  if (!mesh->runtime->edit_mesh) {
+    return false;
+  }
   if (!geometry::attribute_set_poll(*C, mesh->id)) {
     return false;
   }
@@ -132,11 +138,12 @@ static void bmesh_loop_layer_selected_values_set(BMEditMesh &em,
 
 static wmOperatorStatus mesh_set_attribute_exec(bContext *C, wmOperator *op)
 {
+  const Main *bmain = CTX_data_main(C);
   const Scene *scene = CTX_data_scene(C);
   ViewLayer *view_layer = CTX_data_view_layer(C);
 
   Vector<Object *> objects = BKE_view_layer_array_from_objects_in_edit_mode_unique_data(
-      scene, view_layer, CTX_wm_view3d(C));
+      *bmain, scene, view_layer, CTX_wm_view3d(C));
 
   Mesh *active_mesh = ED_mesh_context(C);
   AttributeOwner active_owner = AttributeOwner::from_id(&active_mesh->id);

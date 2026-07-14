@@ -21,7 +21,8 @@ ccl_device_inline Spectrum integrate_camera_sample(KernelGlobals kg,
                                                    const int x,
                                                    const int y,
                                                    const uint rng_pixel,
-                                                   ccl_private Ray *ray)
+                                                   ccl_private Ray *ray,
+                                                   ccl_private int &r_cache_miss)
 {
   /* Filter sampling. */
   const float2 rand_filter = (sample == 0) ? make_float2(0.5f, 0.5f) :
@@ -47,7 +48,7 @@ ccl_device_inline Spectrum integrate_camera_sample(KernelGlobals kg,
   const float2 rand_lens = make_float2(rand_time_lens.y, rand_time_lens.z);
 
   /* Generate camera ray. */
-  return camera_sample(kg, x, y, rand_filter, rand_time, rand_lens, ray);
+  return camera_sample(kg, x, y, rand_filter, rand_time, rand_lens, ray, r_cache_miss);
 }
 
 /* Return false to indicate that this pixel is finished.
@@ -57,27 +58,36 @@ ccl_device bool integrator_init_from_camera(KernelGlobals kg,
                                             IntegratorState state,
                                             const ccl_global KernelWorkTile *ccl_restrict tile,
                                             ccl_global float *render_buffer,
-                                            const int x,
-                                            const int y,
+                                            const int x_,
+                                            const int y_,
                                             const int scheduled_sample)
 {
   PROFILING_INIT(kg, PROFILING_RAY_SETUP);
 
-  /* Initialize path state to give basic buffer access and allow early outputs. */
-  path_state_init(state, tile, x, y);
+  int x, y, sample;
 
-  /* Check whether the pixel has converged and should not be sampled anymore. */
-  if (!film_need_sample_pixel(kg, state, render_buffer)) {
-    return false;
+  if (tile == nullptr) {
+    /* Restart from miss. Reconstruct x, y, sample from state. */
+    const uint pixel_index = INTEGRATOR_STATE(state, path, render_pixel_index);
+    x = pixel_index % (int)kernel_data.cam.width;
+    y = pixel_index / (int)kernel_data.cam.width;
+    sample = INTEGRATOR_STATE(state, path, sample);
   }
+  else {
+    x = x_;
+    y = y_;
 
-  /* Count the sample and get an effective sample for this pixel.
-   *
-   * This logic allows to both count actual number of samples per pixel, and to add samples to this
-   * pixel after it was converged and samples were added somewhere else (in which case the
-   * `scheduled_sample` will be different from actual number of samples in this pixel). */
-  const int sample = film_write_sample(
-      kg, state, render_buffer, scheduled_sample, tile->sample_offset);
+    /* Initialize path state to give basic buffer access and allow early outputs. */
+    path_state_init(state, tile, x, y);
+
+    /* Check whether the pixel has converged and should not be sampled anymore. */
+    if (!film_need_sample_pixel(kg, state, render_buffer)) {
+      return false;
+    }
+
+    /* Count the sample and get an effective sample for this pixel. */
+    sample = film_write_sample(kg, state, render_buffer, scheduled_sample, tile->sample_offset);
+  }
 
   /* Initialize random number seed for path. */
   const uint rng_pixel = path_rng_pixel_init(kg, sample, x, y);
@@ -123,6 +133,30 @@ ccl_device bool integrator_init_from_camera(KernelGlobals kg,
       pray.D = normalize(t * (sin_theta * cosf(phi)) + b * (sin_theta * sinf(phi)) +
                          n * cos_theta);
     }
+    else if (kernel_data.integrator.falcon_photon_is_world) {
+      /* Uniform environment: sample a direction uniformly over the sphere,
+       * then launch a parallel beam through the target sphere's cross-section
+       * disk from outside the scene (pbrt UniformInfiniteLight emission;
+       * host flux = 4 pi^2 r^2 L / N so every photon carries equal flux).
+       * Geometry rides in the repurposed sun_* fields (see data_template.h).
+       * No lights[] access: this pass runs with every lamp hidden. */
+      const float cos_theta = 1.0f - 2.0f * rd.x;
+      const float sin_theta = sqrtf(max(1.0f - cos_theta * cos_theta, 0.0f));
+      const float dphi = M_2PI_F * rd.y;
+      const float3 d = make_float3(
+          sin_theta * cosf(dphi), sin_theta * sinf(dphi), cos_theta);
+      const float3 c = make_float3(kernel_data.integrator.falcon_photon_sun_minx,
+                                   kernel_data.integrator.falcon_photon_sun_miny,
+                                   kernel_data.integrator.falcon_photon_sun_z);
+      const float disk_r = kernel_data.integrator.falcon_photon_sun_sizex;
+      const float backoff = kernel_data.integrator.falcon_photon_sun_sizey;
+      float3 t, b;
+      make_orthonormals(d, &t, &b);
+      const float pr = disk_r * sqrtf(rp.x);
+      const float pphi = M_2PI_F * rp.y;
+      pray.P = c - d * backoff + t * (pr * cosf(pphi)) + b * (pr * sinf(pphi));
+      pray.D = d;
+    }
     else {
       const ccl_global KernelLight *klight = &kernel_data_fetch(lights, 0);
       const float3 n = klight->area.dir;
@@ -148,8 +182,14 @@ ccl_device bool integrator_init_from_camera(KernelGlobals kg,
     pray.dP = differential_zero_compact();
     pray.dD = differential_zero_compact();
     integrator_state_write_ray(state, &pray);
-    path_state_init_integrator(
-        kg, state, sample, rng_pixel, make_spectrum(kernel_data.integrator.falcon_photon_flux));
+    /* Throughput starts at 1.0 (RELATIVE, like a camera path); the physical
+     * per-photon flux is multiplied in at deposit time. Initializing with the
+     * absolute flux (~1e-9) fed russian roulette a "black" path: survival
+     * probability sqrt(throughput) ~= 1e-4 killed 99.99% of the photons after
+     * the first specular bounce (measured: 64M photons -> 5178 deposits =
+     * exactly sqrt(flux), the reason through-glass caustics starved while the
+     * survivors' RR boost was eaten by the 4x flux clamp). */
+    path_state_init_integrator(kg, state, sample, rng_pixel, one_spectrum());
     integrator_path_init(state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST);
     return true;
   }
@@ -157,24 +197,49 @@ ccl_device bool integrator_init_from_camera(KernelGlobals kg,
 
   /* Generate camera ray. */
   Ray ray;
-  Spectrum T = integrate_camera_sample(kg, sample, x, y, rng_pixel, &ray);
+  int cache_miss = 0;
+  Spectrum T = integrate_camera_sample(kg, sample, x, y, rng_pixel, &ray, cache_miss);
+  if (cache_miss) {
+    if (tile != nullptr) {
+      integrator_path_init(state, DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA);
+      INTEGRATOR_STATE_WRITE(state, path, sample) = sample;
+    }
+    integrator_path_cache_miss(state, DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA);
+    return true;
+  }
+
   if (is_zero(T)) {
+    if (tile == nullptr) {
+      integrator_path_terminate(
+          kg, state, render_buffer, DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA);
+    }
     return true;
   }
 
   /* Write camera ray to state. */
   integrator_state_write_ray(state, &ray);
 
-  /* Initialize path state for path integration. */
-  path_state_init_integrator(kg, state, sample, rng_pixel, T);
-
-  /* Continue with intersect_closest kernel, optionally initializing volume
-   * stack before that if the camera may be inside a volume. */
-  if (kernel_data.cam.is_inside_volume) {
-    integrator_path_init(state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_VOLUME_STACK);
+  if (tile == nullptr) {
+    /* Re-initialize path state for path integration. */
+    path_state_init_integrator(kg, state, sample, rng_pixel, T);
+    integrator_path_next(state,
+                         DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA,
+                         kernel_data.cam.is_inside_volume ?
+                             DEVICE_KERNEL_INTEGRATOR_INTERSECT_VOLUME_STACK :
+                             DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST);
   }
   else {
-    integrator_path_init(state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST);
+    /* Initialize path state for path integration. */
+    path_state_init_integrator(kg, state, sample, rng_pixel, T);
+
+    /* Continue with intersect_closest kernel, optionally initializing volume
+     * stack before that if the camera may be inside a volume. */
+    if (kernel_data.cam.is_inside_volume) {
+      integrator_path_init(state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_VOLUME_STACK);
+    }
+    else {
+      integrator_path_init(state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST);
+    }
   }
 
   return true;

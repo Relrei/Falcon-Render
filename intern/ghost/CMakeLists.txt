@@ -305,7 +305,9 @@ elseif(WITH_GHOST_X11 OR WITH_GHOST_WAYLAND)
     set(INC_DST ${CMAKE_CURRENT_BINARY_DIR}/libwayland)
 
     # Generate protocols bindings.
-    macro(generate_protocol_bindings PROT_DEF)
+    # Modifies in parent scope:
+    # - `SRC`: appended with generated protocol source and header files.
+    function(generate_protocol_bindings PROT_DEF)
       # File name without directory or extension (use for header name).
       get_filename_component(_name ${PROT_DEF} NAME_WLE)
       add_custom_command(
@@ -332,8 +334,8 @@ elseif(WITH_GHOST_X11 OR WITH_GHOST_WAYLAND)
         ${INC_DST}/${_name}-client-protocol.c
         ${INC_DST}/${_name}-client-protocol.h
       )
-      unset(_name)
-    endmacro()
+      set(SRC "${SRC}" PARENT_SCOPE)
+    endfunction()
 
     list(APPEND INC_SYS
       ${INC_DST}
@@ -362,6 +364,10 @@ elseif(WITH_GHOST_X11 OR WITH_GHOST_WAYLAND)
     # Viewporter (only required when fractional scale is in use).
     generate_protocol_bindings(
       "${WAYLAND_PROTOCOLS_DIR}/stable/viewporter/viewporter.xml"
+    )
+    # Color management (HDR properties)
+    generate_protocol_bindings(
+      "${WAYLAND_PROTOCOLS_DIR}/staging/color-management/color-management-v1.xml"
     )
     # Pointer-constraints.
     generate_protocol_bindings(
@@ -392,6 +398,10 @@ elseif(WITH_GHOST_X11 OR WITH_GHOST_WAYLAND)
     generate_protocol_bindings(
       "${WAYLAND_PROTOCOLS_DIR}/staging/cursor-shape/cursor-shape-v1.xml"
     )
+    # Support setting the window icon directly (replace legacy `.desktop` files).
+    generate_protocol_bindings(
+      "${WAYLAND_PROTOCOLS_DIR}/staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml"
+    )
 
     unset(INC_DST)
 
@@ -409,11 +419,6 @@ elseif(WITH_GHOST_X11 OR WITH_GHOST_WAYLAND)
       intern/GHOST_NDOFManagerUnix.hh
     )
   endif()
-
-  if(NOT WITH_INSTALL_PORTABLE)
-    add_definitions(-DPREFIX="${CMAKE_INSTALL_PREFIX}")
-  endif()
-
 
 elseif(WIN32)
   # # Warnings as errors, this is too strict!
@@ -497,8 +502,31 @@ elseif(UNIX)
     intern/GHOST_SystemPathsUnix.hh
   )
 
+  # System-wide (non-portable) installs locate architecture-dependent libraries under `lib`
+  # (typically `/usr/lib`), following the FHS convention - alongside `share/`.
   if(NOT WITH_INSTALL_PORTABLE)
     add_definitions(-DPREFIX="${CMAKE_INSTALL_PREFIX}")
+
+    # NOTE: A Python module is itself a library: its wrapper libraries are bundled in the package
+    # beside the add-on, so it doesn't need a separate system libraries path.
+    if(NOT WITH_PYTHON_MODULE)
+      # The standard variable for this path is `CMAKE_INSTALL_LIBDIR` (typically `lib` or `lib64`).
+      # It isn't set by default, but systems that build packages may define it.
+      #
+      # NOTE: `include(GNUInstallDirs)` could auto-detect this path.
+      # Since default builds aren't system-wide, leave it to the
+      # package-build scripts to pass in the correct directory.
+      set(_lib "lib")
+      if(DEFINED CMAKE_INSTALL_LIBDIR)
+        if(CMAKE_INSTALL_LIBDIR)
+          set(_lib "${CMAKE_INSTALL_LIBDIR}")
+        endif()
+      endif()
+
+      add_definitions(-DBLENDER_INSTALL_LIBDIR="${_lib}")
+
+      unset(_lib)
+    endif()
   endif()
 
 elseif(WIN32)

@@ -161,7 +161,7 @@ enum_volume_interpolation = (
 enum_world_mis = (
     ('NONE',
      "None",
-     "Don't sample the background, faster but might cause noise for non-solid backgrounds"),
+     "Do not sample the background, faster but might cause noise for non-solid backgrounds"),
     ('AUTOMATIC',
      "Auto",
      "Automatically try to determine the best setting"),
@@ -188,6 +188,7 @@ enum_texture_limit = (
     ('4096', "4096", "Limit texture size to 4096 pixels", 6),
     ('8192', "8192", "Limit texture size to 8192 pixels", 7),
 )
+
 
 enum_fast_gi_method = (
     ('REPLACE', "Replace", "Replace global illumination with ambient occlusion after a specified number of bounces"),
@@ -230,11 +231,16 @@ enum_view3d_shading_render_pass = (
     ('UV', "UV", "Show the UV render pass"),
     ('MIST', "Mist", "Show the Mist render pass"),
     ('DENOISING_ALBEDO', "Denoising Albedo", "Albedo pass used by denoiser"),
+    ('DENOISING_SPECULAR_ALBEDO', "Denoising Specular Albedo", "Specular albedo pass used by denoiser"),
     ('DENOISING_NORMAL', "Denoising Normal", "Normal pass used by denoiser"),
+    ('DENOISING_ROUGHNESS', "Denoising Roughness", "Roughness pass used by denoiser"),
+    ('DENOISING_BACKWARD_MOTION', "Denoising Backward Motion", "Backward motion pass used by denoiser"),
     ('SAMPLE_COUNT', "Sample Count", "Per-pixel number of samples"),
 )
 
 enum_view3d_debug_render_pass = (
+    ('MOTION', "Vector", "Show motion vectors"),
+
     ('VOLUME_SCATTER', "Volume Scatter", "Show the contribution of scattered ray in volume"),
     ('VOLUME_TRANSMIT', "Volume Transmit", "Show the contribution of transmitted ray in volume"),
     ('VOLUME_MAJORANT', "Volume Majorant", "Show the majorant transmittance of the volume")
@@ -270,6 +276,14 @@ def enum_openimagedenoise_denoiser(self, context):
     return []
 
 
+def enum_dlss_denoiser(self, context):
+    import _cycles
+    if _cycles.with_dlss and (not context or bool(context.preferences.addons[__package__].preferences.get_devices_for_type('CUDA'))):
+        return [('DLSS', "DLSS",
+                 n_("Use NVIDIA DLSS Ray Reconstruction"), 8)]
+    return []
+
+
 def enum_optix_denoiser(self, context):
     if not context or bool(context.preferences.addons[__package__].preferences.get_devices_for_type('OPTIX')):
         return [('OPTIX', "OptiX", n_(
@@ -280,8 +294,9 @@ def enum_optix_denoiser(self, context):
 def enum_preview_denoiser(self, context):
     optix_items = enum_optix_denoiser(self, context)
     oidn_items = enum_openimagedenoise_denoiser(self, context)
+    dlss_items = enum_dlss_denoiser(self, context)
 
-    if len(optix_items) or len(oidn_items):
+    if len(optix_items) or len(oidn_items) or len(dlss_items):
         items = [
             ('AUTO',
              "Automatic",
@@ -293,6 +308,7 @@ def enum_preview_denoiser(self, context):
 
     items += optix_items
     items += oidn_items
+    items += dlss_items
     return items
 
 
@@ -300,11 +316,12 @@ def enum_denoiser(self, context):
     items = []
     items += enum_optix_denoiser(self, context)
     items += enum_openimagedenoise_denoiser(self, context)
+    items += enum_dlss_denoiser(self, context)  # 実験: 最終レンダーでもDLSS-RRを選べるように
     return items
 
 
 enum_denoising_input_passes = (
-    ('RGB', "None", "Don't use utility passes for denoising", 1),
+    ('RGB', "None", "Do not use utility passes for denoising", 1),
     ('RGB_ALBEDO', "Albedo", "Use albedo pass for denoising", 2),
     ('RGB_ALBEDO_NORMAL', "Albedo and Normal", "Use albedo and normal passes for denoising", 3),
 )
@@ -337,6 +354,28 @@ enum_denoising_quality = (
      "Fast",
      "High performance",
      3),
+)
+enum_denoising_upscale_quality = (
+    ('NONE',
+     "None",
+     "Highest quality without upscaling",
+     0),
+    ('QUALITY',
+     "Quality",
+     "Offers higher image quality than balanced mode",
+     1),
+    ('BALANCED',
+     "Balanced",
+     "Offers both optimized performance and image quality",
+     2),
+    ('PERF',
+     "Performance",
+     "Offers a higher performance boost than balanced mode",
+     3),
+    ('ULTRA_PERF',
+     "Ultra Performance",
+     "Offers the highest performance boost",
+     4),
 )
 
 enum_direct_light_sampling_type = (
@@ -488,6 +527,66 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
     preview_denoising_use_gpu: BoolProperty(
         name="Denoise Preview on GPU",
         description="Perform denoising on GPU devices configured in the system tab in the user preferences. This is significantly faster than on CPU, but requires additional GPU memory. When large scenes need more GPU memory, this option can be disabled",
+        default=True,
+    )
+    preview_denoising_upscale_quality: EnumProperty(
+        name="Viewport Denoising Upscale Quality",
+        description="Overall quality when using DLSS",
+        items=enum_denoising_upscale_quality,
+        default='QUALITY',
+    )
+    denoising_upscale_quality: EnumProperty(
+        name="Denoising Upscale Quality",
+        description="Overall quality when using DLSS for final renders. Modes other "
+        "than None render internally at a reduced resolution and upscale to the "
+        "output size (faster, experimental)",
+        items=enum_denoising_upscale_quality,
+        default='NONE',
+    )
+    denoising_carry_history: BoolProperty(
+        name="履歴持ち越し",
+        description="アニメーションレンダーでDLSSの時間履歴をフレーム間で持ち越す"
+        "(ゲームと同じ動作)。ちらつきが減り少ないサンプルで安定する。"
+        "OFFで旧来のフレーム毎リセットに戻る",
+        default=True,
+    )
+    preview_denoising_carry_history: BoolProperty(
+        name="ナビ履歴持ち越し",
+        description="ビューポートのナビゲーションをまたいでDLSSの時間履歴を"
+        "モーションベクタで整列して持ち越し、停止時はサンプルを蓄積する(実験的)。"
+        "リセット毎の再収束のブレが消え、静止画像が最大サンプルまで収束する。"
+        "ナビ中の低解像度プレビューは無効になるため操作は重くなる。"
+        "ボリュームはモーションベクタを持たないため移動中に尾を引く"
+        "(ボリューム入りシーンはOFF推奨)",
+        default=False,
+    )
+    denoising_warmup_frames: IntProperty(
+        name="ウォームアップ枚数",
+        description="アニメの開始フレームと各カットの直前に、実フレームをこの枚数だけ焼いて捨てる。"
+        "DLSSの履歴は別視点の実フレームからしか育たないため、"
+        "冷えた1枚目とカット直後だけノイズが多くなるのを埋める"
+        "(2枚でほぼ埋まり4枚で頭打ち。同じ絵の焼き直しやサンプル増量では温まらない)。"
+        "「ウォームアップ付きレンダー」で使う",
+        min=0, max=16, default=4,
+    )
+    preview_denoising_carry_motion_limit: IntProperty(
+        name="履歴を保つ動きの上限",
+        description="この画素数を超えてカメラが動いたフレームでは履歴を捨てる。"
+        "DLSSはゲームの毎秒60コマの小刻みな動きが前提で、"
+        "パストレのビューポートは1コマが遅いためマウスを振ると動きが大きくなりすぎ、"
+        "履歴が正しく重ならずゴーストになる。"
+        "小さくするとゴーストは減るがナビ中の滑らかさも減る"
+        "(0でナビ毎に必ずリセット=持ち越しOFF相当)",
+        min=0, max=1024, default=48,
+        subtype='PIXEL',
+    )
+    preview_denoising_bypass_dof: BoolProperty(
+        name="プレビュー中は被写界深度を切る",
+        description="ビューポートのDLSSプレビュー中だけカメラの絞りを閉じる。"
+        "レンズによるボケはサンプル毎にレイの向きが変わる確率的なぼかしで、"
+        "DLSSの想定外のため斑点になる(カメラビューだけ荒れる原因)。"
+        "ウォークビューは元からボケないので、この設定でカメラビューが同じ見え方になる。"
+        "ボケの確認はOIDNか最終レンダーで",
         default=True,
     )
 
@@ -676,6 +775,7 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         "learns the light distribution of the scene and guides path into directions "
         "with high direct and indirect light contributions",
         default=False,
+        update=update_render_passes,
     )
 
     use_deterministic_guiding: BoolProperty(
@@ -895,6 +995,11 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         subtype='PIXEL'
     )
 
+    use_pixel_jitter: BoolProperty(
+        name="Use Pixel Jitter",
+        default=False,
+    )
+
     seed: IntProperty(
         name="Seed",
         description="Seed value for integrator to get different noise patterns",
@@ -1021,18 +1126,34 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         subtype='FACTOR',
     )
 
+    texture_resolution: FloatProperty(
+        name="Viewport Texture Resolution",
+        default=1.0,
+        description="Scale factor for texture resolution used by viewport rendering",
+        min=0.00001, max=1.0,
+        subtype='FACTOR',
+    )
+
+    texture_resolution_render: FloatProperty(
+        name="Render Texture Resolution",
+        default=1.0,
+        description="Scale factor for texture resolution used by final rendering",
+        min=0.00001, max=1.0,
+        subtype='FACTOR',
+    )
+
     texture_limit: EnumProperty(
         name="Viewport Texture Limit",
         default='OFF',
         description="Limit texture size used by viewport rendering",
-        items=enum_texture_limit
+        items=enum_texture_limit,
     )
 
     texture_limit_render: EnumProperty(
         name="Render Texture Limit",
         default='OFF',
         description="Limit texture size used by final rendering",
-        items=enum_texture_limit
+        items=enum_texture_limit,
     )
 
     use_fast_gi: BoolProperty(
@@ -1112,6 +1233,17 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         name="Adaptive Compile",
         description=adaptive_compile_description,
         default=False)
+
+    debug_use_texture_cache_eviction: BoolProperty(
+        name="Cache Eviction",
+        description="Evict unused tiles from the texture cache to free up memory",
+        default=True)
+
+    debug_texture_cache_preserve_unused: IntProperty(
+        name="Preserve Unused MB",
+        description="Preserve unused texture cache data, up to this amount of memory",
+        min=0,
+        default=0)
 
     # Falcon SHARC (experimental spatial hash radiance cache) UI controls.
     # Bridged to the FALCON_SHARC_* env vars by CyclesRender in __init__.py.
@@ -1244,6 +1376,16 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
                     "between the caustic and the camera; also correctly removes "
                     "through-glass splats light tracing cannot place. Small cost, "
                     "keep on unless chasing raw speed on open scenes",
+        default=True,
+    )
+    falcon_lt_world: BoolProperty(
+        name="LT World Photons",
+        description="Add a world photon pass to the LT composite: a uniform "
+                    "(non-textured) background emits photons so world->glass->"
+                    "shadow embedded caustics appear. The exclusive separation "
+                    "turns PT caustics off in beauty, so without this pass that "
+                    "component is in no layer (LuxCore parity gap #2). Skipped "
+                    "automatically for HDRI/textured or black worlds",
         default=True,
     )
     falcon_sharc_gate: BoolProperty(
@@ -1422,6 +1564,11 @@ class CyclesWorldSettings(bpy.types.PropertyGroup):
                     "(lower values give more accurate and detailed results, but also increased render time)",
         default=1.0,
         min=0.0000001, max=100000.0, soft_min=0.1, soft_max=100.0, precision=4
+    )
+    use_shadows: BoolProperty(
+        name="Shadows",
+        description="Enable shadow casting from the world",
+        default=True,
     )
 
     @classmethod
@@ -1698,6 +1845,18 @@ class CyclesRenderLayerSettings(bpy.types.PropertyGroup):
         default=False,
         update=update_render_passes,
     )
+    denoising_pass_follow_reflections: BoolProperty(
+        name="Denoising Pass Reflections",
+        description="Follow reflections for the denoising feature passes",
+        default=True,
+        update=update_render_passes,
+    )
+    denoising_pass_use_albedo_roughness_weighting: BoolProperty(
+        name="Denoising Pass Albedo Roughness Weighting",
+        description="Use roughness-based weighting of the albedo for the denoising feature passes",
+        default=True,
+        update=update_render_passes,
+    )
 
     @classmethod
     def register(cls):
@@ -1926,6 +2085,22 @@ class CyclesPreferences(bpy.types.AddonPreferences):
 
         return False
 
+    def has_dlss_gpu_devices(self):
+        compute_device_type = self.get_compute_device_type()
+
+        # We need non-CPU devices, used for rendering and supporting DLSS
+        if compute_device_type != 'NONE':
+            for device in self.get_device_list(compute_device_type):
+                device_type = device[1]
+                if device_type == 'CPU':
+                    continue
+
+                has_device_dlss_support = device[9]
+                if has_device_dlss_support and self.find_existing_device_entry(device).use:
+                    return True
+
+        return False
+
     def has_optixdenoiser_gpu_devices(self):
         compute_device_type = self.get_compute_device_type()
 
@@ -1991,8 +2166,8 @@ class CyclesPreferences(bpy.types.AddonPreferences):
                     col.label(text=rpt_("or AMD Radeon Pro %s driver or newer") %
                               pro_driver_version, icon='BLANK1', translate=False)
                 elif sys.platform.startswith("linux"):
-                    rocm_version = "6.0"
-                    driver_version = "23.40"
+                    rocm_version = "6.3"
+                    driver_version = "24.30"
                     col.label(
                         text=rpt_("Requires AMD GPU with RDNA architecture"),
                         icon='BLANK1',
@@ -2005,14 +2180,27 @@ class CyclesPreferences(bpy.types.AddonPreferences):
             elif device_type == 'ONEAPI':
                 import sys
                 if sys.platform.startswith("win"):
+                    # NOTE(@sirgienko)
+                    # We need NEO driver version 35716 or higher, see oneapi/device_impl.cpp for more details.
+                    # The minimal version for Intel® Arc™ GPUs is driver 101.8331
+                    # The minimal version for Intel® Arc™ Pro GPUs is driver 101.8306
+                    # The previous driver version for Intel® Arc™ GPUs, before 101.8331, was driver 101.8250
+                    # and no intermediate versions were publicly available between 8250 and 8331 for Intel® Arc™ GPUs.
+                    # As a result, we can safely recommend users to use driver version 8306 or higher, without needing
+                    # to distinguish between Intel® Arc™ and Intel® Arc™ Pro users.
                     driver_version = "XX.X.101.8306"
-                    col.label(text=rpt_("Requires Intel GPU with Xe-HPG architecture"), icon='BLANK1', translate=False)
-                    col.label(text=rpt_("and Windows driver version %s or newer") % driver_version,
+                    col.label(
+                        text=self._format_device_name(
+                            rpt_("Requires Intel(R) Arc(TM) GPUs or newer Intel(R) Graphics")),
+                        icon='BLANK1',
+                        translate=False)
+                    col.label(text=rpt_("with Windows driver version %s or newer") % driver_version,
                               icon='BLANK1', translate=False)
                 elif sys.platform.startswith("linux"):
-                    driver_version = "XX.XX.34666.3"
+                    driver_version = "XX.XX.37435.3"
                     col.label(
-                        text=rpt_("Requires Intel GPU with Xe-HPG architecture and"),
+                        text=self._format_device_name(
+                            rpt_("Requires Intel(R) Arc(TM) GPUs or newer Intel(R) Graphics")),
                         icon='BLANK1',
                         translate=False)
                     col.label(

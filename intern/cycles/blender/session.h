@@ -110,6 +110,21 @@ class BlenderSession {
   double last_progress;
   double last_status_time;
 
+  /* Hard-cut detection for the DLSS-RR viewport history (bound-camera marker
+   * switches and timeline jumps reset it; playback steps of one frame keep
+   * it and get warped by the interactive motion passes instead). */
+  /* Drop the DLSS-RR history when the frame that follows cannot be reached from
+   * the last one by motion vectors (marker camera switch, timeline jump). */
+  void clear_denoiser_history_on_cut();
+  const void *last_cut_camera_ = nullptr;
+  int last_cut_frame_ = INT_MIN;
+
+  /* Viewport: drop the carried history when the camera jumped too far for the motion vectors to
+   * explain (see clear_denoiser_history_on_jump). */
+  void clear_denoiser_history_on_jump();
+  Transform last_view_matrix_ = transform_identity();
+  bool have_last_view_matrix_ = false;
+
   int width, height;
   float pixelsize;
   bool preview_osl;

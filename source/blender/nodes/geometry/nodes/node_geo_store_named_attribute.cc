@@ -11,6 +11,7 @@
 #include "RNA_enum_types.hh"
 
 #include "BKE_attribute_legacy_convert.hh"
+#include "BKE_grease_pencil.hh"
 #include "BKE_instances.hh"
 #include "BKE_mesh.hh"
 #include "BKE_type_conversions.hh"
@@ -35,16 +36,19 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_default_layout();
   const bNode *node = b.node_or_null();
 
-  b.add_input<decl::Geometry>("Geometry")
+  b.add_input<decl::Geometry>("Geometry"_ustr)
       .description("Geometry to store a new attribute with the given name on");
-  b.add_output<decl::Geometry>("Geometry").propagate_all().align_with_previous();
-  b.add_input<decl::Bool>("Selection").default_value(true).hide_value().field_on_all();
-  b.add_input<decl::String>("Name").is_attribute_name().optional_label();
+  b.add_output<decl::Geometry>("Geometry"_ustr).propagate_all_geometry().align_with_previous();
+  b.add_input<decl::Bool>("Selection"_ustr)
+      .default_value(true)
+      .hide_value()
+      .evaluated_geometry_field();
+  b.add_input<decl::String>("Name"_ustr).is_attribute_name().optional_label();
 
   if (node != nullptr) {
     const NodeGeometryStoreNamedAttribute &storage = node_storage(*node);
     const eCustomDataType data_type = eCustomDataType(storage.data_type);
-    b.add_input(data_type, "Value").field_on_all();
+    b.add_input(data_type, "Value"_ustr).evaluated_geometry_field();
   }
 }
 
@@ -72,36 +76,53 @@ static void node_gather_link_searches(GatherLinkSearchOpParams &params)
 
   if (params.in_out() == SOCK_IN) {
     const std::optional<eCustomDataType> type = bke::socket_type_to_custom_data_type(
-        eNodeSocketDatatype(params.other_socket().type));
+        params.other_socket().type);
     if (type && *type != CD_PROP_STRING) {
       /* The input and output sockets have the same name. */
       params.add_item(IFACE_("Value"), [type](LinkSearchOpParams &params) {
-        bNode &node = params.add_node("GeometryNodeStoreNamedAttribute");
+        bNode &node = params.add_node("GeometryNodeStoreNamedAttribute"_ustr);
         node_storage(node).data_type = *type;
-        params.update_and_connect_available_socket(node, "Value");
+        params.update_and_connect_available_socket(node, "Value"_ustr);
       });
+    }
+  }
+}
+
+/* Need to tag the drawings because it's not handled by try_capture_field_on_geometry
+ * automatically yet.*/
+static void grease_pencil_add_missing_update_tags(const std::string &name,
+                                                  GeometrySet &geometry_set)
+{
+  GreasePencil &grease_pencil = *geometry_set.get_grease_pencil_for_write();
+  if (name == "fill_id") {
+    for (GreasePencilDrawingBase *base : grease_pencil.drawings()) {
+      if (base->type != GP_DRAWING) {
+        continue;
+      }
+      bke::greasepencil::Drawing &drawing = reinterpret_cast<GreasePencilDrawing *>(base)->wrap();
+      drawing.tag_fills_changed();
     }
   }
 }
 
 static void node_geo_exec(GeoNodeExecParams params)
 {
-  GeometrySet geometry_set = params.extract_input<GeometrySet>("Geometry");
-  const std::string name = params.extract_input<std::string>("Name");
+  GeometrySet geometry_set = params.extract_input<GeometrySet>("Geometry"_ustr);
+  const std::string name = params.extract_input<std::string>("Name"_ustr);
 
   if (name.empty()) {
-    params.set_output("Geometry", std::move(geometry_set));
+    params.set_output("Geometry"_ustr, std::move(geometry_set));
     return;
   }
   if (!bke::allow_procedural_attribute_access(name)) {
     params.error_message_add(NodeWarningType::Info, TIP_(bke::no_procedural_access_message));
-    params.set_output("Geometry", std::move(geometry_set));
+    params.set_output("Geometry"_ustr, std::move(geometry_set));
     return;
   }
   if (bke::attribute_name_is_anonymous(name)) {
     params.error_message_add(NodeWarningType::Info,
                              TIP_("Anonymous attributes cannot be created here"));
-    params.set_output("Geometry", std::move(geometry_set));
+    params.set_output("Geometry"_ustr, std::move(geometry_set));
     return;
   }
 
@@ -112,11 +133,16 @@ static void node_geo_exec(GeoNodeExecParams params)
   const bke::AttrType data_type = *bke::custom_data_type_to_attr_type(cd_type);
   const AttrDomain domain = AttrDomain(storage.domain);
 
-  const Field<bool> selection = params.extract_input<Field<bool>>("Selection");
+  const Field<bool> selection = params.extract_input<Field<bool>>("Selection"_ustr);
 
-  GField field = params.extract_input<GField>("Value");
-  if (ELEM(data_type, bke::AttrType::Float2, bke::AttrType::ColorByte, bke::AttrType::Int8)) {
-    field = bke::get_implicit_type_conversions().try_convert(
+  GField field = params.extract_input<GField>("Value"_ustr);
+  if (ELEM(data_type,
+           bke::AttrType::Float2,
+           bke::AttrType::Float4,
+           bke::AttrType::ColorByte,
+           bke::AttrType::Int8))
+  {
+    field = *bke::get_implicit_type_conversions().try_convert(
         std::move(field), bke::attribute_type_to_cpp_type(data_type));
   }
 
@@ -161,6 +187,9 @@ static void node_geo_exec(GeoNodeExecParams params)
               bke::mesh_ensure_default_color_attribute_on_add(mesh, name, domain, data_type);
               bke::mesh_ensure_default_uv_attribute_on_add(mesh, name, domain, data_type);
             }
+            if (component.type() == GeometryComponent::Type::GreasePencil) {
+              grease_pencil_add_missing_update_tags(name, geometry_set);
+            }
           }
           else if (component.attribute_domain_size(domain) != 0) {
             failure.store(true);
@@ -177,14 +206,14 @@ static void node_geo_exec(GeoNodeExecParams params)
     RNA_enum_name_from_value(rna_enum_attribute_type_items, cd_type, &type_name);
     const std::string message = fmt::format(
         fmt::runtime(
-            TIP_("Failed to write to attribute \"{}\" with domain \"{}\" and type \"{}\"")),
+            RPT_("Failed to write to attribute \"{}\" with domain \"{}\" and type \"{}\"")),
         name,
-        TIP_(domain_name),
-        TIP_(type_name));
+        RPT_(domain_name),
+        RPT_(type_name));
     params.error_message_add(NodeWarningType::Warning, message);
   }
 
-  params.set_output("Geometry", std::move(geometry_set));
+  params.set_output("Geometry"_ustr, std::move(geometry_set));
 }
 
 static void node_rna(StructRNA *srna)
@@ -216,7 +245,8 @@ static void node_register()
 {
   static bke::bNodeType ntype;
 
-  geo_node_type_base(&ntype, "GeometryNodeStoreNamedAttribute", GEO_NODE_STORE_NAMED_ATTRIBUTE);
+  geo_node_type_base(
+      &ntype, "GeometryNodeStoreNamedAttribute"_ustr, GEO_NODE_STORE_NAMED_ATTRIBUTE);
   ntype.ui_name = "Store Named Attribute";
   ntype.ui_description =
       "Store the result of a field on a geometry as an attribute with the specified name";
@@ -226,12 +256,12 @@ static void node_register()
                          "NodeGeometryStoreNamedAttribute",
                          node_free_standard_storage,
                          node_copy_standard_storage);
-  bke::node_type_size(ntype, 140, 100, 700);
   ntype.initfunc = node_init;
   ntype.declare = node_declare;
   ntype.gather_link_search_ops = node_gather_link_searches;
   ntype.geometry_node_execute = node_geo_exec;
   ntype.draw_buttons = node_layout;
+  ntype.default_width = bke::NodeWidth::_160;
   bke::node_register_type(ntype);
 
   node_rna(ntype.rna_ext.srna);

@@ -121,7 +121,7 @@ void BlenderSession::create_session()
   const SessionParams session_params = BlenderSync::get_session_params(
       b_engine, b_userpref, *b_scene, background, pixelsize);
   const SceneParams scene_params = BlenderSync::get_scene_params(
-      *b_scene, background, use_developer_ui);
+      b_userpref, *b_data, *b_scene, background, use_developer_ui);
   const bool session_pause = BlenderSync::get_session_pause(*b_scene, background);
 
   /* reset status/progress */
@@ -208,7 +208,7 @@ void BlenderSession::reset_session(blender::Main &b_data, blender::Depsgraph &b_
   const SessionParams session_params = BlenderSync::get_session_params(
       b_engine, b_userpref, *b_scene, background, pixelsize);
   const SceneParams scene_params = BlenderSync::get_scene_params(
-      *b_scene, background, use_developer_ui);
+      b_userpref, b_data, *b_scene, background, use_developer_ui);
 
   if (scene->params.modified(scene_params) || session->params.modified(session_params) ||
       (this->b_render->mode & blender::R_PERSISTENT_DATA) == 0)
@@ -335,6 +335,106 @@ void BlenderSession::stamp_view_layer_metadata(Scene *scene, const string &view_
                                time_human_readable_from_seconds(total_time - render_time).c_str());
 }
 
+void BlenderSession::clear_denoiser_history_on_cut()
+{
+  /* Hard cuts (bound-camera marker switch, timeline jump) cannot be explained by
+   * motion vectors: warping the history across one drags the previous shot into
+   * the new one as a ghost -- the old chalkboard text still legible over the new
+   * frame. Drop the history there, like games do on scene cuts. Single-frame
+   * steps stay below the frame threshold and keep their history. */
+  const void *cut_camera = (b_v3d && b_v3d->camera) ? (const void *)b_v3d->camera :
+                                                      (const void *)b_scene->camera;
+  const int cut_frame = b_scene->r.cfra;
+
+  if ((last_cut_camera_ != nullptr && cut_camera != last_cut_camera_) ||
+      (last_cut_frame_ != INT_MIN && std::abs(cut_frame - last_cut_frame_) > 1))
+  {
+    session->clear_denoiser_temporal_history();
+  }
+
+  last_cut_camera_ = cut_camera;
+  last_cut_frame_ = cut_frame;
+}
+
+void BlenderSession::clear_denoiser_history_on_jump()
+{
+  /* DLSS-RR is built for games: sixty small steps a second, so the previous frame is always a
+   * near neighbour of the current one and the motion vectors line the history up. A path-traced
+   * viewport runs at a few frames a second, so one flick of the mouse moves the camera further
+   * between two frames than a game moves in half a second. The history then gets warped by
+   * vectors that no longer describe it, and what was behind the newly revealed geometry smears
+   * across it -- the ghosting that made carrying history unusable.
+   *
+   * So carry it only while the step is small enough for RR to cope, and reset on the flicks. The
+   * limit is expressed in pixels of apparent motion, which is what actually matters to the
+   * reprojection, and is estimated from how far the camera turned and moved: turning by the whole
+   * field of view sweeps the whole width, and moving sideways by the distance to what you are
+   * looking at is about one radian of parallax. Above the limit the result is no worse than
+   * carrying nothing, which is where the viewport already was. */
+  if (!b_v3d || !b_rv3d || !scene->camera) {
+    have_last_view_matrix_ = false;
+    return;
+  }
+
+  const Transform view = scene->camera->get_matrix();
+
+  if (!have_last_view_matrix_) {
+    last_view_matrix_ = view;
+    have_last_view_matrix_ = true;
+    return;
+  }
+
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+  const int motion_limit = get_int(cscene, "preview_denoising_carry_motion_limit");
+
+  const float3 pos = transform_get_column(&view, 3);
+  const float3 last_pos = transform_get_column(&last_view_matrix_, 3);
+
+  /* Angle between the two view directions, and the sideways shift measured against how far away
+   * the thing being orbited is -- both end up as radians of apparent motion. */
+  const float3 dir = -transform_get_column(&view, 2);
+  const float3 last_dir = -transform_get_column(&last_view_matrix_, 2);
+  const float turn = safe_acosf(clamp(dot(dir, last_dir), -1.0f, 1.0f));
+
+  const float focus = max(b_rv3d->dist, 1e-3f);
+  const float shift = len(pos - last_pos) / focus;
+
+  /* Radians to pixels: the sensor spans 2*atan(sensor/(2*lens)) across the width. */
+  const float lens = max(scene->camera->get_fov(), 1e-3f);
+  const float pixels_per_radian = float(width) / lens;
+  float motion_pixels = (turn + shift) * pixels_per_radian;
+
+  /* A moving object breaks the history the same way a moving camera does, and for the same
+   * reason: at a few frames a second it crosses far more of the screen between two frames than
+   * it would in a game. Its interactive motion pass still holds where it was last update, so
+   * measure the largest step any object took, seen from the camera. */
+  for (Object *ob : scene->objects) {
+    const array<Transform> &motion = ob->get_motion();
+    if (motion.empty()) {
+      continue;
+    }
+
+    const Transform ob_tfm = ob->get_tfm();
+    const float3 ob_pos = transform_get_column(&ob_tfm, 3);
+    const float3 ob_last_pos = transform_get_column(&motion[0], 3);
+    const float step = len(ob_pos - ob_last_pos);
+    if (step == 0.0f) {
+      continue;
+    }
+
+    /* Apparent size of the step: the further away it is, the less of the screen it crosses. */
+    const float distance = max(len(ob_pos - pos), 1e-3f);
+    motion_pixels = max(motion_pixels, (step / distance) * pixels_per_radian);
+  }
+
+  if (motion_pixels > float(motion_limit)) {
+    session->clear_denoiser_temporal_history();
+  }
+
+  last_view_matrix_ = view;
+}
+
 void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
 {
   b_depsgraph = &b_depsgraph_;
@@ -344,9 +444,15 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
     return;
   }
 
+  /* Final renders step through the frames themselves, so the cut check has to
+   * run here too -- synchronize() is the viewport's path. */
+  clear_denoiser_history_on_cut();
+
   /* Create driver to write out render results. */
   ensure_display_driver_if_needed();
   session->set_output_driver(make_unique<BlenderOutputDriver>(b_engine));
+
+  session->set_is_animation((b_engine.flag & blender::RE_ENGINE_ANIMATION) != 0);
 
   session->full_buffer_written_cb = [&](string_view filename) { full_buffer_written(filename); };
 
@@ -374,7 +480,7 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
   /* Compute render passes and film settings. */
   sync->sync_render_passes(*b_rlay, b_view_layer);
 
-  const int num_views = BLI_listbase_count(&b_rr->views);
+  const int num_views = b_rr->views.count();
 
   for (const auto [view_index, b_view] : b_rr->views.enumerate()) {
     b_rview_name = b_view.name;
@@ -782,7 +888,7 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
   const SessionParams session_params = BlenderSync::get_session_params(
       b_engine, b_userpref, *b_scene, background, pixelsize);
   const SceneParams scene_params = BlenderSync::get_scene_params(
-      *b_scene, background, use_developer_ui);
+      b_userpref, *b_data, *b_scene, background, use_developer_ui);
   const bool session_pause = BlenderSync::get_session_pause(*b_scene, background);
 
   if (session->params.modified(session_params) || scene->params.modified(scene_params)) {
@@ -832,6 +938,9 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
   else {
     sync->sync_camera(*b_render, width, height, "");
   }
+
+  clear_denoiser_history_on_cut();
+  clear_denoiser_history_on_jump();
 
   /* get buffer parameters */
   const BufferParams buffer_params = BlenderSync::get_buffer_params(
@@ -904,6 +1013,12 @@ void BlenderSession::view_draw(const int w, const int h)
   /* pause in redraw in case update is not being called due to final render */
   session->set_pause(BlenderSync::get_session_pause(*b_scene, background));
 
+  /* Update navigating state. */
+  const bool dimensions_changed = (width != w || height != h || pixelsize != blender::U.pixelsize);
+  const bool is_navigating = region_view3d_navigating_or_transforming(b_rv3d) ||
+                             dimensions_changed;
+  session->set_navigating(is_navigating);
+
   /* before drawing, we verify camera and viewport size changes, because
    * we do not get update callbacks for those, we must detect them here */
   if (session->ready_to_reset()) {
@@ -911,8 +1026,7 @@ void BlenderSession::view_draw(const int w, const int h)
 
     /* If dimensions changed, reset. We need to check pixel size here because
      * it's only valid during drawing, as it can change per window. */
-    const float new_pixelsize = blender::U.pixelsize;
-    if (width != w || height != h || pixelsize != new_pixelsize) {
+    if (dimensions_changed) {
       if (start_resize_time == 0.0) {
         /* don't react immediately to resizes to avoid flickery resizing
          * of the viewport, and some window managers changing the window
@@ -926,7 +1040,7 @@ void BlenderSession::view_draw(const int w, const int h)
       else {
         width = w;
         height = h;
-        pixelsize = new_pixelsize;
+        pixelsize = blender::U.pixelsize;
         reset = true;
       }
     }

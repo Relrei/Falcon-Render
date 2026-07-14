@@ -118,6 +118,7 @@ enum class Type : uint8_t {
   SubPassTransition,
   StateSet,
   StencilSet,
+  TextureCopy,
 
   /** Special commands stored in separate buffers. */
   SubPass,
@@ -365,12 +366,12 @@ struct SpecializeConstant {
 
 struct Draw {
   gpu::Batch *batch;
-  uint16_t instance_len;
-  uint8_t expand_prim_type; /* #GPUPrimType */
-  uint8_t expand_prim_len;
+  uint32_t instance_len : 24;
+  uint32_t expand_prim_type : 4; /* #GPUPrimType */
+  uint32_t expand_prim_len : 4;
   uint32_t vertex_first;
   uint32_t vertex_len;
-  ResourceIndex res_index;
+  ResourceID res_id;
 
   Draw() = default;
 
@@ -380,12 +381,14 @@ struct Draw {
        uint vertex_first,
        GPUPrimType expanded_prim_type,
        uint expanded_prim_len,
-       ResourceIndex res_index)
+       ResourceID res_id)
   {
     BLI_assert(batch != nullptr);
+    BLI_assert(expanded_prim_type <= 15);
+    BLI_assert(expanded_prim_len <= 15);
     this->batch = batch;
-    this->res_index = res_index;
-    this->instance_len = uint16_t(min_uu(instance_len, USHRT_MAX));
+    this->res_id = res_id;
+    this->instance_len = min_uu(instance_len, (1 << 24) - 1);
     this->vertex_len = vertex_len;
     this->vertex_first = vertex_first;
     this->expand_prim_type = expanded_prim_type;
@@ -414,7 +417,7 @@ struct DrawMulti {
 struct DrawIndirect {
   gpu::Batch *batch;
   gpu::StorageBuf **indirect_buf;
-  ResourceIndex res_index;
+  ResourceID res_id;
 
   void execute(RecordingState &state) const;
   std::string serialize() const;
@@ -462,7 +465,7 @@ struct Clear {
 
 struct ClearMulti {
   /** \note This should be a Span<float4> but we need have to only have trivial types here. */
-  const float4 *colors;
+  const double4 *colors;
   int colors_len;
 
   void execute() const;
@@ -489,6 +492,22 @@ struct StencilSet {
   std::string serialize() const;
 };
 
+struct TextureCopy {
+  union {
+    gpu::Texture *src;
+    gpu::Texture **src_ref;
+  };
+  union {
+    gpu::Texture *dst;
+    gpu::Texture **dst_ref;
+  };
+  bool src_is_ref;
+  bool dst_is_ref;
+
+  void execute() const;
+  std::string serialize() const;
+};
+
 union Undetermined {
   ShaderBind shader_bind;
   ResourceBind resource_bind;
@@ -506,6 +525,7 @@ union Undetermined {
   ClearMulti clear_multi;
   StateSet state_set;
   StencilSet stencil_set;
+  TextureCopy texture_copy;
 };
 
 /** Try to keep the command size as low as possible for performance. */
@@ -548,7 +568,7 @@ class DrawCommandBuf {
                    uint instance_len,
                    uint vertex_len,
                    uint vertex_first,
-                   ResourceIndexRange index_range,
+                   ResourceIDRange id_range,
                    uint custom_id,
                    GPUPrimType expanded_prim_type,
                    uint16_t expanded_prim_len)
@@ -560,7 +580,7 @@ class DrawCommandBuf {
     BLI_assert_msg(custom_id == 0, "Custom ID is not supported in PassSimple");
     UNUSED_VARS_NDEBUG(custom_id);
 
-    for (auto res_index : index_range.index_range()) {
+    for (auto res_id : id_range.id_range()) {
       int64_t index = commands.append_and_get_index({});
       headers.append({Type::Draw, uint(index)});
       commands[index].draw = {batch,
@@ -569,7 +589,7 @@ class DrawCommandBuf {
                               vertex_first,
                               expanded_prim_type,
                               expanded_prim_len,
-                              ResourceIndex(res_index)};
+                              ResourceID(res_id)};
     }
   }
 
@@ -669,7 +689,7 @@ class DrawMultiBuf {
                    uint instance_len,
                    uint vertex_len,
                    uint vertex_first,
-                   ResourceIndexRange index_range,
+                   ResourceIDRange id_range,
                    uint custom_id,
                    GPUPrimType expanded_prim_type,
                    uint16_t expanded_prim_len)
@@ -693,11 +713,11 @@ class DrawMultiBuf {
 
     uint &group_id = group_ids_.lookup_or_add(DrawGroupKey(cmd.uuid, batch), uint(-1));
 
-    bool inverted = index_range.has_inverted_handedness();
+    bool inverted = id_range.has_inverted_handedness();
 
-    for (auto res_index : index_range.index_range()) {
+    for (auto res_id : id_range.id_range()) {
       DrawPrototype &draw = prototype_buf_.get_or_resize(prototype_count_++);
-      draw.res_index = uint32_t(res_index);
+      draw.res_id = uint32_t(res_id);
       draw.custom_id = custom_id;
       draw.instance_len = instance_len;
       draw.group_id = group_id;

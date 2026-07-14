@@ -8,6 +8,8 @@
  * Functions for interpolating data across the surface of a mesh.
  */
 
+#include <algorithm>
+
 #include "MEM_guardedalloc.h"
 
 #include "DNA_meshdata_types.h"
@@ -921,7 +923,7 @@ void BM_data_layer_free(BMesh *bm, CustomData *data, int type)
   data->pool = nullptr;
 
   const bool had_layer = CustomData_free_layer_active(data, eCustomDataType(type));
-  /* Assert because its expensive to realloc - better not do if layer isn't present. */
+  /* Assert because its expensive to reallocate - better not do if layer isn't present. */
   BLI_assert(had_layer != false);
   UNUSED_VARS_NDEBUG(had_layer);
 
@@ -1153,9 +1155,13 @@ static void bm_loop_walk_data(LoopWalkCtx *lwc, BMLoop *l_walk)
 {
   int i;
 
-  BLI_assert(CustomData_data_equals(eCustomDataType(lwc->type),
-                                    lwc->data_ref,
-                                    BM_ELEM_CD_GET_VOID_P(l_walk, lwc->cd_layer_offset)));
+  BLI_assert(
+      /* Include pointer equality to prevent assert if any of the values include NAN,
+       * making it seem like there is a bug when there isn't. */
+      (lwc->data_ref == BM_ELEM_CD_GET_VOID_P(l_walk, lwc->cd_layer_offset)) ||
+      CustomData_data_equals(eCustomDataType(lwc->type),
+                             lwc->data_ref,
+                             BM_ELEM_CD_GET_VOID_P(l_walk, lwc->cd_layer_offset)));
   BLI_assert(BM_elem_flag_test(l_walk, BM_ELEM_INTERNAL_TAG));
 
   bm_loop_walk_add(lwc, l_walk);
@@ -1229,7 +1235,7 @@ LinkNode *BM_vert_loop_groups_data_layer_create(
         mul_vn_fl(lf->data_weights, lf->data_len, 1.0f / lwc.weight_accum);
       }
       else {
-        copy_vn_fl(lf->data_weights, lf->data_len, 1.0f / float(lf->data_len));
+        std::fill_n(lf->data_weights, lf->data_len, 1.0f / float(lf->data_len));
       }
 
       BLI_linklist_prepend_arena(&groups, lf, lwc.arena);

@@ -10,6 +10,9 @@
 #include <cstring>
 
 #ifdef WIN32
+#  ifdef WIN32_LEAN_AND_MEAN
+#    undef WIN32_LEAN_AND_MEAN
+#  endif
 #  include "utfconv.hh"
 #  include <windows.h>
 #  ifdef WITH_CPU_CHECK
@@ -75,6 +78,8 @@
 #include "WM_api.hh"
 
 #include "RNA_define.hh"
+
+#include "FN_init.hh"
 
 #ifdef WITH_OPENGL_BACKEND
 #  include "GPU_compilation_subprocess.hh"
@@ -174,6 +179,7 @@ namespace blender {
 ApplicationState app_state = []() {
   ApplicationState app_state{};
   app_state.signal.use_crash_handler = true;
+  app_state.signal.use_console_crash_handler = false;
   app_state.signal.use_abort_handler = true;
   app_state.exit_code_on_error.python = 0;
   app_state.main_arg_deferred = nullptr;
@@ -385,7 +391,7 @@ int main(int argc,
 #endif
 
 #if defined(WITH_TBB_MALLOC) && defined(__linux__)
-  /* Enable huge pages for performance .*/
+  /* Enable huge pages for performance. */
   scalable_allocation_mode(TBBMALLOC_USE_HUGE_PAGES, 1);
 #endif
 
@@ -487,6 +493,7 @@ int main(int argc,
   BKE_blender_globals_init(); /* `blender.cc` */
 
   BKE_cpp_types_init();
+  fn::multi_function::register_common_functions();
   BKE_idtype_init();
   BKE_modifier_init();
   seq::modifiers_init();
@@ -543,7 +550,12 @@ int main(int argc,
 
 #ifdef WITH_CYCLES
   CCL_log_init();
+  CCL_implicit_sharing_init();
 #endif
+
+  /* Set max open files to better handle production files that may use many
+   * open geometry or texture cache file handles. After logging since it's used .*/
+  BLI_system_max_open_files_ensure();
 
   /* Must be initialized after #BKE_appdir_init to account for color-management paths. */
   IMB_init();

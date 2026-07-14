@@ -10,6 +10,9 @@ from mathutils import Vector
 
 import bpy
 
+# To update the test data, set the `BLENDER_TEST_UPDATE` environment variable:
+# `BLENDER_TEST_UPDATE=1 ctest -R bl_node_copy_operators`
+#
 # Test cases listed below must have a test data in the "Tests" node group in the main test file.
 # Each test case should have a frame node whose content is used as input for operators.
 # Nodes labeled "external" are excluded from the grouping operator to test external links.
@@ -27,13 +30,6 @@ import bpy
 #   - bpy.data.node_groups["ExpectedUngroup"]:              Result of node.ungroup operator.
 #   - bpy.data.node_groups["ExpectedGroupSeparateCopy"]:    Result of node.group_separate operator with type='COPY'.
 #   - bpy.data.node_groups["ExpectedGroupSeparateMove"]:    Result of node.group_separate operator with type='MOVE'.
-#
-# The script can be invoked with an additional argument '--generate' to update the ground truth test data.
-# Nodes in the "Expected***" node trees are replaced with the result of operators applied to the "Tests" node tree.
-#
-# ./bin/blender --factory-startup --python <SOURCEPATH>/tests/python/bl_node_copy_operators.py
-#     --
-#     --testdir <SOURCEPATH>/tests/files/node_group --generate
 
 args = None
 testfile = "node_copy_operators.blend"
@@ -59,10 +55,13 @@ all_test_cases = [
     ('test_vector_dimension', {}),
     ('test_default_input', {}),
     ('test_anim_data', {}),
+    ('test_anim_data_ungroup', {'NODE_GROUP'}),
     ('test_extension_sockets', {}),
     ('test_pass_through', {'NODE_GROUP'}),
     ('test_insert_group_with_sockets', {'GROUP_INSERT'}),
     ('test_ungroup_multiple', {'NODE_GROUP'}),
+    ('test_ungroup_proxy_nodes', {'NODE_GROUP'}),
+    ('test_viewer_node', {}),
 ]
 
 
@@ -267,6 +266,8 @@ def execute_group_insert(test_case, test_tree, expected_tree=None):
         # Should have one node group labeled "external".
         assert len(test_nodes_external) == 1
         group_node = test_nodes_external[0]
+        # Ensure single-user node group, so that inserting nodes does not modify a shared tree.
+        group_node.node_tree = group_node.node_tree.copy()
         with node_editor_context_override(bpy.context, test_tree, selected_nodes=test_nodes_internal + [group_node], active_node=group_node):
             bpy.ops.node.group_insert()
 
@@ -400,7 +401,6 @@ class AbstractNodeCopyOperatorTest(unittest.TestCase):
         self.assertTrue(args.testdir.exists(),
                         'Test dir {0} should exist'.format(args.testdir))
         open_test_file()
-        self.assertEqual(bpy.data.version, (5, 1, 27))
 
     def tearDown(self):
         self._tempdir.cleanup()
@@ -628,6 +628,7 @@ def generate_test_data():
 def main():
     global args
     import argparse
+    import os
 
     if '--' in sys.argv:
         argv = [sys.argv[0]] + sys.argv[sys.argv.index('--') + 1:]
@@ -636,17 +637,13 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--testdir', required=True, type=pathlib.Path)
-    parser.add_argument(
-        '--generate',
-        action='store_true',
-        help="Generate ground truth test data instead of running the test")
     parser.add_argument('--subtest', default=None, help="Select a single test case")
     args, remaining = parser.parse_known_args(argv)
 
-    if args.generate:
+    if os.getenv("BLENDER_TEST_UPDATE") is not None:
         generate_test_data()
-    else:
-        unittest.main(argv=remaining)
+
+    unittest.main(argv=remaining)
 
 
 if __name__ == "__main__":

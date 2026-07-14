@@ -18,12 +18,18 @@ class TileManager;
 
 class RenderWork {
  public:
-  int resolution_divider = 1;
+  float resolution_divider = 1;
+  float denoised_resolution_divider = 1;
 
   /* Initialize render buffers.
    * Includes steps like zeroing the buffer on the device, and optional reading of pixels from the
    * baking target. */
   bool init_render_buffers = false;
+
+  /* The sample count restarted but the frame did not change (a DLSS-RR pre-roll
+   * pass), so the temporal history lines up with the frame as it is: keep it,
+   * and do not warp it by the frame's motion vectors. */
+  bool denoise_same_frame_restart = false;
 
   /* Path tracing samples information. */
   struct {
@@ -105,6 +111,16 @@ class RenderScheduler {
 
   void set_denoiser_params(const DenoiseParams &params);
   bool is_denoiser_gpu_used() const;
+
+  /* Rendering a frame of an animation, which enables the DLSS-RR first-frame
+   * history pre-roll. */
+  void set_is_animation(bool is_animation);
+
+  /* Extra renders of the frame that starts with no DLSS-RR history, used to
+   * fill that history with independent estimates before the kept pass (0 when
+   * there is nothing to pre-roll). */
+  int get_dlss_preroll_passes() const;
+  bool use_dlss_stream_final() const;
 
   void set_adaptive_sampling(const AdaptiveSampling &adaptive_sampling);
   bool is_adaptive_sampling_used() const;
@@ -379,6 +395,17 @@ class RenderScheduler {
     /* Number of rendered samples on top of the start sample. */
     int num_rendered_samples = 0;
 
+    /* Total samples pushed through the continuous DLSS viewport stream since
+     * the last reset. The per-work counter above is rewound for every DLSS
+     * update, so this is the only record of overall progress; done() uses it
+     * to honor the viewport sample limit for DLSS. */
+    int num_dlss_stream_samples = 0;
+
+    /* Sample count at the last DLSS denoise of the accumulating viewport
+     * (carry ON). Used to re-denoise only when the buffer changed enough
+     * (samples doubled); see work_need_denoise. */
+    int last_dlss_denoise_samples = 0;
+
     /* Point in time the latest PathTraceDisplay work has been scheduled. */
     double last_display_update_time = 0.0;
     /* Value of -1 means display was never updated. */
@@ -464,6 +491,22 @@ class RenderScheduler {
 
   /* Background (offline) rendering. */
   bool background_;
+
+  /* This render is a frame of an animation, so the DLSS-RR history from the
+   * previous frame carries into this one -- except on the very first frame. */
+  bool is_animation_ = false;
+
+  /* No DLSS-RR history has been built yet in this render job: the first frame
+   * of an animation gets none of the temporal accumulation that later frames
+   * inherit, and comes out visibly noisier. Cleared once a frame has been
+   * rendered. */
+  bool dlss_history_cold_ = true;
+
+  /* Pre-roll of the first frame: extra renders of it, each from a different
+   * part of the sample sequence, that only exist to fill the RR history. */
+  int preroll_passes_left_ = 0;
+  int preroll_sample_base_ = 0;
+  bool preroll_same_frame_restart_ = false;
 
   /* Pixel size is used to force lower resolution render for final pass. Useful for retina or other
    * types of hi-dpi displays. */

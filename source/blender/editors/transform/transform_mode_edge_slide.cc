@@ -6,6 +6,8 @@
  * \ingroup edtransform
  */
 
+#include <algorithm>
+
 #include "BLI_math_geom.h"
 #include "BLI_math_matrix.h"
 #include "BLI_math_matrix.hh"
@@ -13,6 +15,7 @@
 
 #include "BKE_editmesh.hh"
 #include "BKE_editmesh_bvh.hh"
+#include "BKE_report.hh"
 #include "BKE_unit.hh"
 
 #include "GPU_immediate.hh"
@@ -57,6 +60,12 @@ struct EdgeSlideData {
   void update_proj_mat(TransInfo *t, const TransDataContainer *tc)
   {
     ARegion *region = t->region;
+    if (region == nullptr) [[unlikely]] {
+      this->win_half = {1.0f, 1.0f};
+      this->proj_mat = float4x4::identity();
+      return;
+    }
+
     this->win_half = {region->winx / 2.0f, region->winy / 2.0f};
 
     if (t->spacetype == SPACE_VIEW3D) {
@@ -279,7 +288,7 @@ static void calcEdgeSlide_mval_range(TransInfo *t,
   if (use_calc_direction) {
     loop_dir = MEM_new_array_zeroed<float2>(loop_nr, "sv loop_dir");
     loop_maxdist = MEM_new_array_uninitialized<float>(loop_nr, "sv loop_maxdist");
-    copy_vn_fl(loop_maxdist, loop_nr, FLT_MAX);
+    std::fill_n(loop_maxdist, loop_nr, FLT_MAX);
   }
 
   for (int i : sld->sv.index_range()) {
@@ -882,6 +891,12 @@ static void initEdgeSlide_ex(TransInfo *t,
 {
   EdgeSlideData *sld;
   bool ok = false;
+
+  if ((t->flag & T_EDIT) == 0 || (t->obedit_type != OB_MESH)) {
+    BKE_report(t->reports, RPT_ERROR, "'Edge Slide' is only supported in mesh edit mode");
+    t->state = TRANS_CANCEL;
+    return;
+  }
 
   t->mode = TFM_EDGE_SLIDE;
 

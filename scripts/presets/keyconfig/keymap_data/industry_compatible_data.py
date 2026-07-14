@@ -192,11 +192,13 @@ def km_window(params):
         ("wm.read_homefile", {"type": 'N', "value": 'PRESS', "ctrl": True}, None),
         op_menu("TOPBAR_MT_file_open_recent", {"type": 'O', "value": 'PRESS', "shift": True, "ctrl": True}),
         ("wm.open_mainfile", {"type": 'O', "value": 'PRESS', "ctrl": True}, None),
-        ("wm.save_mainfile", {"type": 'S', "value": 'PRESS', "ctrl": True}, None),
-        ("wm.save_as_mainfile", {"type": 'S', "value": 'PRESS', "shift": True, "ctrl": True}, None),
+        ("wm.save_mainfile", {"type": 'S', "value": 'PRESS', "ctrl": True},
+         {"properties": [("show_save_modified_images_dialog", True)]}),
+        ("wm.save_as_mainfile", {"type": 'S', "value": 'PRESS', "shift": True, "ctrl": True},
+         {"properties": [("show_save_modified_images_dialog", True)]}),
         ("wm.save_mainfile",
          {"type": 'S', "value": 'PRESS', "ctrl": True, "alt": True},
-         {"properties": [("incremental", True)]}),
+         {"properties": [("incremental", True), ("show_save_modified_images_dialog", True)]}),
         ("wm.quit_blender", {"type": 'Q', "value": 'PRESS', "ctrl": True}, None),
 
         # Quick menu and toolbar
@@ -469,6 +471,8 @@ def km_property_editor(params):
         ("constraint.delete", {"type": 'BACK_SPACE', "value": 'PRESS'}, {"properties": [("report", True)]}),
         ("constraint.delete", {"type": 'DEL', "value": 'PRESS'}, {"properties": [("report", True)]}),
         ("constraint.copy", {"type": 'D', "value": 'PRESS', "ctrl": True}, None),
+        # Strip modifiers
+        ("sequencer.strip_modifier_set_active", {"type": 'LEFTMOUSE', "value": 'PRESS'}, None),
     ])
 
     return keymap
@@ -878,6 +882,16 @@ def km_markers(params):
          {"properties": [("extend", False), ("camera", True)]}),
         ("marker.select", {"type": 'LEFTMOUSE', "value": 'PRESS', "shift": True, "ctrl": True},
          {"properties": [("extend", True), ("camera", True)]}),
+        ("marker.select_leftright",
+         {"type": params.select_mouse, "value": 'CLICK', "ctrl": True},
+         {"properties": [("mode", 'CLICK_SIDE'), ("extend", False)]}),
+        ("marker.select_leftright",
+         {"type": params.select_mouse, "value": 'CLICK', "ctrl": True, "shift": True},
+         {"properties": [("mode", 'CLICK_SIDE'), ("extend", True)]}),
+        ("marker.select_leftright", {"type": 'LEFT_BRACKET', "value": 'PRESS'},
+         {"properties": [("mode", 'LEFT'), ("extend", False)]}),
+        ("marker.select_leftright", {"type": 'RIGHT_BRACKET', "value": 'PRESS'},
+         {"properties": [("mode", 'RIGHT'), ("extend", False)]}),
         ("marker.select_box", {"type": 'Q', "value": 'PRESS'}, None),
         ("marker.select_all", {"type": 'A', "value": 'PRESS', "ctrl": True}, {"properties": [("action", 'SELECT')]}),
         ("marker.select_all", {"type": 'A', "value": 'PRESS', "ctrl": True,
@@ -1260,6 +1274,7 @@ def km_file_browser(params):
         # The two refresh operators have polls excluding each other (so only one is available depending on context).
         ("file.refresh", {"type": 'R', "value": 'PRESS', "ctrl": True}, None),
         ("asset.library_refresh", {"type": 'R', "value": 'PRESS', "ctrl": True}, None),
+        ("asset.library_reload_listing", {"type": 'R', "value": 'PRESS', "shift": True}, None),
         ("file.previous", {"type": 'BACK_SPACE', "value": 'PRESS'}, None),
         ("file.next", {"type": 'BACK_SPACE', "value": 'PRESS', "shift": True}, None),
         ("wm.context_toggle", {"type": 'H', "value": 'PRESS'},
@@ -1307,6 +1322,7 @@ def km_file_browser_main(params):
         # The two refresh operators have polls excluding each other (so only one is available depending on context).
         ("file.refresh", {"type": 'R', "value": 'PRESS', "ctrl": True}, None),
         ("asset.library_refresh", {"type": 'R', "value": 'PRESS', "ctrl": True}, None),
+        ("asset.library_reload_listing", {"type": 'R', "value": 'PRESS', "shift": True}, None),
         ("file.select", {"type": 'LEFTMOUSE', "value": 'PRESS'},
          {"properties": [("open", False), ("deselect_all", True)]}),
         ("file.select", {"type": 'LEFTMOUSE', "value": 'CLICK', "ctrl": True},

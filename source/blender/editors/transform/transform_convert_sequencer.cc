@@ -24,7 +24,6 @@
 #include "SEQ_animation.hh"
 #include "SEQ_channels.hh"
 #include "SEQ_edit.hh"
-#include "SEQ_effects.hh"
 #include "SEQ_iterator.hh"
 #include "SEQ_relations.hh"
 #include "SEQ_sequencer.hh"
@@ -57,24 +56,6 @@ struct TransDataSeq {
   int start_offset;
   /** One of #SEQ_SELECT, #SEQ_LEFTSEL and #SEQ_RIGHTSEL. */
   short sel_flag;
-};
-
-/**
- * Sequencer transform customdata (stored in #TransCustomDataContainer).
- */
-struct TransSeq {
-  TransDataSeq *tdseq;
-  /* Maximum delta allowed along x and y before clamping selected strips/handles. Always active. */
-  rcti offset_clamp;
-  /* Maximum delta before clamping handles to the bounds of underlying content. May be disabled. */
-  int hold_clamp_min, hold_clamp_max;
-
-  /* Initial rect of the view2d, used for computing offset during edge panning. */
-  rctf initial_v2d_cur;
-  ui::View2DEdgePanData edge_pan;
-
-  /* Strips that aren't selected, but their position entirely depends on transformed strips. */
-  VectorSet<Strip *> time_dependent_strips;
 };
 
 }  // namespace
@@ -270,7 +251,7 @@ static void free_transform_custom_data(TransCustomData *custom_data)
 {
   if ((custom_data->data != nullptr) && custom_data->use_free) {
     TransSeq *ts = static_cast<TransSeq *>(custom_data->data);
-    MEM_delete(ts->tdseq);
+    MEM_delete(static_cast<TransDataSeq *>(ts->tdseq));
     MEM_delete(ts);
     custom_data->data = nullptr;
   }
@@ -341,7 +322,7 @@ static void freeSeqData(TransInfo *t, TransDataContainer *tc, TransCustomData *c
 
   VectorSet transformed_strips = seq_transform_collection_from_transdata(tc);
   seq::iterator_set_expand(
-      scene, seqbase_active_get(t), transformed_strips, seq::query_strip_effect_chain);
+      seqbase_active_get(t), transformed_strips, seq::query_strip_effect_chain);
 
   for (Strip *strip : transformed_strips) {
     strip->runtime->flag &= ~(seq::StripRuntimeFlag::ClampedLH | seq::StripRuntimeFlag::ClampedRH);
@@ -410,7 +391,6 @@ static Strip *effect_base_input_get(Strip *effect, SeqInputSide side)
 static void query_time_dependent_strips_strips(TransInfo *t,
                                                VectorSet<Strip *> &time_dependent_strips)
 {
-  Scene *scene = CTX_data_sequencer_scene(t->context);
   ListBaseT<Strip> *seqbase = seqbase_active_get(t);
 
   /* Query dependent strips where used strips do not have handles selected.
@@ -420,7 +400,7 @@ static void query_time_dependent_strips_strips(TransInfo *t,
   VectorSet<Strip *> strips_no_handles = query_selected_strips_no_handles(seqbase);
   time_dependent_strips.add_multiple(strips_no_handles);
 
-  seq::iterator_set_expand(scene, seqbase, strips_no_handles, seq::query_strip_effect_chain);
+  seq::iterator_set_expand(seqbase, strips_no_handles, seq::query_strip_effect_chain);
   bool strip_added = true;
 
   while (strip_added) {
@@ -447,7 +427,7 @@ static void query_time_dependent_strips_strips(TransInfo *t,
    * With single input effect, it is less likely desirable to move animation. */
 
   VectorSet selected_strips = seq::query_selected_strips(seqbase);
-  seq::iterator_set_expand(scene, seqbase, selected_strips, seq::query_strip_effect_chain);
+  seq::iterator_set_expand(seqbase, selected_strips, seq::query_strip_effect_chain);
   for (Strip *strip : selected_strips) {
     /* Check only 2 input effects. */
     if (strip->input1 == nullptr || strip->input2 == nullptr) {
@@ -476,14 +456,14 @@ static void create_trans_seq_clamp_data(TransInfo *t, const Scene *scene)
   bool only_handles_selected = true;
 
   /* Prevent snaps and change in `values` past `offset_clamp` for all selected strips. */
-  BLI_rcti_init(&ts->offset_clamp, -INT_MAX, INT_MAX, -seq::MAX_CHANNELS, seq::MAX_CHANNELS);
+  BLI_rcti_init(&ts->offset_clamp, INT_MIN, INT_MAX, -seq::MAX_CHANNELS, seq::MAX_CHANNELS);
 
   VectorSet<Strip *> strips = seq::query_selected_strips(seq::active_seqbase_get(ed));
   for (Strip *strip : strips) {
-    if (!strip->is_effect() || seq::effect_get_num_inputs(strip->type) == 0) {
+    if (!strip->is_effect_with_inputs()) {
       continue;
     }
-    /* If there is an effect strip with no inputs selected, prevent any x-direction movement,
+    /* If there is an effect strip without its inputs selected, prevent any x-direction movement,
      * since these strips are tied to their inputs and can only move up and down. */
     if (!(strip->input1->flag & SEQ_SELECT) &&
         (!strip->input2 || !(strip->input2->flag & SEQ_SELECT)))
@@ -495,7 +475,7 @@ static void create_trans_seq_clamp_data(TransInfo *t, const Scene *scene)
 
   /* Try to clamp handles by default. */
   t->modifiers |= MOD_STRIP_CLAMP_HOLDS;
-  ts->hold_clamp_min = -INT_MAX;
+  ts->hold_clamp_min = INT_MIN;
   ts->hold_clamp_max = INT_MAX;
   for (Strip *strip : strips) {
     if (seq::transform_is_locked(seq::channels_displayed_get(ed), strip)) {
@@ -667,7 +647,6 @@ static void flushTransSeq(TransInfo *t)
 
   TransDataContainer *tc = TRANS_DATA_CONTAINER_FIRST_SINGLE(t);
   TransData *td = tc->data;
-  TransData2D *td2d = tc->data_2d;
 
   /* This is calculated for offsetting animation of effects that change position with inputs.
    * Maximum(positive or negative) value is used, because individual strips can be clamped. This
@@ -682,7 +661,7 @@ static void flushTransSeq(TransInfo *t)
   view2d_edge_pan_loc_compensate(t, edge_pan_offset);
 
   /* Flush to 2D vector from internally used 3D vector. */
-  for (int a = 0; a < tc->data_len; a++, td++, td2d++) {
+  for (int a = 0; a < tc->data_len; a++, td++) {
     TransDataSeq *tdsq = static_cast<TransDataSeq *>(td->extra);
     Strip *strip = tdsq->strip;
 
@@ -770,7 +749,7 @@ static void flushTransSeq(TransInfo *t)
    * will not be updated and we'll get false positives. */
   VectorSet transformed_strips = seq_transform_collection_from_transdata(tc);
   seq::iterator_set_expand(
-      scene, seqbase_active_get(t), transformed_strips, seq::query_strip_effect_chain);
+      seqbase_active_get(t), transformed_strips, seq::query_strip_effect_chain);
 
   for (Strip *strip : transformed_strips) {
     /* Test overlap, displays red outline. */

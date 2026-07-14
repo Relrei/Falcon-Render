@@ -21,6 +21,8 @@ class GraphicsInteropDevice;
 class RenderBuffers;
 class Progress;
 
+bool use_dlss_denoiser(Device *denoiser_device, const DenoiseParams &params);
+
 bool use_optix_denoiser(Device *denoiser_device, const DenoiseParams &params);
 
 bool use_gpu_oidn_denoiser(Device *denoiser_device, const DenoiseParams &params);
@@ -58,6 +60,25 @@ class Denoiser {
   void set_params(const DenoiseParams &params);
   const DenoiseParams &get_params() const;
 
+  /* Drop any temporal history the denoiser carries (DLSS-RR). Called when the
+   * scene content changed (anything but the camera): motion vectors cannot
+   * explain such edits, so carried history would ghost the old content. */
+  virtual void clear_temporal_history() {}
+
+  /* The next denoise restarts the sample count without changing the frame (a
+   * DLSS-RR pre-roll pass), so the history is already aligned with it. */
+  virtual void set_same_frame_restart(bool /*same_frame_restart*/) {}
+
+  /* Camera matrices for the frame being denoised, in the row-major left-multiply
+   * form NGX wants. DLSS-RR needs them to make sense of the specular hit
+   * distance, which is a world-space length. */
+  virtual void set_camera_matrices(const float * /*world_to_view*/,
+                                   const float * /*view_to_clip*/)
+  {
+  }
+
+  static bool is_device_supported(DenoiserType type, const DeviceInfo &denoise_device_info);
+
   /* Recommended type for viewport denoising. */
   static DenoiserType automatic_viewport_denoiser_type(const DeviceInfo &denoise_device_info);
 
@@ -90,9 +111,11 @@ class Denoiser {
    * Returns true when all passes are denoised. Will return false if there is a denoiser error (for
    * example, caused by misconfigured denoiser) or when user requested to cancel rendering. */
   virtual bool denoise_buffer(const BufferParams &buffer_params,
+                              const BufferParams &denoised_buffer_params,
                               RenderBuffers *render_buffers,
-                              const int num_samples,
-                              bool allow_inplace_modification) = 0;
+                              int num_samples,
+                              bool allow_inplace_modification,
+                              float2 pixel_jitter = {}) = 0;
 
   /* Get a device which is used to perform actual denoising.
    *
@@ -123,10 +146,6 @@ class Denoiser {
 
  protected:
   Denoiser(Device *denoiser_device, const DenoiseParams &params);
-
-  /* Get device type mask which is used to filter available devices when new device needs to be
-   * created. */
-  virtual uint get_device_type_mask() const = 0;
 
   Device *denoiser_device_;
   bool denoise_kernels_are_loaded_;

@@ -92,6 +92,10 @@ class PathTrace {
    * Use this to configure the denoiser before rendering any samples. */
   void set_denoiser_params(const DenoiseParams &params);
 
+  /* Drop the denoiser's temporal history (DLSS-RR carry). Called when the
+   * scene content changed, since carried history would ghost the edit. */
+  void clear_denoiser_temporal_history();
+
   /* Set parameters used for adaptive sampling.
    * Use this to configure the adaptive sampler before rendering any samples. */
   void set_adaptive_sampling(const AdaptiveSampling &adaptive_sampling);
@@ -194,6 +198,9 @@ class PathTrace {
 
   /* Initialize kernel execution on all integrator queues. */
   void render_init_kernel_execution();
+
+  /* Release kernel execution resources on all integrator queues. */
+  void render_deinit_kernel_execution();
 
   /* Make sure both allocated and effective buffer parameters of path tracer works are up to date
    * with the current big tile parameters, performance-dependent slicing, and resolution divider.
@@ -319,10 +326,11 @@ class PathTrace {
      * Allows to re-use same render buffer, but have less pixels rendered into in it. The way to
      * think of render buffer in this case is as an over-allocated array: the resolution divider
      * affects both resolution and stride as visible by the integrator kernels. */
-    int resolution_divider = 0;
+    float resolution_divider = 0;
 
     /* Parameters of the big tile with the current resolution divider applied. */
     BufferParams effective_big_tile_params;
+    BufferParams effective_denoised_big_tile_params;
 
     /* Denoiser was run and there are denoised versions of the passes in the render buffers. */
     bool has_denoised_result = false;

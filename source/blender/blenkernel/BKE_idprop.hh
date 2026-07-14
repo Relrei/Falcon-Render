@@ -9,6 +9,7 @@
  */
 
 #include <memory>
+#include <optional>
 
 #include "DNA_ID.h"
 #include "DNA_ID_enums.h"
@@ -80,15 +81,14 @@ void IDP_ResizeIDPArray(IDProperty *prop, int newlen);
  * This function works for strings too!
  */
 void IDP_ResizeArray(IDProperty *prop, int newlen);
-void IDP_FreeArray(IDProperty *prop);
 
 /* ---------- String Type ------------ */
 /**
  * \param st: The string to assign.
  * Doesn't need to be null terminated when clamped by `maxncpy`.
- * \param name: The property name.
- * \param maxncpy: The maximum size of the string (including the `\0` terminator).
+ * \param st_maxncpy: The maximum size of the string (including the `\0` terminator).
  * When zero, this is the equivalent of passing in `strlen(st) + 1`
+ * \param name: The property name.
  * \return The new string property.
  */
 IDProperty *IDP_NewStringMaxSize(const char *st,
@@ -104,7 +104,7 @@ IDProperty *IDP_NewString(blender::StringRef value,
 /**
  * \param st: The string to assign.
  * Doesn't need to be null terminated when clamped by `maxncpy`.
- * \param maxncpy: The maximum size of the string (including the `\0` terminator).
+ * \param st_maxncpy: The maximum size of the string (including the `\0` terminator).
  * When zero, this is the equivalent of passing in `strlen(st) + 1`
  */
 void IDP_AssignStringMaxSize(IDProperty *prop, const char *st, size_t st_maxncpy) ATTR_NONNULL();
@@ -287,8 +287,6 @@ IDProperty *IDP_New(char type,
  * \note This will free allocated data, all child properties of arrays and groups, and unlink IDs!
  * But it does not free the actual #IDProperty struct itself.
  */
-void IDP_FreePropertyContent_ex(IDProperty *prop, bool do_id_user);
-void IDP_FreePropertyContent(IDProperty *prop);
 void IDP_FreeProperty_ex(IDProperty *prop, bool do_id_user);
 void IDP_FreeProperty(IDProperty *prop);
 
@@ -375,6 +373,14 @@ const IDProperty *_IDP_assert_type_mask(const IDProperty *prop, int ty_mask);
 /* No `IDP_string_set` needed. */
 #define IDP_ID_get(prop) ((void)0, ((ID *)_IDP_assert_type(prop, IDP_ID)->data.pointer))
 /* No `IDP_ID_set` needed. */
+
+std::optional<StringRefNull> IDP_group_lookup_string(const IDProperty &group, StringRef name);
+std::optional<float> IDP_group_lookup_float(const IDProperty &group, StringRef name);
+std::optional<int> IDP_group_lookup_int(const IDProperty &group, StringRef name);
+std::optional<bool> IDP_group_lookup_bool(const IDProperty &group, StringRef name);
+std::optional<Span<float>> IDP_group_lookup_float_array(const IDProperty &group,
+                                                        StringRef name,
+                                                        int required_size);
 
 /**
  * Return an int from an #IDProperty with a compatible type. This should be avoided, but
@@ -469,7 +475,9 @@ std::unique_ptr<io::serialize::ArrayValue> convert_to_serialize_values(
     const IDProperty *properties);
 
 /**
- * \brief Convert the given `value` to an `IDProperty`.
+ * \brief Convert the given `value` (which must be an array) to an `IDProperty`.
+ * \return The first successfully converted property with further array elements in the
+ *    `IDProperty.next` chain, or null if none could be converted or \a value is not an array.
  */
 IDProperty *convert_from_serialize_value(const io::serialize::Value &value);
 

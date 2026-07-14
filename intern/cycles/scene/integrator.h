@@ -17,6 +17,25 @@ class Device;
 class DeviceScene;
 class Scene;
 
+struct HaltonSequence {
+  HaltonSequence()
+  {
+    reset();
+  }
+
+  void reset()
+  {
+    a2 = 0;
+    b2 = 1;
+    a3 = 0;
+    b3 = 1;
+  }
+  float2 next();
+
+  int a2, b2;
+  int a3, b3;
+};
+
 class Integrator : public Node {
  public:
   NODE_DECLARE
@@ -95,14 +114,42 @@ class Integrator : public Node {
   NODE_SOCKET_API(SamplingPattern, sampling_pattern)
   NODE_SOCKET_API(float, scrambling_distance)
 
+  NODE_SOCKET_API(bool, use_pixel_jitter);
+  NODE_SOCKET_API(bool, use_custom_pixel_jitter_sample);
+  NODE_SOCKET_API_ARRAY(array<float>, custom_pixel_jitter_sample);
+  HaltonSequence pixel_jitter_state;
+  int pixel_jitter_frame = 0;
+
+  /* DLSS-RR rebuilds sub-pixel detail from the jitter moving between frames, so
+   * every sample of one frame has to be taken at the same sub-pixel point --
+   * that is what a game's one-sample-per-frame render hands it. Cycles advanced
+   * the jitter on every scene update, which in a progressive render means once
+   * per sample batch: a 32-sample frame averaged three different sub-pixel
+   * positions, so the detail RR was meant to reconstruct was already gone by the
+   * time it saw the buffer, and the jitter we reported described only the last
+   * batch. Pin it for the frame in final renders; the viewport keeps advancing,
+   * where each update is a fresh sample that RR converges over its own history. */
+  void pin_pixel_jitter_per_frame(bool pin)
+  {
+    pixel_jitter_pinned_ = pin;
+  }
+  void advance_pixel_jitter()
+  {
+    pixel_jitter_pending_ = true;
+  }
+  bool pixel_jitter_pinned_ = false;
+  bool pixel_jitter_pending_ = true;
+  float2 pixel_jitter_current_ = make_float2(0.0f, 0.0f);
+
   NODE_SOCKET_API(bool, use_denoise);
   NODE_SOCKET_API(DenoiserType, denoiser_type);
   NODE_SOCKET_API(int, denoise_start_sample);
-  NODE_SOCKET_API(bool, use_denoise_pass_albedo);
-  NODE_SOCKET_API(bool, use_denoise_pass_normal);
+  NODE_SOCKET_API(DenoiserPassMask, denoiser_passes);
   NODE_SOCKET_API(DenoiserPrefilter, denoiser_prefilter);
   NODE_SOCKET_API(bool, denoise_use_gpu);
   NODE_SOCKET_API(DenoiserQuality, denoiser_quality);
+  NODE_SOCKET_API(float, denoiser_upscale_factor);
+  NODE_SOCKET_API(bool, denoiser_carry_history);
 
   enum : uint32_t {
     AO_PASS_MODIFIED = (1 << 0),

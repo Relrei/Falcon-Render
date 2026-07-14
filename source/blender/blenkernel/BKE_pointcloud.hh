@@ -9,6 +9,8 @@
  * \brief General operations for point clouds.
  */
 
+#include "MEM_guardedalloc.h" /* For `MEM_CXX_CLASS_ALLOC_FUNCS`. */
+
 #include "BLI_bounds_types.hh"
 #include "BLI_kdopbvh.hh"
 #include "BLI_math_vector_types.hh"
@@ -56,6 +58,10 @@ PointCloud *BKE_pointcloud_new_nomain(int totpoint);
 void BKE_pointcloud_nomain_to_pointcloud(PointCloud *pointcloud_src, PointCloud *pointcloud_dst);
 
 bool BKE_pointcloud_attribute_required(const PointCloud *pointcloud, StringRef name);
+
+void BKE_pointcloud_material_remap(PointCloud *pointcloud,
+                                   const unsigned int *remap,
+                                   int remap_num);
 
 /**
  * Copy data from #src to #dst, except the geometry and attributes. Typically used to

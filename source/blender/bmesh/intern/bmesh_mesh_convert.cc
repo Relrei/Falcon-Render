@@ -410,7 +410,7 @@ void BM_mesh_bm_from_me(BMesh *bm, const Mesh *mesh, const BMeshFromMeshParams *
     /* Evaluated meshes can be topologically inconsistent with their shape keys.
      * Shape keys are also already integrated into the state of the evaluated
      * mesh, so considering them here would kind of apply them twice. */
-    tot_shape_keys = BLI_listbase_count(&mesh->key->block);
+    tot_shape_keys = mesh->key->block.count();
 
     /* Original meshes must never contain a shape-key custom-data layers.
      *
@@ -872,7 +872,7 @@ static int bm_to_mesh_shape_layer_index_from_kb(BMesh *bm, KeyBlock *currkey)
  * basis are typically copied into the `positions` array since it makes sense for the meshes
  * vertex coordinates to match the "Basis" key.
  * When enabled, skip this step and copy #BMVert.co directly to the mesh position.
- * See #BMeshToMeshParams.active_shapekey_to_mvert doc-string.
+ * See #BMeshToMeshParams.active_shapekey_to_mvert docstring.
  */
 static void bm_to_mesh_shape(BMesh *bm,
                              Key *key,
@@ -1037,7 +1037,7 @@ static void bm_to_mesh_shape(BMesh *bm,
       if (currkey.data && (cd_shape_keyindex_offset != -1)) {
         CLOG_WARN(&LOG,
                   "Found shape-key but no CD_SHAPEKEY layers to read from, "
-                  "using existing shake-key data where possible");
+                  "using existing shape-key data where possible");
       }
       else {
         CLOG_WARN(&LOG,
@@ -1518,7 +1518,7 @@ static void bm_to_mesh_edges(Mesh &mesh,
 
   process_edges(bm_edges.index_range().take_front(1));
 
-  threading::parallel_for(dst_edges.index_range(), 512, [&](const IndexRange range) {
+  threading::parallel_for(dst_edges.index_range().drop_front(1), 512, [&](const IndexRange range) {
     process_edges(range);
     single_checker.check_range(range);
   });
@@ -1640,15 +1640,25 @@ static void bm_to_mesh_loops(Mesh &mesh,
 
   process_corners(bm_loops.index_range().take_front(1));
 
-  threading::parallel_for(dst_corner_verts.index_range(), 1024, [&](const IndexRange range) {
-    process_corners(range);
-    single_checker.check_range(range);
-  });
+  threading::parallel_for(
+      dst_corner_verts.index_range().drop_front(1), 1024, [&](const IndexRange range) {
+        process_corners(range);
+        single_checker.check_range(range);
+      });
 }
 
 void BM_mesh_bm_to_me(Main *bmain, BMesh *bm, Mesh *mesh, const BMeshToMeshParams *params)
 {
   const int old_verts_num = mesh->verts_num;
+  AttributeOwner owner = AttributeOwner::from_id(&mesh->id);
+  const std::string attributes_active_name = BKE_attributes_active_name_get(owner).value_or("");
+
+  /* Override (wrong) DNA default of 0 for attributes_active_index. See comments on the
+   * Mesh.attributes_active_index declaration. */
+  if (attributes_active_name.empty()) {
+    BLI_assert(ELEM(mesh->attributes_active_index, 0, -1));
+    mesh->attributes_active_index = -1;
+  }
 
   BKE_mesh_clear_geometry(mesh);
 
@@ -1922,6 +1932,23 @@ void BM_mesh_bm_to_me(Main *bmain, BMesh *bm, Mesh *mesh, const BMeshToMeshParam
   edge_single_checker.optimize_storage();
   face_single_checker.optimize_storage();
   corner_single_checker.optimize_storage();
+
+  /* Conversion to edit-mesh may have modified the attribute layers.
+   * Re-resolve the active attribute by name to keep it stable. */
+  if (!attributes_active_name.empty()) {
+    /* Invalid active attributes can happen because of wrong DNA default, see comment
+     * on the Mesh.attributes_active_index declaration. */
+    if (bke::allow_procedural_attribute_access(attributes_active_name)) {
+      BKE_attributes_active_set(owner, attributes_active_name);
+    }
+    else {
+      mesh->attributes_active_index = -1;
+    }
+  }
+  else {
+    BLI_assert(ELEM(mesh->attributes_active_index, 0, -1));
+    mesh->attributes_active_index = -1;
+  }
 }
 
 void BM_mesh_bm_to_me_compact(BMesh &bm,
@@ -1934,6 +1961,12 @@ void BM_mesh_bm_to_me_compact(BMesh &bm,
 
   /* Must be an empty mesh. */
   BLI_assert(mesh.verts_num == 0);
+
+  /* New Mesh is created with this at 0, but if the conversion from BMesh potentially adds
+   * some attributes we should make sure it is at -1 or it might point to an invalid internal
+   * attribute. */
+  mesh.attributes_active_index = -1;
+
   /* Just in case, clear the derived geometry caches from the input mesh. */
   BKE_mesh_runtime_clear_geometry(&mesh);
 

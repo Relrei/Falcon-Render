@@ -11,6 +11,7 @@
 #include "scene/shader.h"
 #include "scene/stats.h"
 #include "session/buffers.h"
+#include "session/cache_eviction.h"
 #include "session/tile.h"
 
 #include "util/progress.h"
@@ -97,8 +98,9 @@ class SessionParams {
     return !(device == params.device && headless == params.headless &&
              background == params.background && pixel_size == params.pixel_size &&
              threads == params.threads && use_profiling == params.use_profiling &&
-             shadingsystem == params.shadingsystem && use_auto_tile == params.use_auto_tile &&
-             tile_size == params.tile_size);
+             use_auto_tile == params.use_auto_tile && tile_size == params.tile_size &&
+             use_resolution_divider == params.use_resolution_divider &&
+             shadingsystem == params.shadingsystem);
   }
 };
 
@@ -135,13 +137,23 @@ class Session {
   void draw();
   void wait();
 
+  /* Drop the DLSS-RR carried temporal history (viewport). Called by the
+   * engine integration on hard cuts -- bound-camera switches and timeline
+   * jumps -- which motion vectors cannot explain. */
+  void clear_denoiser_temporal_history();
+
   bool ready_to_reset();
   void reset(const SessionParams &session_params, const BufferParams &buffer_params);
 
   void set_pause(bool pause);
+  void set_navigating(bool navigating);
 
   void set_samples(const int samples);
   void set_time_limit(const double time_limit);
+
+  /* Tell the DLSS-RR scheduler that this render is part of an animation, which
+   * enables the first-frame history pre-roll (see RenderScheduler). */
+  void set_is_animation(bool is_animation);
 
   void set_output_driver(unique_ptr<OutputDriver> driver);
   void set_display_driver(unique_ptr<DisplayDriver> driver);
@@ -239,6 +251,9 @@ class Session {
 
   TileManager tile_manager_;
   BufferParams buffer_params_;
+
+  /* Manages when image cache eviction happens. */
+  CacheEvictionManager eviction_manager_;
 
   /* Render scheduler is used to get work to be rendered with the current big tile. */
   RenderScheduler render_scheduler_;

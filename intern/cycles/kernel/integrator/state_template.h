@@ -35,10 +35,14 @@ KERNEL_STRUCT_MEMBER(path, uint16_t, queued_kernel, KERNEL_FEATURE_PATH_TRACING)
 KERNEL_STRUCT_MEMBER(path, uint32_t, rng_pixel, KERNEL_FEATURE_PATH_TRACING)
 /* Random number dimension offset. */
 KERNEL_STRUCT_MEMBER(path, uint16_t, rng_offset, KERNEL_FEATURE_PATH_TRACING)
+/* enum PathRayVisibilityFlag, limited to bits from PATH_RAY_VISIBILITY_ALL */
+KERNEL_STRUCT_MEMBER(path, uint8_t, visibility, KERNEL_FEATURE_PATH_TRACING)
 /* enum PathRayFlag */
 KERNEL_STRUCT_MEMBER(path, uint32_t, flag, KERNEL_FEATURE_PATH_TRACING)
 /* enum PathRayMNEE */
 KERNEL_STRUCT_MEMBER(path, uint8_t, mnee, KERNEL_FEATURE_PATH_TRACING)
+/* Index of shadow state path used for storing MNEE state. */
+KERNEL_STRUCT_MEMBER(path, int, mnee_shadow_state, KERNEL_FEATURE_MNEE)
 /* Majorant volume optical depth. */
 KERNEL_STRUCT_MEMBER(path, float, optical_depth, KERNEL_FEATURE_PATH_TRACING)
 /* Multiple importance sampling
@@ -69,6 +73,9 @@ KERNEL_STRUCT_MEMBER(path, PackedSpectrum, pass_diffuse_weight, KERNEL_FEATURE_L
 KERNEL_STRUCT_MEMBER(path, PackedSpectrum, pass_glossy_weight, KERNEL_FEATURE_LIGHT_PASSES)
 /* Denoising. */
 KERNEL_STRUCT_MEMBER(path, PackedSpectrum, denoising_feature_throughput, KERNEL_FEATURE_DENOISING)
+/* Plane of the delta mirror the camera ray hit, for primary surface replacement. */
+KERNEL_STRUCT_MEMBER(path, packed_float3, psr_mirror_n, KERNEL_FEATURE_DENOISING)
+KERNEL_STRUCT_MEMBER(path, float, psr_mirror_d, KERNEL_FEATURE_DENOISING)
 /* Shader sorting. */
 /* TODO: compress as uint16? or leave out entirely and recompute key in sorting code? */
 KERNEL_STRUCT_MEMBER(path, uint32_t, shader_sort_key, KERNEL_FEATURE_PATH_TRACING)
@@ -134,7 +141,7 @@ KERNEL_STRUCT_MEMBER(guiding, bool, use_surface_guiding, KERNEL_FEATURE_PATH_GUI
 /* Random number used for additional guiding decisions (e.g., cache query, selection to use guiding
  * or BSDF sampling) */
 KERNEL_STRUCT_MEMBER(guiding, float, sample_surface_guiding_rand, KERNEL_FEATURE_PATH_GUIDING)
-/* The probability to use surface guiding (i.e., diffuse sampling prob * guiding prob)*/
+/* The probability to use surface guiding (i.e., diffuse sampling prob * guiding prob). */
 KERNEL_STRUCT_MEMBER(guiding, float, surface_guiding_sampling_prob, KERNEL_FEATURE_PATH_GUIDING)
 /* Probability of sampling a BSSRDF closure instead of a BSDF closure. */
 KERNEL_STRUCT_MEMBER(guiding, float, bssrdf_sampling_prob, KERNEL_FEATURE_PATH_GUIDING)

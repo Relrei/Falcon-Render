@@ -18,12 +18,12 @@ namespace nodes::node_shader_vector_transform_cc {
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_input<decl::Vector>("Vector")
+  b.add_input<decl::Vector>("Vector"_ustr)
       .default_value({0.5f, 0.5f, 0.5f})
       .min(-10000.0f)
       .max(10000.0f)
       .description("Vector, point, or normal which will be used for conversion between spaces");
-  b.add_output<decl::Vector>("Vector");
+  b.add_output<decl::Vector>("Vector"_ustr);
 }
 
 static void node_shader_buts_vect_transform(ui::Layout &layout, bContext * /*C*/, PointerRNA *ptr)
@@ -47,7 +47,7 @@ static void node_shader_init_vect_transform(bNodeTree * /*ntree*/, bNode *node)
   node->storage = vect;
 }
 
-static const char *get_gpufn_name_from_to(short from, short to, bool is_direction)
+static const char *get_gpufn_name_from_to(short from, short to, short vector_type)
 {
   switch (from) {
     case SHD_VECT_TRANSFORM_SPACE_OBJECT:
@@ -55,11 +55,25 @@ static const char *get_gpufn_name_from_to(short from, short to, bool is_directio
         case SHD_VECT_TRANSFORM_SPACE_OBJECT:
           return nullptr;
         case SHD_VECT_TRANSFORM_SPACE_WORLD:
-          return is_direction ? "direction_transform_object_to_world" :
-                                "point_transform_object_to_world";
+          switch (vector_type) {
+            case SHD_VECT_TRANSFORM_TYPE_NORMAL:
+              return "normal_transform_object_to_world";
+            case SHD_VECT_TRANSFORM_TYPE_VECTOR:
+              return "direction_transform_object_to_world";
+            case SHD_VECT_TRANSFORM_TYPE_POINT:
+              return "point_transform_object_to_world";
+          }
+          break;
         case SHD_VECT_TRANSFORM_SPACE_CAMERA:
-          return is_direction ? "direction_transform_object_to_view" :
-                                "point_transform_object_to_view";
+          switch (vector_type) {
+            case SHD_VECT_TRANSFORM_TYPE_NORMAL:
+              return "normal_transform_object_to_view";
+            case SHD_VECT_TRANSFORM_TYPE_VECTOR:
+              return "direction_transform_object_to_view";
+            case SHD_VECT_TRANSFORM_TYPE_POINT:
+              return "point_transform_object_to_view";
+          }
+          break;
       }
       break;
     case SHD_VECT_TRANSFORM_SPACE_WORLD:
@@ -67,11 +81,25 @@ static const char *get_gpufn_name_from_to(short from, short to, bool is_directio
         case SHD_VECT_TRANSFORM_SPACE_WORLD:
           return nullptr;
         case SHD_VECT_TRANSFORM_SPACE_CAMERA:
-          return is_direction ? "direction_transform_world_to_view" :
-                                "point_transform_world_to_view";
+          switch (vector_type) {
+            case SHD_VECT_TRANSFORM_TYPE_NORMAL:
+              return "normal_transform_world_to_view";
+            case SHD_VECT_TRANSFORM_TYPE_VECTOR:
+              return "direction_transform_world_to_view";
+            case SHD_VECT_TRANSFORM_TYPE_POINT:
+              return "point_transform_world_to_view";
+          }
+          break;
         case SHD_VECT_TRANSFORM_SPACE_OBJECT:
-          return is_direction ? "direction_transform_world_to_object" :
-                                "point_transform_world_to_object";
+          switch (vector_type) {
+            case SHD_VECT_TRANSFORM_TYPE_NORMAL:
+              return "normal_transform_world_to_object";
+            case SHD_VECT_TRANSFORM_TYPE_VECTOR:
+              return "direction_transform_world_to_object";
+            case SHD_VECT_TRANSFORM_TYPE_POINT:
+              return "point_transform_world_to_object";
+          }
+          break;
       }
       break;
     case SHD_VECT_TRANSFORM_SPACE_CAMERA:
@@ -79,11 +107,25 @@ static const char *get_gpufn_name_from_to(short from, short to, bool is_directio
         case SHD_VECT_TRANSFORM_SPACE_CAMERA:
           return nullptr;
         case SHD_VECT_TRANSFORM_SPACE_WORLD:
-          return is_direction ? "direction_transform_view_to_world" :
-                                "point_transform_view_to_world";
+          switch (vector_type) {
+            case SHD_VECT_TRANSFORM_TYPE_NORMAL:
+              return "normal_transform_view_to_world";
+            case SHD_VECT_TRANSFORM_TYPE_VECTOR:
+              return "direction_transform_view_to_world";
+            case SHD_VECT_TRANSFORM_TYPE_POINT:
+              return "point_transform_view_to_world";
+          }
+          break;
         case SHD_VECT_TRANSFORM_SPACE_OBJECT:
-          return is_direction ? "direction_transform_view_to_object" :
-                                "point_transform_view_to_object";
+          switch (vector_type) {
+            case SHD_VECT_TRANSFORM_TYPE_NORMAL:
+              return "normal_transform_view_to_object";
+            case SHD_VECT_TRANSFORM_TYPE_VECTOR:
+              return "direction_transform_view_to_object";
+            case SHD_VECT_TRANSFORM_TYPE_POINT:
+              return "point_transform_view_to_object";
+          }
+          break;
       }
       break;
   }
@@ -107,9 +149,8 @@ static int gpu_shader_vect_transform(GPUMaterial *mat,
     inputlink = GPU_uniform(in[0].vec);
   }
 
-  const bool is_direction = (nodeprop->type != SHD_VECT_TRANSFORM_TYPE_POINT);
   const char *func_name = get_gpufn_name_from_to(
-      nodeprop->convert_from, nodeprop->convert_to, is_direction);
+      nodeprop->convert_from, nodeprop->convert_to, nodeprop->type);
 
   if (func_name) {
     /* For cycles we have inverted Z */
@@ -209,7 +250,7 @@ void register_node_type_sh_vect_transform()
 
   static bke::bNodeType ntype;
 
-  sh_node_type_base(&ntype, "ShaderNodeVectorTransform", SH_NODE_VECT_TRANSFORM);
+  sh_node_type_base(&ntype, "ShaderNodeVectorTransform"_ustr, SH_NODE_VECT_TRANSFORM);
   ntype.ui_name = "Vector Transform";
   ntype.ui_description =
       "Convert a vector, point, or normal between world, camera, and object coordinate space";

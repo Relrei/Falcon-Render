@@ -111,7 +111,7 @@ static void draw_node_inputs_recursive(bContext *C,
   const char *panel_translation_context = (panel_decl.translation_context.has_value() ?
                                                panel_decl.translation_context->c_str() :
                                                nullptr);
-  panel.header->label(CTX_IFACE_(panel_translation_context, panel_decl.name), ICON_NONE);
+  panel.header->label(CTX_IFACE_(panel_translation_context, panel_decl.name.ref()), ICON_NONE);
   if (!panel.body) {
     return;
   }
@@ -126,7 +126,8 @@ static void draw_node_inputs_recursive(bContext *C,
     }
     else if (const auto *layout_decl = dynamic_cast<const LayoutDeclaration *>(item_decl)) {
       if (!layout_decl->is_default) {
-        layout_decl->draw(*panel.body, C, node_ptr);
+        Layout &column = panel.body->column(false);
+        layout_decl->draw(column, C, node_ptr);
       }
     }
   }
@@ -177,7 +178,8 @@ void template_node_inputs(Layout *layout, bContext *C, PointerRNA *ptr)
       }
       else if (const auto *layout_decl = dynamic_cast<const LayoutDeclaration *>(item_decl)) {
         if (!layout_decl->is_default) {
-          layout_decl->draw(*layout, C, ptr);
+          Layout &column = layout->column(false);
+          layout_decl->draw(column, C, ptr);
         }
       }
     }

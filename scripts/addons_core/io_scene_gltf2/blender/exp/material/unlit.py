@@ -107,7 +107,7 @@ def __detect_lightpath_trick(socket):
     in0 = previous_socket(NodeSocket(prev.node.inputs[0], prev.group_path))
     if in0.socket is None or in0.socket.node.type != 'LIGHT_PATH':
         return None
-    if in0.socket.name != 'Is Camera Ray':
+    if in0.socket.identifier != 'Is Camera Ray':
         return None
     next_socket = NodeSocket(prev.node.inputs[2], prev.group_path)
 
@@ -178,7 +178,13 @@ def gather_base_color_texture(info, export_settings):
                 path_['path'] = export_settings['current_texture_transform'][k]['path'].replace(
                     "YYY", "pbrMetallicRoughness/baseColorTexture/extensions")
                 path_['vector_type'] = export_settings['current_texture_transform'][k]['vector_type']
-                export_settings['current_paths'][k] = path_
+                if k in export_settings['current_paths']:
+                    if 'additional' not in export_settings['current_paths'][k]:
+                        export_settings['current_paths'][k]['additional'] = []
+                    if path_['path'] != export_settings['current_paths'][k]['path']:
+                        export_settings['current_paths'][k]['additional'].append(path_['path'])
+                else:
+                    export_settings['current_paths'][k] = path_
 
         export_settings['current_texture_transform'] = {}
 

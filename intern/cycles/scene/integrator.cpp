@@ -34,6 +34,29 @@
 
 CCL_NAMESPACE_BEGIN
 
+/* Halton sequence generator using only integer numbers.
+ * See https://doi.org/10.1016/0010-4655(91)90064-R for details. */
+static float halton(int &a, int &b, int base)
+{
+  int x = b - a;
+  if (x == 1) {
+    a = 1;
+    b *= base;
+  }
+  else {
+    int y = b / base;
+    while (x <= y) {
+      y /= base;
+    }
+    a = (1 + base) * y - x;
+  }
+  return static_cast<float>(a) / static_cast<float>(b);
+}
+float2 HaltonSequence::next()
+{
+  return make_float2(halton(a2, b2, 2) - 0.5f, halton(a3, b3, 3) - 0.5f);
+}
+
 NODE_DEFINE(Integrator)
 {
   NodeType *type = NodeType::add("integrator", create);
@@ -113,6 +136,7 @@ NODE_DEFINE(Integrator)
   SOCKET_BOOLEAN(use_emission, "Use Emission", true);
 
   SOCKET_INT(seed, "Seed", 0);
+
   SOCKET_FLOAT(sample_clamp_direct, "Sample Clamp Direct", 0.0f);
   SOCKET_FLOAT(sample_clamp_indirect, "Sample Clamp Indirect", 10.0f);
   SOCKET_BOOLEAN(motion_blur, "Motion Blur", false);
@@ -141,10 +165,16 @@ NODE_DEFINE(Integrator)
               SAMPLING_PATTERN_TABULATED_SOBOL);
   SOCKET_FLOAT(scrambling_distance, "Scrambling Distance", 1.0f);
 
+  SOCKET_BOOLEAN(use_pixel_jitter, "Use Pixel Jitter", false);
+  SOCKET_BOOLEAN(use_custom_pixel_jitter_sample, "Use custom pixel jitter sample value", false);
+  SOCKET_FLOAT_ARRAY(
+      custom_pixel_jitter_sample, "Custom pixel jitter sample overwrite value", array<float>());
+
   static NodeEnum denoiser_type_enum;
   denoiser_type_enum.insert("none", DENOISER_NONE);
   denoiser_type_enum.insert("optix", DENOISER_OPTIX);
   denoiser_type_enum.insert("openimagedenoise", DENOISER_OPENIMAGEDENOISE);
+  denoiser_type_enum.insert("dlss", DENOISER_DLSS);
 
   static NodeEnum denoiser_prefilter_enum;
   denoiser_prefilter_enum.insert("none", DENOISER_PREFILTER_NONE);
@@ -162,14 +192,15 @@ NODE_DEFINE(Integrator)
   SOCKET_BOOLEAN(use_denoise, "Use Denoiser", false);
   SOCKET_ENUM(denoiser_type, "Denoiser Type", denoiser_type_enum, DENOISER_OPENIMAGEDENOISE);
   SOCKET_INT(denoise_start_sample, "Start Sample to Denoise", 0);
-  SOCKET_BOOLEAN(use_denoise_pass_albedo, "Use Albedo Pass for Denoiser", true);
-  SOCKET_BOOLEAN(use_denoise_pass_normal, "Use Normal Pass for Denoiser", true);
+  SOCKET_INT(denoiser_passes, "Denoiser Passes", DENOISER_PASS_ALBEDO | DENOISER_PASS_NORMAL);
   SOCKET_ENUM(denoiser_prefilter,
               "Denoiser Prefilter",
               denoiser_prefilter_enum,
               DENOISER_PREFILTER_ACCURATE);
   SOCKET_BOOLEAN(denoise_use_gpu, "Denoise on GPU", true);
   SOCKET_ENUM(denoiser_quality, "Denoiser Quality", denoiser_quality_enum, DENOISER_QUALITY_HIGH);
+  SOCKET_FLOAT(denoiser_upscale_factor, "Denoiser Upscale Factor", 1.0f);
+  SOCKET_BOOLEAN(denoiser_carry_history, "Denoiser Carry History", false);
 
   return type;
 }
@@ -189,6 +220,10 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
       scene->update_stats->integrator.times.add_entry({"device_update", time});
     }
   });
+
+  if (use_denoise && denoiser_type == DENOISER_DLSS) {
+    use_pixel_jitter = true;
+  }
 
   KernelIntegrator *kintegrator = &dscene->data.integrator;
 
@@ -309,10 +344,19 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
     kintegrator->blue_noise_sequence_length -= 1;
   }
 
+  /* Randomize the seed every frame when applying pixel jitter. */
+  if (use_pixel_jitter) {
+    if (use_custom_pixel_jitter_sample) {
+      kintegrator->seed = hash_uint2(seed, pixel_jitter_frame);
+    }
+    else {
+      kintegrator->seed = hash_uint3(seed, pixel_jitter_state.a2, pixel_jitter_state.a3);
+    }
+  }
   /* The blue-noise sampler needs a randomized seed to scramble properly, providing e.g. 0 won't
    * work properly. Therefore, hash the seed in those cases. */
-  if (kintegrator->sampling_pattern == SAMPLING_PATTERN_BLUE_NOISE_FIRST ||
-      kintegrator->sampling_pattern == SAMPLING_PATTERN_BLUE_NOISE_PURE)
+  else if (kintegrator->sampling_pattern == SAMPLING_PATTERN_BLUE_NOISE_FIRST ||
+           kintegrator->sampling_pattern == SAMPLING_PATTERN_BLUE_NOISE_PURE)
   {
     kintegrator->seed = hash_uint(seed);
   }
@@ -356,6 +400,25 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
   }
 
   kintegrator->has_shadow_catcher = scene->has_shadow_catcher();
+
+  if (use_pixel_jitter) {
+    if (use_custom_pixel_jitter_sample) {
+      kintegrator->pixel_jitter = make_float2(custom_pixel_jitter_sample[0],
+                                              custom_pixel_jitter_sample[1]);
+      ++pixel_jitter_frame;
+    }
+    else {
+      if (!pixel_jitter_pinned_ || pixel_jitter_pending_) {
+        pixel_jitter_current_ = pixel_jitter_state.next();
+        pixel_jitter_pending_ = false;
+      }
+      kintegrator->pixel_jitter = pixel_jitter_current_;
+    }
+  }
+  else {
+    kintegrator->pixel_jitter = make_float2(FLT_MAX);
+    pixel_jitter_state.reset();
+  }
 
   dscene->sample_pattern_lut.clear_modified();
 
@@ -406,6 +469,7 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
      * SHARC -- the two modes share storage and are not meant to run together. */
     kintegrator->falcon_photon_add = 0;
     kintegrator->falcon_photon_pass = 0;
+    kintegrator->falcon_photon_is_world = 0;
     kintegrator->falcon_photon_point_store = 0;
     kintegrator->falcon_photon_point_mode = 0;
     kintegrator->falcon_photon_point_max = 0;
@@ -479,7 +543,16 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
      * avoids touching that lifecycle at all. Kept as `false` rather than
      * removed so the reset logic stays in one place if revisited. */
     const bool accumulate = false;
-    if (photon_light) {
+    /* FALCON_PHOTON_WORLD=<L>: photon pass emitting from a uniform environment
+     * of radiance L instead of a lamp (the world pass runs with every lamp
+     * hidden, so photon_light is null then). Covers the world->glass->shadow
+     * caustic component the exclusive separation removes from beauty and the
+     * lamp LT passes never carry (LuxCore parity gap #2, 2026-07-06). */
+    const char *world_env = (photon_mode && strcmp(photon_mode, "bake") == 0) ?
+                                getenv("FALCON_PHOTON_WORLD") :
+                                nullptr;
+    const float world_radiance = world_env ? (float)atof(world_env) : 0.0f;
+    if (photon_light || world_radiance > 0.0f) {
       const size_t floats = (size_t(1) << 22) * 4;
       if (dscene->falcon_sharc_cache.size() != floats) {
         if (dscene->falcon_sharc_cache.size() != 0) {
@@ -493,9 +566,6 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
       }
       dscene->falcon_sharc_cache.clear_modified();
 
-      Light *light = photon_light;
-      const float3 strength = light->get_strength();
-      const float watts = (strength.x + strength.y + strength.z) / 3.0f;
       double n_photons = 1e6;
       const char *n_env = getenv("FALCON_PHOTON_N");
       if (n_env) {
@@ -507,16 +577,73 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
         gain = (float)atof(gain_env);
       }
       kintegrator->falcon_photon_pass = 1;
-      kintegrator->falcon_photon_is_sun = (light->get_light_type() == LIGHT_DISTANT) ? 1 : 0;
-      kintegrator->falcon_photon_is_spot = (light->get_light_type() == LIGHT_SPOT) ? 1 : 0;
+
+      Light *light = photon_light;
+      const float watts = light ? (light->get_strength().x + light->get_strength().y +
+                                   light->get_strength().z) /
+                                      3.0f :
+                                  0.0f;
+      kintegrator->falcon_photon_is_sun = (light && light->get_light_type() == LIGHT_SUN) ?
+                                              1 :
+                                              0;
+      kintegrator->falcon_photon_is_spot = (light && light->get_light_type() == LIGHT_SPOT) ? 1 :
+                                                                                              0;
       kintegrator->falcon_photon_flux = (float)(watts * gain / n_photons);
+
+      if (!light) {
+        /* World (uniform environment) emission: parallel beams through the
+         * caster bounding sphere's cross-section, one uniform direction per
+         * photon. Power intercepted by the sphere = 4 pi^2 r^2 L (pbrt
+         * UniformInfiniteLight), so flux/photon = that / N. The launch disk
+         * center/radius come from FALCON_PHOTON_TARGET (fallback: whole-scene
+         * bounding sphere) and ride in the sun_* fields; backoff pushes the
+         * launch plane outside every bound so occlusion (e.g. the floor
+         * blocking light from below) stays physical. */
+        kintegrator->falcon_photon_is_world = 1;
+        BoundBox bbox = BoundBox::empty;
+        for (Object *ob : scene->objects) {
+          if (ob->get_geometry() && ob->bounds.valid()) {
+            bbox.grow(ob->bounds);
+          }
+        }
+        float3 c = bbox.valid() ? 0.5f * (bbox.min + bbox.max) : zero_float3();
+        float disk_r = bbox.valid() ? 0.5f * len(bbox.max - bbox.min) : 1.0f;
+        const char *tgt_env = getenv("FALCON_PHOTON_TARGET");
+        float tc[4];
+        if (tgt_env && sscanf(tgt_env, "%f,%f,%f,%f", &tc[0], &tc[1], &tc[2], &tc[3]) == 4) {
+          c = make_float3(tc[0], tc[1], tc[2]);
+          disk_r = tc[3] * 1.05f;
+        }
+        float backoff = disk_r;
+        if (bbox.valid()) {
+          for (int i = 0; i < 8; i++) {
+            const float3 corner = make_float3((i & 1) ? bbox.max.x : bbox.min.x,
+                                              (i & 2) ? bbox.max.y : bbox.min.y,
+                                              (i & 4) ? bbox.max.z : bbox.min.z);
+            backoff = max(backoff, len(corner - c));
+          }
+        }
+        backoff = backoff * 1.05f + 0.1f;
+        kintegrator->falcon_photon_sun_minx = c.x;
+        kintegrator->falcon_photon_sun_miny = c.y;
+        kintegrator->falcon_photon_sun_z = c.z;
+        kintegrator->falcon_photon_sun_sizex = disk_r;
+        kintegrator->falcon_photon_sun_sizey = backoff;
+        kintegrator->falcon_photon_flux = (float)(4.0 * M_PI_F * M_PI_F * double(disk_r) *
+                                                  double(disk_r) * world_radiance * gain /
+                                                  n_photons);
+        LOG_INFO << "Falcon Photon: world emission, L " << world_radiance << " disk r " << disk_r
+                 << " backoff " << backoff;
+      }
 
       if (kintegrator->falcon_photon_is_spot) {
         /* Blender spot = point light (intensity W / 4 pi) clipped to the cone,
          * so the power actually leaving through the cone is W * Omega/(4 pi),
          * Omega = 2 pi (1 - cos(half angle)). Uniform cone sampling in the
          * kernel then gives every photon equal flux. */
-        const float cos_half = cosf(light->get_spot_angle() * 0.5f);
+        /* 5.2: spot cone angle moved to the SpotLight subclass. */
+        const SpotLight *spot = dynamic_cast<const SpotLight *>(light);
+        const float cos_half = cosf((spot ? spot->get_angle() : M_PI_F) * 0.5f);
         const float omega = M_2PI_F * (1.0f - cos_half);
         kintegrator->falcon_photon_flux = (float)(watts * (omega / (4.0f * M_PI_F)) * gain /
                                                   n_photons);
@@ -947,6 +1074,11 @@ AdaptiveSampling Integrator::get_adaptive_sampling() const
 
   adaptive_sampling.use = use_adaptive_sampling;
 
+  /* Disable sample count pass with upscaling. */
+  if (use_denoise && denoiser_upscale_factor != 1.0f) {
+    adaptive_sampling.use = false;
+  }
+
   if (!adaptive_sampling.use) {
     return adaptive_sampling;
   }
@@ -1006,11 +1138,12 @@ DenoiseParams Integrator::get_denoise_params() const
 
   denoise_params.start_sample = denoise_start_sample;
 
-  denoise_params.use_pass_albedo = use_denoise_pass_albedo;
-  denoise_params.use_pass_normal = use_denoise_pass_normal;
+  denoise_params.passes = denoiser_passes;
 
   denoise_params.prefilter = denoiser_prefilter;
   denoise_params.quality = denoiser_quality;
+  denoise_params.upscale_factor = denoiser_upscale_factor;
+  denoise_params.carry_history = denoiser_carry_history;
 
   return denoise_params;
 }

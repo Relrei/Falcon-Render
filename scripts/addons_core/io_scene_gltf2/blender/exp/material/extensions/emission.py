@@ -13,11 +13,12 @@ from ..search_node_tree import \
     get_socket_from_gltf_material_node
 
 
-def export_emission_factor(blender_material, export_settings):
-    emissive_socket = get_socket(blender_material.node_tree, "Emissive")
+def export_emission_factor(bmat, export_settings):
+    export_settings['current_texture_transform'] = {}
+    emissive_socket = get_socket(bmat.get_used_material().node_tree, "Emissive")
     if emissive_socket.socket is None:
         emissive_socket = get_socket_from_gltf_material_node(
-            blender_material.node_tree, "EmissiveFactor")
+            bmat.get_used_material().node_tree, "EmissiveFactor")
     if emissive_socket is not None and isinstance(emissive_socket.socket, bpy.types.NodeSocket):
         if export_settings['gltf_image_format'] != "NONE":
             factor, path = get_factor_from_socket(emissive_socket, kind='RGB')
@@ -78,11 +79,11 @@ def export_emission_factor(blender_material, export_settings):
     return None
 
 
-def export_emission_texture(blender_material, export_settings):
-    emissive = get_socket(blender_material.node_tree, "Emissive")
+def export_emission_texture(bmat, export_settings):
+    emissive = get_socket(bmat.get_used_material().node_tree, "Emissive")
     if emissive.socket is None:
         emissive = get_socket_from_gltf_material_node(
-            blender_material.node_tree, "Emissive")
+            bmat.get_used_material().node_tree, "Emissive")
     emissive_texture, uvmap_info, udim_info, _ = gltf2_blender_gather_texture_info.gather_texture_info(
         emissive, (emissive,), export_settings)
 
@@ -93,7 +94,13 @@ def export_emission_texture(blender_material, export_settings):
             path_['path'] = export_settings['current_texture_transform'][k]['path'].replace(
                 "YYY", "emissiveTexture/extensions")
             path_['vector_type'] = export_settings['current_texture_transform'][k]['vector_type']
-            export_settings['current_paths'][k] = path_
+            if k in export_settings['current_paths']:
+                if 'additional' not in export_settings['current_paths'][k]:
+                    export_settings['current_paths'][k]['additional'] = []
+                if path_['path'] != export_settings['current_paths'][k]['path']:
+                    export_settings['current_paths'][k]['additional'].append(path_['path'])
+            else:
+                export_settings['current_paths'][k] = path_
 
     export_settings['current_texture_transform'] = {}
 

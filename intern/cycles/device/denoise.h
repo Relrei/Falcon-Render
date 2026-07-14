@@ -11,6 +11,7 @@ CCL_NAMESPACE_BEGIN
 enum DenoiserType {
   DENOISER_OPTIX = 2,
   DENOISER_OPENIMAGEDENOISE = 4,
+  DENOISER_DLSS = 8,
   DENOISER_NUM,
 
   DENOISER_NONE = 0,
@@ -21,6 +22,22 @@ enum DenoiserType {
 const char *denoiserTypeToHumanReadable(DenoiserType type);
 
 using DenoiserTypeMask = int;
+
+enum DenoiserPass {
+  DENOISER_PASS_NONE = 0,
+  DENOISER_PASS_ALBEDO = 1 << 0,
+  DENOISER_PASS_SPECULAR_ALBEDO = 1 << 1,
+  DENOISER_PASS_NORMAL = 1 << 2,
+  DENOISER_PASS_ROUGHNESS = 1 << 3,
+  DENOISER_PASS_DEPTH = 1 << 4,
+  DENOISER_PASS_MOTION = 1 << 5,
+  DENOISER_PASS_BACKWARD_MOTION = 1 << 6,
+  DENOISER_PASS_SPECULAR_MOTION = 1 << 7,
+  DENOISER_PASS_TRANSMISSION = 1 << 8,
+  DENOISER_PASS_SPECULAR_HIT_DISTANCE = 1 << 9,
+};
+
+using DenoiserPassMask = int;
 
 enum DenoiserPrefilter {
   /* Best quality of the result without extra processing time, but requires guiding passes to be
@@ -62,8 +79,7 @@ class DenoiseParams : public Node {
   int start_sample = 0;
 
   /* Auxiliary passes. */
-  bool use_pass_albedo = true;
-  bool use_pass_normal = true;
+  DenoiserPassMask passes = DENOISER_PASS_ALBEDO | DENOISER_PASS_NORMAL;
 
   /* Configure the denoiser to use motion vectors, previous image and a temporally stable model. */
   bool temporally_stable = false;
@@ -74,6 +90,12 @@ class DenoiseParams : public Node {
 
   DenoiserPrefilter prefilter = DENOISER_PREFILTER_FAST;
   DenoiserQuality quality = DENOISER_QUALITY_HIGH;
+  float upscale_factor = 1.0f;
+
+  /* DLSS-RR: carry the temporal history across restarts, aligning it with the
+   * motion vectors. Final renders carry across animation frames; the viewport
+   * carries across navigation restarts using the interactive motion passes. */
+  bool carry_history = false;
 
   static const NodeEnum *get_type_enum();
   static const NodeEnum *get_prefilter_enum();

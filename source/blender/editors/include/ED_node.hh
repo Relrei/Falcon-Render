@@ -74,7 +74,7 @@ void node_insert_on_link_flags_set(SpaceNode &snode,
 /**
  * Tag the editor to highlight the frame that currently transformed nodes will be attached to.
  */
-void node_insert_on_frame_flag_set(bContext &C, SpaceNode &snode, const int2 &cursor);
+void node_insert_on_frame_flag_set(SpaceNode &snode, ARegion &region, const int2 &cursor);
 void node_insert_on_frame_flag_clear(SpaceNode &snode);
 
 /**
@@ -105,8 +105,8 @@ std::optional<nodes::FoundNestedNodeID> find_nested_node_id_in_root(
     const bNodeTree &root_tree, const ComputeContext *compute_context, const int node_id);
 
 struct ObjectAndModifier {
-  const Object *object;
-  const NodesModifierData *nmd;
+  const Object *object = nullptr;
+  const NodesModifierData *nmd = nullptr;
 };
 /**
  * Finds the context-modifier for the node editor.
@@ -164,6 +164,9 @@ const char *node_socket_get_description(const bNodeSocket *socket);
 
 std::optional<Bounds<float2>> node_bounds(Span<const bNode *> nodes);
 std::optional<Bounds<float2>> node_location_bounds(Span<const bNode *> nodes);
+
+/** Find the top-most parent shared by all the nodes, or null if no parent contains all nodes. */
+bNode *find_common_parent_node(Span<bNode *> nodes);
 
 }  // namespace ed::space_node
 

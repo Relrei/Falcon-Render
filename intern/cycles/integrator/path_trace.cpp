@@ -20,6 +20,7 @@
 
 #include "util/log.h"
 #include "util/progress.h"
+#include "util/scoped_defer.h"
 #include "util/tbb.h"
 #include "util/time.h"
 
@@ -217,6 +218,7 @@ void PathTrace::render_pipeline(RenderWork render_work)
                                                   0);
 
   render_init_kernel_execution();
+  SCOPED_DEFER(render_deinit_kernel_execution());
 
   render_scheduler_.report_work_begin(render_work);
 
@@ -479,6 +481,13 @@ void PathTrace::render_init_kernel_execution()
   }
 }
 
+void PathTrace::render_deinit_kernel_execution()
+{
+  for (auto &&path_trace_work : path_trace_works_) {
+    path_trace_work->deinit_execution();
+  }
+}
+
 /* TODO(sergey): Look into `std::function` rather than using a template. Should not be a
  * measurable performance impact at runtime, but will make compilation faster and binary somewhat
  * smaller. */
@@ -539,22 +548,22 @@ void PathTrace::update_allocated_work_buffer_params()
                                });
 }
 
-static BufferParams scale_buffer_params(const BufferParams &params, const int resolution_divider)
+static BufferParams scale_buffer_params(const BufferParams &params, const float resolution_divider)
 {
   BufferParams scaled_params = params;
 
-  scaled_params.width = max(1, params.width / resolution_divider);
-  scaled_params.height = max(1, params.height / resolution_divider);
+  scaled_params.width = max(1, int(params.width / resolution_divider));
+  scaled_params.height = max(1, int(params.height / resolution_divider));
 
-  scaled_params.window_x = params.window_x / resolution_divider;
-  scaled_params.window_y = params.window_y / resolution_divider;
-  scaled_params.window_width = max(1, params.window_width / resolution_divider);
-  scaled_params.window_height = max(1, params.window_height / resolution_divider);
+  scaled_params.window_x = int(params.window_x / resolution_divider);
+  scaled_params.window_y = int(params.window_y / resolution_divider);
+  scaled_params.window_width = max(1, int(params.window_width / resolution_divider));
+  scaled_params.window_height = max(1, int(params.window_height / resolution_divider));
 
-  scaled_params.full_x = params.full_x / resolution_divider;
-  scaled_params.full_y = params.full_y / resolution_divider;
-  scaled_params.full_width = max(1, params.full_width / resolution_divider);
-  scaled_params.full_height = max(1, params.full_height / resolution_divider);
+  scaled_params.full_x = int(params.full_x / resolution_divider);
+  scaled_params.full_y = int(params.full_y / resolution_divider);
+  scaled_params.full_width = max(1, int(params.full_width / resolution_divider));
+  scaled_params.full_height = max(1, int(params.full_height / resolution_divider));
 
   scaled_params.update_offset_stride();
 
@@ -563,24 +572,32 @@ static BufferParams scale_buffer_params(const BufferParams &params, const int re
 
 void PathTrace::update_effective_work_buffer_params(const RenderWork &render_work)
 {
-  const int resolution_divider = render_work.resolution_divider;
+  const float denoised_resolution_divider = render_work.denoised_resolution_divider;
+  const float resolution_divider = render_work.resolution_divider / denoised_resolution_divider;
 
-  const BufferParams scaled_full_params = scale_buffer_params(full_params_, resolution_divider);
-  const BufferParams scaled_big_tile_params = scale_buffer_params(big_tile_params_,
+  const BufferParams denoised_big_tile_params = scale_buffer_params(big_tile_params_,
+                                                                    denoised_resolution_divider);
+  const BufferParams scaled_big_tile_params = scale_buffer_params(denoised_big_tile_params,
                                                                   resolution_divider);
 
   const int overscan = tile_manager_.get_tile_overscan();
 
-  foreach_sliced_buffer_params(path_trace_works_,
-                               work_balance_infos_,
-                               scaled_big_tile_params,
-                               overscan,
-                               [&](PathTraceWork *path_trace_work, const BufferParams params) {
-                                 path_trace_work->set_effective_buffer_params(
-                                     scaled_full_params, scaled_big_tile_params, params);
-                               });
+  foreach_sliced_buffer_params(
+      path_trace_works_,
+      work_balance_infos_,
+      denoised_big_tile_params,
+      overscan,
+      [&](PathTraceWork *path_trace_work, const BufferParams params) {
+        /* Scale down the sliced buffer parameters again that were scaled by denoising upscale
+         * factor above. This should match the values that would occur when slicing
+         * 'scaled_big_tile_params' directly. */
+        const BufferParams scaled_params = scale_buffer_params(params, resolution_divider);
+        path_trace_work->set_effective_buffer_params(
+            scaled_big_tile_params, scaled_params, denoised_big_tile_params, params);
+      });
 
   render_state_.effective_big_tile_params = scaled_big_tile_params;
+  render_state_.effective_denoised_big_tile_params = denoised_big_tile_params;
 }
 
 void PathTrace::update_work_buffer_params_if_needed(const RenderWork &render_work)
@@ -724,10 +741,18 @@ void PathTrace::adaptive_sample(RenderWork &render_work)
   }
 }
 
+void PathTrace::clear_denoiser_temporal_history()
+{
+  if (denoiser_) {
+    denoiser_->clear_temporal_history();
+  }
+}
+
 void PathTrace::set_denoiser_params(const DenoiseParams &params)
 {
   if (!params.use) {
     denoiser_.reset();
+    render_scheduler_.set_denoiser_params(params);
     return;
   }
 
@@ -738,8 +763,14 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
 
   Device *effective_denoise_device;
   Device *cpu_fallback_device = cpu_device_.get();
-  const DenoiseParams effective_denoise_params = get_effective_denoise_params(
+  DenoiseParams effective_denoise_params = get_effective_denoise_params(
       denoise_device_, cpu_fallback_device, params, interop_device, effective_denoise_device);
+
+  /* Carrying the DLSS-RR temporal history is allowed in both modes now:
+   * final (background) renders carry it across animation frames
+   * (denoising_carry_history), the viewport carries it across navigation
+   * restarts aligned by the interactive motion passes
+   * (preview_denoising_carry_history). Each mode's sync sets its own flag. */
 
   bool need_to_recreate_denoiser = false;
   if (denoiser_) {
@@ -747,7 +778,9 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
 
     const bool is_cpu_denoising = old_denoiser_params.type == DENOISER_OPENIMAGEDENOISE &&
                                   old_denoiser_params.use_gpu == false;
-    const bool requested_gpu_denoising = effective_denoise_params.type == DENOISER_OPTIX ||
+    const bool always_gpu_denoising = effective_denoise_params.type == DENOISER_DLSS ||
+                                      effective_denoise_params.type == DENOISER_OPTIX;
+    const bool requested_gpu_denoising = always_gpu_denoising ||
                                          (effective_denoise_params.type ==
                                               DENOISER_OPENIMAGEDENOISE &&
                                           effective_denoise_params.use_gpu == true);
@@ -765,7 +798,7 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
     /* Optix Denoiser is not supporting CPU devices, so use_gpu option is not
      * shown in the UI and changes in the option value should not be checked. */
     if (old_denoiser_params.type == effective_denoise_params.type &&
-        (is_same_denoising_device_type || effective_denoise_params.type == DENOISER_OPTIX))
+        (is_same_denoising_device_type || always_gpu_denoising))
     {
       denoiser_->set_params(effective_denoise_params);
     }
@@ -829,6 +862,37 @@ void PathTrace::denoise(const RenderWork &render_work)
 
   LOG_DEBUG << "Perform denoising work.";
 
+  denoiser_->set_same_frame_restart(render_work.denoise_same_frame_restart);
+
+  {
+    /* The specular hit distance is a world-space length; RR needs the camera
+     * matrices to place the reflection it describes.
+     *
+     * NGX wants these row-major and left-multiply (v * M). Cycles stores its
+     * matrices row-major but right-multiply (M * v), so they have to be
+     * transposed -- NVIDIA's own sample gets away with passing glm matrices
+     * untouched precisely because glm's column-major storage already amounts to
+     * the transpose. Handing ours over as-is (which is what the first attempt at
+     * this did) feeds RR a garbled matrix, and it quietly ignores the guide.
+     *
+     * Cycles keeps world->camera and world->NDC; view->clip is world->NDC with
+     * the camera undone, and NDC ([0,1]) remapped to clip ([-1,1]). */
+    const KernelCamera &cam = device_scene_->data.cam;
+
+    const ProjectionTransform camera_to_world(transform_inverse(cam.worldtocamera));
+    ProjectionTransform ndc_to_clip = projection_identity();
+    ndc_to_clip.x = make_float4(2.0f, 0.0f, 0.0f, -1.0f);
+    ndc_to_clip.y = make_float4(0.0f, 2.0f, 0.0f, -1.0f);
+
+    const ProjectionTransform world_to_view(cam.worldtocamera);
+    const ProjectionTransform view_to_clip = ndc_to_clip * cam.worldtondc * camera_to_world;
+
+    const ProjectionTransform world_to_view_ngx = projection_transpose(world_to_view);
+    const ProjectionTransform view_to_clip_ngx = projection_transpose(view_to_clip);
+
+    denoiser_->set_camera_matrices(&world_to_view_ngx.x.x, &view_to_clip_ngx.x.x);
+  }
+
   const double start_time = time_dt();
 
   RenderBuffers *buffer_to_denoise = nullptr;
@@ -840,12 +904,14 @@ void PathTrace::denoise(const RenderWork &render_work)
   }
 
   if (big_tile_denoise_work_) {
-    big_tile_denoise_work_->set_effective_buffer_params(render_state_.effective_big_tile_params,
-                                                        render_state_.effective_big_tile_params,
-                                                        render_state_.effective_big_tile_params);
+    big_tile_denoise_work_->set_effective_buffer_params(
+        render_state_.effective_big_tile_params,
+        render_state_.effective_big_tile_params,
+        render_state_.effective_denoised_big_tile_params,
+        render_state_.effective_denoised_big_tile_params);
 
     buffer_to_denoise = big_tile_denoise_work_->get_render_buffers();
-    buffer_to_denoise->reset(render_state_.effective_big_tile_params);
+    buffer_to_denoise->reset(render_state_.effective_denoised_big_tile_params);
 
     copy_to_render_buffers(buffer_to_denoise);
 
@@ -858,9 +924,11 @@ void PathTrace::denoise(const RenderWork &render_work)
   }
 
   if (denoiser_->denoise_buffer(render_state_.effective_big_tile_params,
+                                render_state_.effective_denoised_big_tile_params,
                                 buffer_to_denoise,
                                 get_num_samples_in_buffer(),
-                                allow_inplace_modification))
+                                allow_inplace_modification,
+                                device_scene_->data.integrator.pixel_jitter))
   {
     render_state_.has_denoised_result = true;
   }
@@ -961,17 +1029,22 @@ void PathTrace::update_display(const RenderWork &render_work)
   if (display_) {
     LOG_DEBUG << "Perform copy to GPUDisplay work.";
 
-    const int texture_width = render_state_.effective_big_tile_params.window_width;
-    const int texture_height = render_state_.effective_big_tile_params.window_height;
+    const PassType pass_type = film_->get_display_pass();
+    const bool show_denoised =
+        ((render_work.display.use_denoised_result && has_denoised_result() &&
+          big_tile_params_.get_pass_offset(pass_type, PassMode::DENOISED) != PASS_UNUSED) ||
+         is_volume_guiding_pass(pass_type));
+
+    const int texture_width = show_denoised ?
+                                  render_state_.effective_denoised_big_tile_params.window_width :
+                                  render_state_.effective_big_tile_params.window_width;
+    const int texture_height = show_denoised ?
+                                   render_state_.effective_denoised_big_tile_params.window_height :
+                                   render_state_.effective_big_tile_params.window_height;
     if (!display_->update_begin(texture_width, texture_height)) {
       LOG_ERROR << "Error beginning GPUDisplay update.";
       return;
     }
-
-    const PassType pass_type = film_->get_display_pass();
-    const bool show_denoised = (render_work.display.use_denoised_result &&
-                                has_denoised_result()) ||
-                               is_volume_guiding_pass(pass_type);
 
     const PassMode pass_mode = show_denoised ? PassMode::DENOISED : PassMode::NOISY;
 
@@ -1103,7 +1176,11 @@ void PathTrace::cancel()
 {
   thread_scoped_lock lock(render_cancel_.mutex);
 
-  render_cancel_.is_requested = true;
+  /* Only cancel in the middle of rendering when there is at least one sample in the output.
+   * Otherwise interactivity becomes bad. */
+  if (get_num_samples_in_buffer() > 1) {
+    render_cancel_.is_requested = true;
+  }
 
   while (render_cancel_.is_rendering) {
     render_cancel_.condition.wait(lock);
@@ -1324,7 +1401,8 @@ void PathTrace::process_full_buffer_from_disk(string_view filename)
     set_denoiser_params(denoise_params);
 
     /* Number of samples doesn't matter too much, since the samples count pass will be used. */
-    denoiser_->denoise_buffer(full_frame_buffers.params, &full_frame_buffers, 0, false);
+    denoiser_->denoise_buffer(
+        full_frame_buffers.params, full_frame_buffers.params, &full_frame_buffers, 0, false);
 
     render_state_.has_denoised_result = true;
   }

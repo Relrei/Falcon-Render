@@ -30,7 +30,11 @@ struct DeviceKernelArguments {
     HIPRT_GLOBAL_STACK,
   };
 
-  static const int MAX_ARGS = 18;
+  /* The DLSS-RR guiding preprocess takes the most: one per guide surface, plus
+   * the pass offset of each guide in the render buffer. Note the assert below is
+   * compiled out in release builds, so overflowing this silently smashes the
+   * stack. */
+  static const int MAX_ARGS = 32;
   Type types[MAX_ARGS];
   void *values[MAX_ARGS];
   size_t sizes[MAX_ARGS];
@@ -129,6 +133,9 @@ class DeviceQueue {
    * Use this method after device synchronization has finished before enqueueing any kernels. */
   virtual void init_execution() = 0;
 
+  /* Update device-specific image state after allocating device_image. */
+  virtual void load_image_info() = 0;
+
   /* Enqueue kernel execution.
    *
    * Execute the kernel work_size times on the device.
@@ -149,6 +156,7 @@ class DeviceQueue {
   virtual void zero_to_device(device_memory &mem) = 0;
   virtual void copy_to_device(device_memory &mem) = 0;
   virtual void copy_from_device(device_memory &mem) = 0;
+  virtual void *copy_from_device_synchronized(device_memory &mem, vector<uint8_t> &storage) = 0;
 
   /* Graphics resources interoperability.
    *

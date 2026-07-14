@@ -38,9 +38,6 @@ struct ShaderCreateInfo;
  * This makes sure the GPUVertexFormat name buffer does not overflow. */
 constexpr static int GPU_MAX_ATTR = 15;
 
-/* Determined by the maximum uniform buffer size divided by chunk size. */
-constexpr static int GPU_MAX_UNIFORM_ATTR = 8;
-
 /* -------------------------------------------------------------------- */
 /** \name Creation
  * \{ */
@@ -230,6 +227,7 @@ void GPU_shader_uniform_4fv(gpu::Shader *sh, const char *name, const float data[
 void GPU_shader_uniform_2iv(gpu::Shader *sh, const char *name, const int data[2]);
 void GPU_shader_uniform_3iv(gpu::Shader *sh, const char *name, const int data[3]);
 void GPU_shader_uniform_mat4(gpu::Shader *sh, const char *name, const float data[4][4]);
+void GPU_shader_uniform_mat3(gpu::Shader *sh, const char *name, const float data[3][3]);
 void GPU_shader_uniform_mat3_as_mat4(gpu::Shader *sh, const char *name, const float data[3][3]);
 void GPU_shader_uniform_1f_array(gpu::Shader *sh, const char *name, int len, const float *val);
 void GPU_shader_uniform_2fv_array(gpu::Shader *sh,
@@ -380,8 +378,6 @@ enum GPUUniformBuiltin {
 
   GPU_UNIFORM_COLOR,              /* vec4 color */
   GPU_UNIFORM_BASE_INSTANCE,      /* int baseInstance */
-  GPU_UNIFORM_RESOURCE_CHUNK,     /* int resourceChunk */
-  GPU_UNIFORM_RESOURCE_ID,        /* int resourceId */
   GPU_UNIFORM_SRGB_TRANSFORM,     /* bool srgbTarget */
   GPU_UNIFORM_SCENE_LINEAR_XFORM, /* float3x3 gpu_scene_linear_to_xyz */
 };

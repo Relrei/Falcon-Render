@@ -14,6 +14,13 @@
 
 CCL_NAMESPACE_BEGIN
 
+/* Blender 5.2 removed BSDF_ROUGHNESS_SQ_THRESH from svm/types.h; keep the 5.1
+ * value (squared roughness under which a microfacet counts as smooth) for the
+ * dispersion gate in shade_surface.h. */
+#ifndef BSDF_ROUGHNESS_SQ_THRESH
+#  define BSDF_ROUGHNESS_SQ_THRESH 2e-10f
+#endif
+
 #ifdef __FALCON_SHARC__
 
 /* Sampled band. Uniform lambda over [380, 730] nm. */

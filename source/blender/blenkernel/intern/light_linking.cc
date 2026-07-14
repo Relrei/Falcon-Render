@@ -48,6 +48,32 @@ void BKE_light_linking_copy(Object *object_dst, const Object *object_src, const 
   }
 }
 
+void BKE_light_linking_copy_collection(Main *bmain,
+                                       Object &object_dst,
+                                       const Object &object_src,
+                                       const LightLinkingType link_type)
+{
+  Collection *receiver_collection = BKE_light_linking_collection_get(&object_src, link_type);
+  BKE_light_linking_collection_assign(bmain, &object_dst, receiver_collection, link_type);
+
+  DEG_id_tag_update(&object_dst.id, ID_RECALC_SYNC_TO_EVAL | ID_RECALC_SHADING);
+  DEG_relations_tag_update(bmain);
+}
+
+void BKE_light_linking_copy_receiver_collection(Main *bmain,
+                                                Object &object_dst,
+                                                const Object &object_src)
+{
+  BKE_light_linking_copy_collection(bmain, object_dst, object_src, LIGHT_LINKING_RECEIVER);
+}
+
+void BKE_light_linking_copy_blocker_collection(Main *bmain,
+                                               Object &object_dst,
+                                               const Object &object_src)
+{
+  BKE_light_linking_copy_collection(bmain, object_dst, object_src, LIGHT_LINKING_BLOCKER);
+}
+
 void BKE_light_linking_delete(Object *object, const int delete_flags)
 {
   if (object->light_linking) {
@@ -231,10 +257,11 @@ static CollectionLightLinking *light_linking_collection_add_collection(Main *bma
   return &collection_child->light_linking;
 }
 
-void BKE_light_linking_add_receiver_to_collection(Main *bmain,
-                                                  Collection *collection,
-                                                  ID *receiver,
-                                                  const eCollectionLightLinkingState link_state)
+static void light_linking_add_receiver_to_collection(Main *bmain,
+                                                     Collection *collection,
+                                                     ID *receiver,
+                                                     const eCollectionLightLinkingState link_state,
+                                                     const bool allow_all_objects)
 {
   const ID_Type id_type = GS(receiver->name);
 
@@ -243,14 +270,19 @@ void BKE_light_linking_add_receiver_to_collection(Main *bmain,
   if (id_type == ID_OB) {
     Object *object = reinterpret_cast<Object *>(receiver);
 
-    if (object->type == OB_EMPTY && object->instance_collection) {
-      if (!BKE_collection_contains_geometry_recursive(object->instance_collection)) {
+    if (!allow_all_objects) {
+      if (object->type == OB_EMPTY && object->instance_collection) {
+        if (!BKE_collection_contains_geometry_recursive(object->instance_collection) &&
+            !DEG_object_has_geometry_component(object))
+        {
+          return;
+        }
+      }
+      else if (!DEG_object_has_geometry_component(object)) {
         return;
       }
     }
-    else if (!OB_TYPE_IS_GEOMETRY(object->type)) {
-      return;
-    }
+
     collection_light_linking = light_linking_collection_add_object(bmain, collection, object);
   }
   else if (id_type == ID_GR) {
@@ -271,6 +303,14 @@ void BKE_light_linking_add_receiver_to_collection(Main *bmain,
   DEG_id_tag_update(receiver, ID_RECALC_SHADING);
 
   DEG_relations_tag_update(bmain);
+}
+
+void BKE_light_linking_add_receiver_to_collection(Main *bmain,
+                                                  Collection *collection,
+                                                  ID *receiver,
+                                                  const eCollectionLightLinkingState link_state)
+{
+  light_linking_add_receiver_to_collection(bmain, collection, receiver, link_state, false);
 }
 
 static void order_collection_receiver_before(Collection *collection,
@@ -410,7 +450,7 @@ void BKE_light_linking_add_receiver_to_collection_before(
 {
   BLI_assert(before);
 
-  BKE_light_linking_add_receiver_to_collection(bmain, collection, receiver, link_state);
+  light_linking_add_receiver_to_collection(bmain, collection, receiver, link_state, true);
 
   if (!before) {
     return;
@@ -434,7 +474,7 @@ void BKE_light_linking_add_receiver_to_collection_after(
 {
   BLI_assert(after);
 
-  BKE_light_linking_add_receiver_to_collection(bmain, collection, receiver, link_state);
+  light_linking_add_receiver_to_collection(bmain, collection, receiver, link_state, true);
 
   if (!after) {
     return;
@@ -488,11 +528,13 @@ void BKE_light_linking_link_receiver_to_emitter(Main *bmain,
                                                 const eCollectionLightLinkingState link_state)
 {
   if (receiver->type == OB_EMPTY && receiver->instance_collection) {
-    if (!BKE_collection_contains_geometry_recursive(receiver->instance_collection)) {
+    if (!BKE_collection_contains_geometry_recursive(receiver->instance_collection) &&
+        !DEG_object_has_geometry_component(receiver))
+    {
       return;
     }
   }
-  else if (!OB_TYPE_IS_GEOMETRY(receiver->type)) {
+  else if (!DEG_object_has_geometry_component(receiver)) {
     return;
   }
 
@@ -505,7 +547,8 @@ void BKE_light_linking_link_receiver_to_emitter(Main *bmain,
   BKE_light_linking_add_receiver_to_collection(bmain, collection, &receiver->id, link_state);
 }
 
-void BKE_light_linking_select_receivers_of_emitter(Scene *scene,
+void BKE_light_linking_select_receivers_of_emitter(const Main &bmain,
+                                                   Scene *scene,
                                                    ViewLayer *view_layer,
                                                    Object *emitter,
                                                    const LightLinkingType link_type)
@@ -515,7 +558,7 @@ void BKE_light_linking_select_receivers_of_emitter(Scene *scene,
     return;
   }
 
-  BKE_view_layer_synced_ensure(scene, view_layer);
+  BKE_view_layer_synced_ensure(bmain, scene, view_layer);
 
   /* Deselect all currently selected objects in the view layer, but keep the emitter selected.
    * This is because the operation is called from the emitter being active, and it will be

@@ -55,11 +55,11 @@ bool BKE_image_has_gpu_texture_premultiplied_alpha(Image *image, ImBuf *ibuf)
     }
     /* Generated images use pre multiplied float buffer, but straight alpha for byte buffers. */
     if (image->type == IMA_TYPE_UV_TEST && ibuf) {
-      return ibuf->float_buffer.data != nullptr;
+      return ibuf->float_data() != nullptr;
     }
   }
   if (ibuf) {
-    if (ibuf->float_buffer.data) {
+    if (ibuf->float_data()) {
       return image ? (image->alpha_mode != IMA_ALPHA_STRAIGHT) : false;
     }
 
@@ -149,7 +149,7 @@ static gpu::Texture *gpu_texture_create_tile_array(Image *ima, ImBuf *main_ibuf)
   int arraywidth = 0, arrayheight = 0;
   ListBaseT<FixedSizeBoxPack> boxes = {nullptr};
 
-  int planes = 0;
+  bool all_grayscale = true;
 
   for (ImageTile &tile : ima->tiles) {
     ImageUser iuser;
@@ -177,7 +177,9 @@ static gpu::Texture *gpu_texture_create_tile_array(Image *ima, ImBuf *main_ibuf)
 
       BKE_image_release_ibuf(ima, ibuf, nullptr);
       BLI_addtail(&boxes, packtile);
-      planes = max_ii(planes, ibuf->planes);
+      if (ibuf->color_mode != ImColorMode::BW) {
+        all_grayscale = false;
+      }
     }
   }
 
@@ -205,12 +207,12 @@ static gpu::Texture *gpu_texture_create_tile_array(Image *ima, ImBuf *main_ibuf)
       tile_runtime->tilearray_layer = arraylayers;
     }
 
-    BLI_freelistN(&packed);
+    packed.free_no_destruct();
     arraylayers++;
   }
 
   const bool use_high_bitdepth = (ima->flag & IMA_HIGH_BITDEPTH);
-  const bool use_grayscale = planes <= 8;
+  const bool use_grayscale = all_grayscale;
   /* Create Texture without content. */
   gpu::Texture *tex = IMB_touch_gpu_texture(ima->id.name + 2,
                                             main_ibuf,
@@ -251,15 +253,10 @@ static gpu::Texture *gpu_texture_create_tile_array(Image *ima, ImBuf *main_ibuf)
     BKE_image_release_ibuf(ima, ibuf, nullptr);
   }
 
-  if (GPU_mipmap_enabled()) {
-    GPU_texture_update_mipmap_chain(tex);
-    GPU_texture_mipmap_mode(tex, true, true);
-    if (ima) {
-      ima->runtime->gpuflag |= IMA_GPU_MIPMAP_COMPLETE;
-    }
-  }
-  else {
-    GPU_texture_mipmap_mode(tex, false, true);
+  GPU_texture_update_mipmap_chain(tex);
+  GPU_texture_mipmap_mode(tex, true, true);
+  if (ima) {
+    ima->runtime->gpuflag |= IMA_GPU_MIPMAP_COMPLETE;
   }
 
   return tex;
@@ -349,7 +346,7 @@ static void image_gpu_texture_try_partial_update(Image *image, ImageUser *iuser)
 
 void BKE_image_ensure_gpu_texture(Image *image, ImageUser *iuser)
 {
-  if (!image) {
+  if (!image || !iuser) {
     return;
   }
 
@@ -364,8 +361,20 @@ void BKE_image_ensure_gpu_texture(Image *image, ImageUser *iuser)
   }
 }
 
+/* Returns the GPU textures representing the given image with the given image user. The image
+ * texture cache is checked first and if cached texture exist, they will be returned. If try_only
+ * is true, nullptr textures will be returned if no cached textures exists, otherwise, the textures
+ * will be generated and added to the cached.
+ *
+ * The textures are generated from the given image buffer which is assumed to be acquired from the
+ * image with the image user, but if nullptr is provided, the image buffer will be acquired
+ * internally. If use_viewers is true, the image buffer will be acquired with locking to allow
+ * retrieval of images of type viewer. If use_tile_mapping is true and the image is a tiled images,
+ * the returned texture will be a 2D texture array with a mapping texture to sampling the image at
+ * arbitrary tiles, otherwise, only the tile in the image user will be retrieved. */
 static ImageGPUTextures image_get_gpu_texture(Image *ima,
                                               ImageUser *iuser,
+                                              ImBuf *image_buffer,
                                               const bool use_viewers,
                                               const bool use_tile_mapping,
                                               bool try_only)
@@ -448,11 +457,20 @@ static ImageGPUTextures image_get_gpu_texture(Image *ima,
     return result;
   }
 
-  /* check if we have a valid image buffer */
+  /* Acquire the image buffer if not provided. */
   void *lock;
-  ImBuf *ibuf = BKE_image_acquire_ibuf(ima, iuser, (use_viewers) ? &lock : nullptr);
+  ImBuf *ibuf = image_buffer;
+  if (!image_buffer) {
+    ibuf = BKE_image_acquire_ibuf(ima, iuser, (use_viewers) ? &lock : nullptr);
+  }
+  BLI_SCOPED_DEFER([&]() {
+    if (!image_buffer) {
+      BKE_image_release_ibuf(ima, ibuf, (use_viewers) ? lock : nullptr);
+    }
+  });
+
+  /* check if we have a valid image buffer */
   if (ibuf == nullptr) {
-    BKE_image_release_ibuf(ima, ibuf, (use_viewers) ? lock : nullptr);
     *result.texture = image_gpu_texture_error_create(textarget);
     if (textarget == TEXTARGET_2D_ARRAY) {
       *result.tile_mapping = image_gpu_texture_error_create(TEXTARGET_TILE_MAPPING);
@@ -471,19 +489,14 @@ static ImageGPUTextures image_get_gpu_texture(Image *ima,
     const bool store_premultiplied = BKE_image_has_gpu_texture_premultiplied_alpha(ima, ibuf);
 
     *result.texture = IMB_create_gpu_texture(
-        ima->id.name + 2, ibuf, use_high_bitdepth, store_premultiplied);
+        ima->id.name + 2, ibuf, use_high_bitdepth, store_premultiplied, true);
 
     if (*result.texture) {
       GPU_texture_extend_mode(*result.texture, GPU_SAMPLER_EXTEND_MODE_REPEAT);
 
-      if (GPU_mipmap_enabled()) {
-        GPU_texture_update_mipmap_chain(*result.texture);
-        ima->runtime->gpuflag |= IMA_GPU_MIPMAP_COMPLETE;
-        GPU_texture_mipmap_mode(*result.texture, true, true);
-      }
-      else {
-        GPU_texture_mipmap_mode(*result.texture, false, true);
-      }
+      GPU_texture_update_mipmap_chain(*result.texture);
+      ima->runtime->gpuflag |= IMA_GPU_MIPMAP_COMPLETE;
+      GPU_texture_mipmap_mode(*result.texture, true, true);
     }
   }
 
@@ -491,33 +504,36 @@ static ImageGPUTextures image_get_gpu_texture(Image *ima,
     GPU_texture_original_size_set(*result.texture, ibuf->x, ibuf->y);
   }
 
-  BKE_image_release_ibuf(ima, ibuf, (use_viewers) ? lock : nullptr);
-
   return result;
 }
 
 gpu::Texture *BKE_image_get_gpu_texture(Image *image, ImageUser *iuser)
 {
-  return *image_get_gpu_texture(image, iuser, false, false, false).texture;
+  return *image_get_gpu_texture(image, iuser, nullptr, false, false, false).texture;
 }
 
 gpu::Texture *BKE_image_get_gpu_viewer_texture(Image *image, ImageUser *iuser)
 {
-  return *image_get_gpu_texture(image, iuser, true, false, false).texture;
+  return *image_get_gpu_texture(image, iuser, nullptr, true, false, false).texture;
+}
+
+gpu::Texture *BKE_image_get_gpu_viewer_texture(Image *image, ImageUser *iuser, ImBuf *image_buffer)
+{
+  return *image_get_gpu_texture(image, iuser, image_buffer, true, false, false).texture;
 }
 
 ImageGPUTextures BKE_image_get_gpu_material_texture(Image *image,
                                                     ImageUser *iuser,
                                                     const bool use_tile_mapping)
 {
-  return image_get_gpu_texture(image, iuser, false, use_tile_mapping, false);
+  return image_get_gpu_texture(image, iuser, nullptr, false, use_tile_mapping, false);
 }
 
 ImageGPUTextures BKE_image_get_gpu_material_texture_try(Image *image,
                                                         ImageUser *iuser,
                                                         const bool use_tile_mapping)
 {
-  return image_get_gpu_texture(image, iuser, false, use_tile_mapping, true);
+  return image_get_gpu_texture(image, iuser, nullptr, false, use_tile_mapping, true);
 }
 
 /** \} */
@@ -607,8 +623,8 @@ void BKE_image_free_anim_gputextures(Main *bmain)
 
 void BKE_image_free_old_gputextures(Main *bmain)
 {
-  static int lasttime = 0;
-  int ctime = int(BLI_time_now_seconds());
+  static int64_t lasttime = 0;
+  int64_t ctime = BLI_time_now_seconds_i();
 
   /*
    * Run garbage collector once for every collecting period of time
@@ -629,7 +645,7 @@ void BKE_image_free_old_gputextures(Main *bmain)
     if ((ima.flag & IMA_NOCOLLECT) == 0 && ctime - ima.runtime->lastused > U.textimeout) {
       /* If it's in GL memory, deallocate and set time tag to current time
        * This gives textures a "second chance" to be used before dying. */
-      if (BKE_image_has_opengl_texture(&ima)) {
+      if (BKE_image_has_gpu_texture(&ima)) {
         BKE_image_free_gputextures(&ima);
         ima.runtime->lastused = ctime;
       }
@@ -716,9 +732,9 @@ static void gpu_texture_update_scaled(gpu::Texture *tex,
     ibuf = update_do_scale(rect, rect_float, &x, &y, &w, &h, limit_w, limit_h, full_w, full_h);
   }
 
-  void *data = (ibuf->float_buffer.data) ? static_cast<void *>(ibuf->float_buffer.data) :
-                                           static_cast<void *>(ibuf->byte_buffer.data);
-  eGPUDataFormat data_format = (ibuf->float_buffer.data) ? GPU_DATA_FLOAT : GPU_DATA_UBYTE;
+  const void *data = ibuf->float_data() ? static_cast<const void *>(ibuf->float_data()) :
+                                          static_cast<const void *>(ibuf->byte_data());
+  eGPUDataFormat data_format = ibuf->float_data() ? GPU_DATA_FLOAT : GPU_DATA_UBYTE;
 
   GPU_texture_update_sub(tex, data_format, data, x, y, math::max(layer, 0), w, h, 1);
 
@@ -778,8 +794,8 @@ static void gpu_texture_update_from_ibuf(
   }
 
   /* Get texture data pointers. */
-  float *rect_float = ibuf->float_buffer.data;
-  uchar *rect = ibuf->byte_buffer.data;
+  float *rect_float = ibuf->float_data_for_write();
+  uchar *rect = ibuf->byte_data_for_write();
   int tex_stride = ibuf->x;
   int tex_offset = ibuf->channels * (y * ibuf->x + x);
 
@@ -806,12 +822,12 @@ static void gpu_texture_update_from_ibuf(
     if (IMB_colormanagement_space_is_data(ibuf->byte_buffer.colorspace) && !scaled) {
       /* Not scaled Non-color data, just store buffer as is. */
     }
-    else if (IMB_colormanagement_space_is_srgb(ibuf->byte_buffer.colorspace) ||
+    else if (IMB_colormanagement_space_is_scene_linear_srgb(ibuf->byte_buffer.colorspace) ||
              IMB_colormanagement_space_is_scene_linear(ibuf->byte_buffer.colorspace) ||
              IMB_colormanagement_space_is_data(ibuf->byte_buffer.colorspace))
     {
-      /* sRGB or scene linear or scaled down non-color data, store as byte texture that the GPU
-       * can decode directly. */
+      /* scene linear + sRGB transfer function or scene linear or scaled down non-color data,
+       * store as byte texture that the GPU can decode directly. */
       rect = MEM_new_array_uninitialized<uchar>(4 * size_t(w) * size_t(h), __func__);
       if (rect == nullptr) {
         return;
@@ -870,19 +886,15 @@ static void gpu_texture_update_from_ibuf(
   }
 
   /* Free buffers if needed. */
-  if (rect && rect != ibuf->byte_buffer.data) {
+  if (rect && rect != ibuf->byte_data()) {
     MEM_delete(rect);
   }
-  if (rect_float && rect_float != ibuf->float_buffer.data) {
+  if (rect_float && rect_float != ibuf->float_data()) {
     MEM_delete(rect_float);
   }
 
-  if (GPU_mipmap_enabled()) {
-    GPU_texture_update_mipmap_chain(tex);
-  }
-  else {
-    ima->runtime->gpuflag &= ~IMA_GPU_MIPMAP_COMPLETE;
-  }
+  GPU_texture_update_mipmap_chain(tex);
+  ima->runtime->gpuflag |= IMA_GPU_MIPMAP_COMPLETE;
 
   GPU_texture_unbind(tex);
 }
@@ -931,7 +943,7 @@ void BKE_image_update_gputexture_delayed(
 void BKE_image_paint_set_mipmap(Main *bmain, bool mipmap)
 {
   for (Image &ima : bmain->images) {
-    if (BKE_image_has_opengl_texture(&ima)) {
+    if (BKE_image_has_gpu_texture(&ima)) {
       if (ima.runtime->gpuflag & IMA_GPU_MIPMAP_COMPLETE) {
         for (int a = 0; a < TEXTARGET_COUNT; a++) {
           if (ELEM(a, TEXTARGET_2D, TEXTARGET_2D_ARRAY)) {

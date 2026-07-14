@@ -90,7 +90,47 @@ void RenderScheduler::set_sample_params(const int num_samples,
 
 int RenderScheduler::get_num_samples() const
 {
+  /* Do continuous rendering for the DLSS viewport stream (carry OFF). With
+   * carry ON the viewport accumulates the buffer like a final render and must
+   * stop at the configured sample count; final renders always terminate. */
+  if (!background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
+      !denoiser_params_.carry_history)
+  {
+    return Integrator::MAX_SAMPLES;
+  }
+
   return num_samples_;
+}
+
+int RenderScheduler::get_dlss_preroll_passes() const
+{
+  /* Every frame but the first inherits a DLSS-RR history that already folded in
+   * the noise of all the frames before it -- each one an independent estimate
+   * of the same scene -- so its noise is averaged away over many frames. The
+   * first frame starts with an empty history and comes out visibly noisier: the
+   * opening of a sequence appears to "resolve" over its first frames.
+   *
+   * Extra samples do not fix this (measured: 4x and 8x the samples leave the
+   * frame just as noisy). What the history needs is not a cleaner estimate but
+   * several *independent* ones, which is exactly what the following frames feed
+   * it. So render the first frame several times over with different sample
+   * seeds, denoising each pass into the same history, and keep the last pass as
+   * the frame. Only for animations: a still render must honour its sample
+   * count. FALCON_DLSS_PREROLL sets the number of extra passes (0 disables). */
+  if (!background_ || !is_animation_ || !dlss_history_cold_ || !denoiser_params_.use ||
+      denoiser_params_.type != DENOISER_DLSS || !denoiser_params_.carry_history)
+  {
+    return 0;
+  }
+
+  static const int preroll = getenv("FALCON_DLSS_PREROLL") ? atoi(getenv("FALCON_DLSS_PREROLL")) :
+                                                             4;
+  return max(preroll, 0);
+}
+
+void RenderScheduler::set_is_animation(bool is_animation)
+{
+  is_animation_ = is_animation;
 }
 
 int RenderScheduler::get_sample_offset() const
@@ -122,6 +162,18 @@ int RenderScheduler::get_num_rendered_samples() const
 
 void RenderScheduler::reset(const BufferParams &buffer_params)
 {
+  /* A frame was rendered, so the DLSS-RR history it left behind carries into
+   * the next one and the pre-roll is no longer needed. */
+  if (background_ && state_.num_rendered_samples > 0) {
+    dlss_history_cold_ = false;
+  }
+
+  /* The denoiser parameters are synced after this reset, so the pass count can
+   * only be decided once the first work is scheduled. */
+  preroll_passes_left_ = -1;
+  preroll_sample_base_ = 0;
+  preroll_same_frame_restart_ = false;
+
   buffer_params_ = buffer_params;
 
   update_start_resolution_divider();
@@ -131,12 +183,23 @@ void RenderScheduler::reset(const BufferParams &buffer_params)
   if (background_ || start_resolution_divider_ == 0) {
     state_.resolution_divider = 1;
   }
+  else if (denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
+           denoiser_params_.carry_history)
+  {
+    /* Carrying the DLSS-RR history across navigation needs a constant render
+     * size: a resolution change recreates the DLSS feature and drops the
+     * history. Skip the low-resolution navigation staircase; the DLSS upscale
+     * factor already keeps the per-update cost down. */
+    state_.resolution_divider = pixel_size_;
+  }
   else {
     state_.user_is_navigating = true;
     state_.resolution_divider = start_resolution_divider_;
   }
 
   state_.num_rendered_samples = 0;
+  state_.num_dlss_stream_samples = 0;
+  state_.last_dlss_denoise_samples = 0;
   state_.last_display_update_time = 0.0;
   state_.last_display_update_sample = -1;
 
@@ -288,7 +351,34 @@ bool RenderScheduler::done() const
     return true;
   }
 
-  return get_num_rendered_samples() >= num_samples_;
+  /* The continuous DLSS viewport stream (carry OFF) rewinds the per-work
+   * sample counter, so judge completion by the total streamed samples instead.
+   * This makes the viewport Max Samples setting effective for DLSS (rendering
+   * stops instead of accumulating forever; navigation resets and restarts the
+   * stream). With carry ON the viewport accumulates the buffer normally, so
+   * the default check below already honors the sample limit. */
+  if ((!background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
+       !denoiser_params_.carry_history) ||
+      use_dlss_stream_final())
+  {
+    return state_.num_dlss_stream_samples >= num_samples_;
+  }
+
+  return get_num_rendered_samples() >= get_num_samples();
+}
+
+/* DLSS-RR is built to read a stream of 1-sample jittered frames and rebuild the
+ * image out of them -- that is what NVIDIA's own viewport integration feeds it,
+ * and why the viewport has no sample slider. The final render instead hands it
+ * an accumulated 32-sample buffer, which is not the input it was trained on.
+ * FALCON_DLSS_STREAM_FINAL=1 renders the final frame the way the viewport does:
+ * one fresh sample per RR evaluation, each at a new sub-pixel jitter, letting
+ * RR's own history do the accumulating. */
+bool RenderScheduler::use_dlss_stream_final() const
+{
+  static const bool enabled = getenv("FALCON_DLSS_STREAM_FINAL") != nullptr;
+  return enabled && background_ && denoiser_params_.use &&
+         denoiser_params_.type == DENOISER_DLSS;
 }
 
 RenderWork RenderScheduler::get_render_work()
@@ -297,9 +387,45 @@ RenderWork RenderScheduler::get_render_work()
 
   const double time_now = time_dt();
 
+  if (preroll_passes_left_ < 0) {
+    preroll_passes_left_ = get_dlss_preroll_passes();
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr,
+              "[preroll] bg=%d anim=%d cold=%d use=%d type=%d carry=%d -> passes=%d\n",
+              int(background_),
+              int(is_animation_),
+              int(dlss_history_cold_),
+              int(denoiser_params_.use),
+              int(denoiser_params_.type),
+              int(denoiser_params_.carry_history),
+              preroll_passes_left_);
+    }
+  }
+
+  /* A DLSS-RR pre-roll pass finished: render the same frame once more from a
+   * fresh part of the sample sequence, so RR folds an independent estimate into
+   * the history it hands to the frame that is kept. */
+  if (preroll_passes_left_ > 0 && state_.num_rendered_samples >= num_samples_) {
+    preroll_passes_left_--;
+    preroll_sample_base_ += num_samples_;
+    state_.num_rendered_samples = 0;
+    state_.last_dlss_denoise_samples = 0;
+    state_.last_display_update_sample = -1;
+    state_.path_trace_finished = false;
+    preroll_same_frame_restart_ = true;
+
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr, "[preroll] restart, %d passes left\n", preroll_passes_left_);
+    }
+  }
+
   if (done()) {
     RenderWork render_work;
     render_work.resolution_divider = state_.resolution_divider;
+    render_work.denoised_resolution_divider = state_.resolution_divider;
+    if (denoiser_params_.use) {
+      render_work.resolution_divider *= denoiser_params_.upscale_factor;
+    }
 
     if (!set_postprocess_render_work(&render_work)) {
       set_full_frame_render_work(&render_work);
@@ -321,7 +447,7 @@ RenderWork RenderScheduler::get_render_work()
       /* Don't progress the resolution divider as the user is currently navigating in the scene. */
       state_.user_is_navigating = false;
     }
-    else {
+    else if (default_start_resolution_divider_ != 0) {
       /* If the resolution divider is greater than or equal to default_start_resolution_divider_,
        * drop the resolution divider down to 4. This is so users with slow hardware and thus high
        * resolution dividers (E.G. 16), get an update to let them know something is happening
@@ -337,12 +463,36 @@ RenderWork RenderScheduler::get_render_work()
   }
 
   render_work.resolution_divider = state_.resolution_divider;
+  render_work.denoised_resolution_divider = state_.resolution_divider;
+  if (denoiser_params_.use) {
+    render_work.resolution_divider *= denoiser_params_.upscale_factor;
+
+    /* Viewport stream mode (carry OFF): continuous DLSS rendering restarts the
+     * sample counter so every update is a fresh sample converged by the RR
+     * history alone. Keep the running total so done() can honor the viewport
+     * sample limit. With carry ON the viewport accumulates the buffer like a
+     * final render instead (samples actually add up; DLSS re-denoises the
+     * progressively cleaner buffer), so the counter must keep advancing. */
+    if ((!background_ && denoiser_params_.type == DENOISER_DLSS &&
+         !denoiser_params_.carry_history) ||
+        use_dlss_stream_final())
+    {
+      state_.num_dlss_stream_samples += state_.num_rendered_samples;
+      state_.num_rendered_samples = 0;
+    }
+  }
 
   render_work.path_trace.start_sample = get_start_sample_to_path_trace();
   render_work.path_trace.num_samples = get_num_samples_to_path_trace();
   render_work.path_trace.sample_offset = get_sample_offset();
 
-  render_work.init_render_buffers = (render_work.path_trace.start_sample == get_sample_offset());
+  /* Each pre-roll pass starts from an empty buffer: it is a fresh render of the
+   * frame, not a continuation of the previous pass. */
+  render_work.init_render_buffers = (render_work.path_trace.start_sample ==
+                                     get_sample_offset() + preroll_sample_base_);
+  render_work.denoise_same_frame_restart = preroll_same_frame_restart_ ||
+                                           (use_dlss_stream_final() &&
+                                            state_.num_dlss_stream_samples > 0);
 
   /* NOTE: Rebalance scheduler requires current number of samples to not be advanced forward. */
   render_work.rebalance = work_need_rebalance();
@@ -658,11 +808,23 @@ string RenderScheduler::full_report() const
     result += "  Start Sample: " + to_string(denoiser_params_.start_sample) + "\n";
 
     string passes = "Color";
-    if (denoiser_params_.use_pass_albedo) {
+    if (denoiser_params_.passes & DENOISER_PASS_ALBEDO) {
       passes += ", Albedo";
     }
-    if (denoiser_params_.use_pass_normal) {
+    if (denoiser_params_.passes & DENOISER_PASS_SPECULAR_ALBEDO) {
+      passes += ", Specular Albedo";
+    }
+    if (denoiser_params_.passes & DENOISER_PASS_NORMAL) {
       passes += ", Normal";
+    }
+    if (denoiser_params_.passes & DENOISER_PASS_ROUGHNESS) {
+      passes += ", Roughness";
+    }
+    if (denoiser_params_.passes & DENOISER_PASS_DEPTH) {
+      passes += ", Depth";
+    }
+    if (denoiser_params_.passes & DENOISER_PASS_MOTION) {
+      passes += ", Motion";
     }
 
     result += "  Passes: " + passes + "\n";
@@ -812,7 +974,10 @@ int RenderScheduler::calculate_num_samples_per_update() const
 
 int RenderScheduler::get_start_sample_to_path_trace() const
 {
-  return sample_offset_ + state_.num_rendered_samples;
+  /* Each pre-roll pass renders the same frame again from a different part of the
+   * sample sequence, so that RR gets an independent estimate to fold into its
+   * history rather than the same one over again. */
+  return sample_offset_ + preroll_sample_base_ + state_.num_rendered_samples;
 }
 
 /* Round number of samples to the closest power of two.
@@ -851,7 +1016,7 @@ int RenderScheduler::get_num_samples_to_path_trace() const
   /* Always start full resolution render  with a single sample. Gives more instant feedback to
    * artists, and allows to gather information for a subsequent path tracing works. Do it in the
    * headless mode as well, to give some estimate of how long samples are taking. */
-  if (state_.num_rendered_samples == 0) {
+  if (state_.num_rendered_samples == 0 && state_.last_display_update_sample == -1) {
     return 1;
   }
 
@@ -866,7 +1031,8 @@ int RenderScheduler::get_num_samples_to_path_trace() const
    * more than N samples. */
   const int num_samples_pot = round_num_samples_to_power_of_2(num_samples_per_update);
 
-  const int max_num_samples_to_render = sample_offset_ + num_samples_ - path_trace_start_sample;
+  const int max_num_samples_to_render = sample_offset_ + preroll_sample_base_ + get_num_samples() -
+                                        path_trace_start_sample;
 
   int num_samples_to_render = min(num_samples_pot, max_num_samples_to_render);
 
@@ -938,7 +1104,29 @@ int RenderScheduler::get_num_samples_to_path_trace() const
                                 min(num_samples_to_occupy, max_num_samples_to_render));
   }
 
-  if (limit_samples_per_update_) {
+  /* DLSS-RR in the final render: keep update batches small so the temporal
+   * history accumulates over several denoise rounds within the frame. The
+   * batch grows with the rendered sample count (updates at samples 1, 2, 4,
+   * 8, ...), keeping the denoise overhead logarithmic in the sample count.
+   * FALCON_DLSS_FINAL_DENOISE_ONLY=1 disables the intra-frame rounds (one
+   * denoise at the final sample; inter-frame carry provides the history) for
+   * A/B-ing whether the same-frame re-denoises bake residual noise into the
+   * history as static detail. */
+  if (use_dlss_stream_final()) {
+    return 1;
+  }
+
+  static const bool final_denoise_only = getenv("FALCON_DLSS_FINAL_DENOISE_ONLY") != nullptr;
+  if (background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
+      !final_denoise_only)
+  {
+    const int growing_batch = max(1, state_.num_rendered_samples);
+    num_samples_to_render = min(num_samples_to_render, growing_batch);
+  }
+
+  if (limit_samples_per_update_ &&
+      !(!background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS))
+  {
     num_samples_to_render = min(limit_samples_per_update_, num_samples_to_render);
   }
 
@@ -1016,6 +1204,32 @@ bool RenderScheduler::work_need_denoise(bool &delayed, bool &ready_to_display)
   }
 
   if (background_) {
+    /* DLSS-RR is temporal: re-denoise while the frame is still sampling so the
+     * history accumulates within the frame (the final-sample denoise is handled
+     * by done() above), but skip the earliest rounds. Below ~8 samples the
+     * buffer is still close to raw, and RR bakes that noise into its history as
+     * static surface detail -- the grain that showed up on desks and walls.
+     * Skipping the rounds entirely is not the answer either: the result then
+     * leans on the warped previous frame alone and smears at texture/geometry
+     * boundaries and under changing light. classroom 30f/32spp vs a 1024spp
+     * reference: every-round 27.83 dB / flicker 3.83, from-8-spp 28.37 / 3.84,
+     * final-only 28.81 / 4.07.
+     * FALCON_DLSS_DENOISE_MIN_SPP overrides the threshold (1 = every round);
+     * FALCON_DLSS_FINAL_DENOISE_ONLY=1 skips the intra-frame rounds entirely. */
+    if (denoiser_params_.type == DENOISER_DLSS) {
+      if (use_dlss_stream_final()) {
+        return true;
+      }
+      static const bool final_denoise_only = getenv("FALCON_DLSS_FINAL_DENOISE_ONLY") != nullptr;
+      if (final_denoise_only) {
+        return false;
+      }
+      static const int min_spp = getenv("FALCON_DLSS_DENOISE_MIN_SPP") ?
+                                     atoi(getenv("FALCON_DLSS_DENOISE_MIN_SPP")) :
+                                     8;
+      return state_.num_rendered_samples >= min_spp;
+    }
+
     /* Background render, only denoise when rendering the last sample. */
     /* TODO(sergey): Follow similar logic to viewport, giving an overview of how final denoised
      * image looks like even for the background rendering. */
@@ -1023,6 +1237,27 @@ bool RenderScheduler::work_need_denoise(bool &delayed, bool &ready_to_display)
   }
 
   /* Viewport render. */
+
+  if (denoiser_params_.type == DENOISER_DLSS) {
+    if (denoiser_params_.carry_history) {
+      /* Accumulating viewport (carry ON): re-denoising after every sample
+       * feeds RR a nearly identical noise pattern, which its temporal model
+       * locks onto as if it were static scene detail (grain gets rendered as
+       * texture). Re-denoise only when the buffer changed substantially --
+       * the sample count doubled, mirroring the final-render progressive
+       * cadence -- and hold the previous denoised result in between. */
+      const int last = state_.last_dlss_denoise_samples;
+      if (last == 0 || state_.num_rendered_samples <= last ||
+          state_.num_rendered_samples >= 2 * last)
+      {
+        state_.last_dlss_denoise_samples = state_.num_rendered_samples;
+        return true;
+      }
+      delayed = true;
+      return false;
+    }
+    return true;
+  }
 
   /* Navigation might render multiple samples at a lower resolution. Those are not to be counted as
    * final samples. */

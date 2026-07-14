@@ -50,12 +50,6 @@ class ColorSpaceManager {
                               bool compress_as_srgb,
                               bool ignore_alpha);
 
-  /* Efficiently convert pixels to scene linear colorspace at render time,
-   * for OSL where the image texture cache contains original pixels. The
-   * handle is valid for the lifetime of the application. */
-  static ColorSpaceProcessor *get_processor(ustring colorspace);
-  static void to_scene_linear(ColorSpaceProcessor *processor, float *pixel, const int channels);
-
   /* Clear memory when the application exits. Invalidates all processors. */
   static void free_memory();
 
@@ -71,11 +65,12 @@ class ColorSpaceManager {
   static Transform get_xyz_to_rec2020();
   static Transform get_xyz_to_acescg();
   /* Compute unique string for texture cache hashing and metadata. */
-  static const string &get_xyz_to_scene_linear_rgb_string();
+  static string get_xyz_to_scene_linear_rgb_string();
   /* Determine if scene linear is a common known space. */
   static const char *get_scene_linear_interop_id(const bool srgb_encoded = false);
 
  private:
+  static ColorSpaceProcessor *get_processor(ustring colorspace);
   static void is_builtin_colorspace(ustring colorspace,
                                     bool &is_scene_linear,
                                     bool &is_scene_linear_srgb);

@@ -3,20 +3,29 @@
  * SPDX-License-Identifier: Apache-2.0 */
 
 #include "util/system.h"
+#include "util/log.h"
 #include "util/string.h"
 
+#include <algorithm>
+#include <cstring>
+
 #ifdef _WIN32
+#  include <cstdio>
 #  if (!defined(FREE_WINDOWS))
 #    include <intrin.h>
 #  endif
 #  include "util/windows.h"
 #elif defined(__APPLE__)
+#  include <cstdint>
 #  include <sys/ioctl.h>
+#  include <sys/resource.h>
 #  include <sys/sysctl.h>
 #  include <sys/types.h>
 #  include <unistd.h>
 #else
+#  include <cstdint>
 #  include <sys/ioctl.h>
+#  include <sys/resource.h>
 #  include <unistd.h>
 #endif
 
@@ -262,6 +271,41 @@ uint64_t system_self_process_id()
 #else
   return getpid();
 #endif
+}
+
+size_t system_max_open_files()
+{
+#if defined(_WIN32)
+  return _getmaxstdio();
+#else
+  struct rlimit limit = {};
+  return (getrlimit(RLIMIT_NOFILE, &limit) == 0) ? limit.rlim_cur : SIZE_MAX;
+#endif
+}
+
+void system_max_open_files_ensure()
+{
+  /* The Windows maximum is 8192 open files. */
+  constexpr int max_open_files = 8192;
+  bool ok = true;
+
+#if defined(_WIN32)
+  if (_getmaxstdio() < max_open_files) {
+    ok = _setmaxstdio(max_open_files) == max_open_files;
+  }
+#else
+  struct rlimit limit = {};
+  ok = getrlimit(RLIMIT_NOFILE, &limit) == 0;
+  if (ok && limit.rlim_cur < rlim_t(max_open_files)) {
+    limit.rlim_cur = std::min(rlim_t(max_open_files), limit.rlim_max);
+    ok = setrlimit(RLIMIT_NOFILE, &limit) == 0;
+  }
+#endif
+
+  if (!ok) {
+    LOG_DEBUG << "Failed to ensure max open files is at least " << max_open_files << ": "
+              << strerror(errno);
+  }
 }
 
 CCL_NAMESPACE_END
