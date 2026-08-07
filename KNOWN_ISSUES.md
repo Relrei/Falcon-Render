@@ -9,47 +9,69 @@
   指定しても、実際に消費されるサンプル数が指定値を大幅に超過する。`preview_samples` と
   `samples` を揃えても再現し、他のパラメータの組み合わせを変えても消費量の倍率傾向は改善しない
 - **報告日**: 2026-08-07
-- **状態**: 原因特定済み(ソースコード調査ベース、実機再検証は未実施)
+- **状態**: 有力な原因仮説あり(ソースコード調査ベース)。実機再検証は未実施
+- **重要な再現条件(2026-08-07 追加報告)**: **静止画では発生しない。連番(アニメーション)
+  レンダーに切り替えた途端に確実に発生する。** ビューポートの「ナビ履歴持ち越し」を
+  ON/OFFして事前に試した際は改善しなかった(ただしこれは後述の通り別プロパティの可能性が高い)
 
-### 原因(ソース: `intern/cycles/integrator/render_scheduler.cpp`)
+### 最有力仮説: 連番レンダーで毎フレーム発生する原因(ソース: `intern/cycles/blender/session.cpp`)
 
-症状は2つの別々の仕組みが重なって出ている。
-
-**1. ビューポート(RENDERED表示)でのオーバーシュート — 主因**
-
-`RenderScheduler::get_num_samples()` に以下の分岐がある。
+`BlenderSession::bake` 相当のフレーム同期処理に以下がある。
 
 ```cpp
-if (!background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
-    !denoiser_params_.carry_history)
+if ((this->b_render->mode & blender::R_PERSISTENT_DATA) == 0)
 {
-  return Integrator::MAX_SAMPLES;
+  if (!is_new_session) {
+    free_session();
+    create_session();
+  }
+  return;
 }
 ```
 
-`preview_denoising_carry_history`(UI表記「ナビ履歴持ち越し」、`properties.py`で
-`default=False`)がデフォルトOFFのため、ビューポートでDLSSを使うと**指定サンプル数
-そのものが内部的に無視され、実質無制限(`MAX_SAMPLES`)になる**。停止判定は代わりに
-別カウンタ `num_dlss_stream_samples`(連続DLSSストリーム用、バッチ単位でしか更新
-されない)に委ねられるため、指定値ちょうどで止まらず必ずオーバーシュートする。
-どのサンプル数設定に変えても再現していたのは、設定値自体が参照されていなかったため。
+**「Persistent Data」(レンダープロパティ→パフォーマンス、Blenderのデフォルトは OFF)が
+OFFの場合、アニメーションの各フレームでCycles Sessionが丸ごと破棄・再生成される。**
+`RenderScheduler`はSessionのメンバであり、破棄されればフレームごとに再構築される。
 
-**想定される対処**: ビューポートのDLSSパネルで「ナビ履歴持ち越し」をONにする
-(`carry_history=true`になり、通常の蓄積型の停止判定に切り替わるはず)。未検証。
+`render_scheduler.h` の `dlss_history_cold_`(初回フレーム判定フラグ、初期値`true`)は
+`reset()`内で一度`false`にされる以外に戻す処理が無い。Sessionがフレームごとに
+再構築されると、このフラグも毎回`true`に戻る。
 
-**2. F12アニメーションレンダーでの倍数消費 — 意図された仕様**
+`get_dlss_preroll_passes()` は「アニメーションの最初のフレームだけ、DLSS-RRの時間
+履歴を温めるために同じフレームを5回(既定`FALCON_DLSS_PREROLL=4`+本番1回)レンダー
+する」設計だが、**Persistent DataがOFFだと「最初のフレーム」判定が全フレームで
+成立してしまい、連番の全フレームで5倍のサンプルを消費する。**
 
-`RenderScheduler::get_dlss_preroll_passes()`: 背景レンダーでアニメーションかつ
-最初のフレームの場合、DLSS-RRの時間履歴を温めるため同じフレームを
-(デフォルト`FALCON_DLSS_PREROLL=4`により)4+1=5回分レンダーする。これはバグでは
-なく設計上の機能(コード内コメントに設計意図の説明あり)。ただし進捗表示上は
-「指定サンプル数を大きく超えて回り続ける」ように見える。
+- 静止画(1フレームのみ)で問題が出ない: `is_animation_`がfalseのため
+  `get_dlss_preroll_passes()`が早期リターンで0を返す(そもそも対象外)
+- 連番だと確実に発生する: 上記の通りフレームごとに条件が成立し直すため
+- サンプル数設定を変えても改善しない: 原因がサンプル数と無関係(何倍になるかは
+  `FALCON_DLSS_PREROLL`の値で決まる)なため
+
+**想定される対処(未検証)**: レンダープロパティ → パフォーマンス → **Persistent Data
+をON**にしてから連番レンダーする。Sessionがフレーム間で維持されれば
+`dlss_history_cold_`は2フレーム目以降`false`のままになり、毎フレームの5倍消費が
+止まるはず。
+
+**注意**: 事前に試した「ナビ履歴持ち越し」(`preview_denoising_carry_history`)は
+**ビューポート専用のプロパティ**で、この連番レンダーの問題とは別物
+(こちらは`denoising_carry_history`、UI表記「履歴持ち越し」、デフォルトON)。
+別プロパティを触っていた可能性が高く、Persistent Dataの方はまだ試されていない。
+
+### 別に確認していた仮説(ビューポートRENDERED表示、優先度は連番問題より低い)
+
+`RenderScheduler::get_num_samples()`は、ビューポートでDLSS使用時かつ
+`preview_denoising_carry_history`(デフォルトOFF)の場合、指定サンプル数を無視して
+`Integrator::MAX_SAMPLES`を返す。これは今回の連番レンダー問題とは別の経路。
 
 ### 未実施の切り分け項目
 
-- [ ] 「ナビ履歴持ち越し」ONで実機再検証 — ビューポート側が想定通り直るか確認
-- [ ] `FALCON_DLSS_PREROLL=0` でF12アニメーションレンダーの倍数消費が消えるか確認
-- [ ] adaptive sampling を OFF にした場合の挙動(上記原因と独立した要因が無いかの確認)
+- [ ] **Persistent DataをONにして連番レンダーを実機検証** — 最優先。毎フレームの
+      5倍消費が止まるか確認する
+- [ ] `FALCON_DLSS_PREROLL=0` で連番レンダーの倍数消費が消えるか確認(Persistent Data
+      が効かなかった場合の切り分け)
+- [ ] ビューポートで「ナビ履歴持ち越し」ONの実機再検証(連番問題とは別件として)
+- [ ] adaptive sampling を OFF にした場合の挙動
 - [ ] 他のデノイザー(OIDN 等)との比較
 
 ### 注記
