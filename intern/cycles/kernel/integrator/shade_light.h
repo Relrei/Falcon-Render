@@ -70,8 +70,24 @@ ccl_device_inline ShaderEvalResult integrate_light_forward(
   /* Write to render buffer. */
   guiding_record_surface_emission(kg, state, eval, mis_weight);
   const ccl_global KernelLight *klight = &kernel_data_fetch(lights, isect.prim);
-  film_write_surface_emission(
-      kg, state, eval, mis_weight, render_buffer, object_lightgroup(kg, klight->object_id));
+#ifdef __FALCON_SHARC__
+  /* ★2026-08-25: 光子パス(LT を含む)ではフィルムに書かない。
+   * 光子パスの (x,y) はカメラの画素ではなく「光子の発射番号」なので、ここで書くと
+   * ランプの放射がフレーム全体へ一様にばらまかれる(全画素に同じ下駄が乗る)。
+   * 背景(shade_background.h)と直接光(shade_surface.h)は既に塞いであったが、
+   * **ランプそのものに当たった時だけ塞がれていなかった。**
+   * 発現条件: スポットに半径を与えると、init_from_camera.h の SPOT 分岐が
+   * 球面上の点と円錐方向を独立に取るため、約半数の光子が自分のランプ球の
+   * 内側から出発し、出口でそのランプに当たる(tmin=0・self.light_* も未設定)。
+   * 半径0はデルタ光源で交差対象が無く、ポイント光源は法線まわりのコサイン半球で
+   * 必ず外へ出るので、どちらも症状が出ない。
+   * 焼き(点マップ)はフィルムを捨てるので、同じ当たり方をしても見えない。 */
+  if (!kernel_data.integrator.falcon_photon_pass)
+#endif
+  {
+    film_write_surface_emission(
+        kg, state, eval, mis_weight, render_buffer, object_lightgroup(kg, klight->object_id));
+  }
   return SHADER_EVAL_OK;
 }
 

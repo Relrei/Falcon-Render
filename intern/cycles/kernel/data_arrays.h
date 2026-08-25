@@ -121,5 +121,9 @@ KERNEL_DATA_ARRAY(uint, falcon_photon_index)
  * render_pixel_index; allocated only when FALCON_DAS_MAP is set. */
 KERNEL_DATA_ARRAY(float, falcon_das_scale)
 
+/* Falcon error field: one relative-error scalar per world cell (same hash as
+ * the SHARC grid, its own cell size). Empty cells hold a negative value. */
+KERNEL_DATA_ARRAY(float, falcon_error_field)
+
 #undef KERNEL_DATA_ARRAY
 #undef KERNEL_DATA_ARRAY_WRITABLE

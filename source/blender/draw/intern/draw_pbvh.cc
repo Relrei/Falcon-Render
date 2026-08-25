@@ -9,9 +9,16 @@
  * Embeds GPU meshes inside of bke::pbvh::Tree nodes, used by mesh sculpt mode.
  */
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #include "BLI_map.hh"
 #include "BLI_math_geom.h"
+#include "BLI_time.h"
 #include "BLI_math_vector_types.hh"
+#include "BLI_task.hh"
 #include "BLI_utildefines.h"
 #include "BLI_vector.hh"
 
@@ -125,6 +132,27 @@ class DrawCacheImpl : public DrawCache {
    */
   Map<AttributeRequest, AttributeData> attribute_vbos_;
 
+  /* ★頂点添字の並べ方(`FALCON_DRAW_WELD=1`)で使う分。角ごとの並べ方とは
+   * バッファの中身も長さも別物なので、混ざらないように完全に分けて持つ。
+   * 既定(オフ)ではどれも空のまま。 */
+  Vector<gpu::IndexBufPtr> tris_ibos_welded_;
+  Vector<gpu::IndexBufPtr> lines_ibos_welded_;
+  Map<AttributeRequest, AttributeData> attribute_vbos_welded_;
+  /** どちらの並べ方で作ったバッチかを覚えておく(要求ごと)。 */
+  Map<ViewportRequest, bool> tris_batches_welded_;
+  bool lines_batches_welded_ = false;
+  /**
+   * これまでに要求された属性を全部ためる。**並べ方はこの和で1つに決める。**
+   *
+   * ★要求ごとに決めると、同じ画面の中で並べ方が2通りになり、位置の頂点バッファが
+   * **両方の形で毎ダブ作られる**(実測: 面セットがあると作り直しが7回→13回に倍増した)。
+   * スカルプトのオーバーレイは面セットを別の要求として出してくるので、これは
+   * 珍しい状況ではない。溶接が逆効果になるので、和で決めて1通りに揃える。
+   */
+  Vector<AttributeRequest> attrs_seen_;
+  /** #attrs_seen_ を捨てる目印。PBVH が作り直されたら要求もため直す。 */
+  int attrs_seen_nodes_num_ = -1;
+
   /** Batches for drawing wireframe geometry. */
   Vector<gpu::Batch *> lines_batches_;
   /** Batches for drawing coarse "fast navigate" wireframe geometry. */
@@ -175,20 +203,27 @@ class DrawCacheImpl : public DrawCache {
 
   BitSpan ensure_use_flat_layout(const Object &object, const OrigMeshData &orig_mesh_data);
 
+  bool ensure_welded_layout(const Object &object,
+                            const OrigMeshData &orig_mesh_data,
+                            Span<AttributeRequest> attributes);
+
   Span<gpu::VertBufPtr> ensure_attribute_data(const Object &object,
                                               const OrigMeshData &orig_mesh_data,
                                               const AttributeRequest &attr,
-                                              const IndexMask &node_mask);
+                                              const IndexMask &node_mask,
+                                              bool welded);
 
   Span<gpu::IndexBufPtr> ensure_tri_indices(const Object &object,
                                             const OrigMeshData &orig_mesh_data,
                                             const IndexMask &node_mask,
-                                            bool coarse);
+                                            bool coarse,
+                                            bool welded);
 
   Span<gpu::IndexBufPtr> ensure_lines_indices(const Object &object,
                                               const OrigMeshData &orig_mesh_data,
                                               const IndexMask &node_mask,
-                                              bool coarse);
+                                              bool coarse,
+                                              bool welded);
 };
 
 void DrawCacheImpl::AttributeData::tag_dirty(const IndexMask &node_mask)
@@ -199,11 +234,13 @@ void DrawCacheImpl::AttributeData::tag_dirty(const IndexMask &node_mask)
 
 void DrawCacheImpl::tag_positions_changed(const IndexMask &node_mask)
 {
-  if (DrawCacheImpl::AttributeData *data = attribute_vbos_.lookup_ptr(CustomRequest::Position)) {
-    data->tag_dirty(node_mask);
-  }
-  if (DrawCacheImpl::AttributeData *data = attribute_vbos_.lookup_ptr(CustomRequest::Normal)) {
-    data->tag_dirty(node_mask);
+  for (Map<AttributeRequest, AttributeData> *map : {&attribute_vbos_, &attribute_vbos_welded_}) {
+    if (DrawCacheImpl::AttributeData *data = map->lookup_ptr(CustomRequest::Position)) {
+      data->tag_dirty(node_mask);
+    }
+    if (DrawCacheImpl::AttributeData *data = map->lookup_ptr(CustomRequest::Normal)) {
+      data->tag_dirty(node_mask);
+    }
   }
 }
 
@@ -222,24 +259,30 @@ void DrawCacheImpl::tag_topology_changed(const IndexMask &node_mask)
 
 void DrawCacheImpl::tag_face_sets_changed(const IndexMask &node_mask)
 {
-  if (DrawCacheImpl::AttributeData *data = attribute_vbos_.lookup_ptr(CustomRequest::FaceSet)) {
-    data->tag_dirty(node_mask);
+  for (Map<AttributeRequest, AttributeData> *map : {&attribute_vbos_, &attribute_vbos_welded_}) {
+    if (DrawCacheImpl::AttributeData *data = map->lookup_ptr(CustomRequest::FaceSet)) {
+      data->tag_dirty(node_mask);
+    }
   }
 }
 
 void DrawCacheImpl::tag_masks_changed(const IndexMask &node_mask)
 {
-  if (DrawCacheImpl::AttributeData *data = attribute_vbos_.lookup_ptr(CustomRequest::Mask)) {
-    data->tag_dirty(node_mask);
+  for (Map<AttributeRequest, AttributeData> *map : {&attribute_vbos_, &attribute_vbos_welded_}) {
+    if (DrawCacheImpl::AttributeData *data = map->lookup_ptr(CustomRequest::Mask)) {
+      data->tag_dirty(node_mask);
+    }
   }
 }
 
 void DrawCacheImpl::tag_attribute_changed(const IndexMask &node_mask, StringRef attribute_name)
 {
-  for (const auto &[data_request, data] : attribute_vbos_.items()) {
-    if (const GenericRequest *request = std::get_if<GenericRequest>(&data_request)) {
-      if (*request == attribute_name) {
-        data.tag_dirty(node_mask);
+  for (Map<AttributeRequest, AttributeData> *map : {&attribute_vbos_, &attribute_vbos_welded_}) {
+    for (const auto &[data_request, data] : map->items()) {
+      if (const GenericRequest *request = std::get_if<GenericRequest>(&data_request)) {
+        if (*request == attribute_name) {
+          data.tag_dirty(node_mask);
+        }
       }
     }
   }
@@ -351,6 +394,29 @@ void extract_data_vert_mesh(const OffsetIndices<int> faces,
       *data = Converter::convert(attribute[vert]);
       data++;
     }
+  }
+}
+
+/* ★頂点添字の並べ方(`FALCON_DRAW_WELD=1` の時だけ)。
+ *
+ * 上の #extract_data_vert_mesh は面の**角ごと**に値を展開する。実データでは
+ * 角は頂点の 4.00倍 あるので、彫るたびに 4倍の量を作って GPU へ送っている。
+ * こちらはノードが持つ頂点の並び(#MeshNode::all_verts)にそのまま入れる。
+ * 三角形は添字バッファ側で頂点を指す。
+ *
+ * Blender 自身が #calc_use_flat_layout の Mesh の枝に
+ * 「面の角の属性・シャープな面・面セットが無ければ理論上は頂点添字のバッファを
+ * 使える」と書いている。できないのではなく、やっていないだけ。 */
+template<typename T>
+void extract_data_vert_mesh_welded(const Span<T> attribute,
+                                   const Span<int> verts,
+                                   gpu::VertBuf &vbo)
+{
+  using Converter = AttributeConverter<T>;
+  using VBOType = typename Converter::VBOType;
+  MutableSpan<VBOType> data = vbo.data<VBOType>();
+  for (const int i : verts.index_range()) {
+    data[i] = Converter::convert(attribute[verts[i]]);
   }
 }
 
@@ -497,6 +563,8 @@ void DrawCacheImpl::free_nodes_with_changed_topology(const bke::pbvh::Tree &pbvh
   free_ibos(lines_ibos_coarse_, nodes_to_free);
   free_ibos(tris_ibos_, nodes_to_free);
   free_ibos(tris_ibos_coarse_, nodes_to_free);
+  free_ibos(lines_ibos_welded_, nodes_to_free);
+  free_ibos(tris_ibos_welded_, nodes_to_free);
   if (pbvh.type() == bke::pbvh::Type::BMesh) {
     /* For BMesh, VBOs are only filled with data for visible triangles, and topology can also
      * completely change due to dynamic topology, so VBOs must be rebuilt from scratch. For other
@@ -527,6 +595,25 @@ BLI_NOINLINE static void ensure_vbos_allocated_mesh(const Object &object,
           vbos[i] = gpu::VertBufPtr(GPU_vertbuf_create_with_format(format));
         }
         GPU_vertbuf_data_alloc(*vbos[i], nodes[i].corners_num());
+      },
+      exec_mode::grain_size(64));
+}
+
+/* 頂点添字の並べ方での大きさ = ノードが使う頂点の数(角ではない)。 */
+BLI_NOINLINE static void ensure_vbos_allocated_mesh_welded(
+    const Object &object,
+    const GPUVertFormat &format,
+    const IndexMask &node_mask,
+    const MutableSpan<gpu::VertBufPtr> vbos)
+{
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const Span<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
+  node_mask.foreach_index(
+      [&](const int i) {
+        if (!vbos[i]) {
+          vbos[i] = gpu::VertBufPtr(GPU_vertbuf_create_with_format(format));
+        }
+        GPU_vertbuf_data_alloc(*vbos[i], nodes[i].all_verts().size());
       },
       exec_mode::grain_size(64));
 }
@@ -573,8 +660,79 @@ BLI_NOINLINE static void ensure_vbos_allocated_bmesh(const Object &object,
       exec_mode::grain_size(64));
 }
 
+/* ★描画側で位置を作り直す費用を測る(`FALCON_SCULPT_TIMING=1` の時だけ)。
+ *
+ * 2026-08-17: ここまでの計測は**ストロークの計算だけ**で、描画側を含んでいなかった
+ * (EXEC 経路ではダブの間に描画が走らないため)。実際に手で彫る時は毎ダブ通る。
+ *
+ * しかもここは**面の角ごとに位置を展開する**(頂点の共有をやめている。法線が
+ * 角ごとに来るため)。四角面なら1面4個、三角なら3個書くので、頂点数の数倍になる。
+ * falcon-live 側が同じ形の無駄を頂点の溶接で潰して 5.2倍にした、という共有を受けて
+ * こちら側の実際の量を数えることにした。**「6倍くらいのはず」で進めない。** */
+namespace falcon_draw_timing {
+static std::atomic<int64_t> g_ns{0}, g_corners{0}, g_verts{0}, g_written{0}, g_calls{0};
+
+static bool enabled()
+{
+  static const bool on = (getenv("FALCON_SCULPT_TIMING") != nullptr);
+  return on;
+}
+
+static void report()
+{
+  const int64_t calls = g_calls.exchange(0, std::memory_order_relaxed);
+  if (calls == 0) {
+    return;
+  }
+  const int64_t ns = g_ns.exchange(0, std::memory_order_relaxed);
+  const int64_t corners = g_corners.exchange(0, std::memory_order_relaxed);
+  const int64_t verts = g_verts.exchange(0, std::memory_order_relaxed);
+  const int64_t written = g_written.exchange(0, std::memory_order_relaxed);
+  /* 「書いた数」= 実際に頂点バッファへ入れた要素の数。角ごとの並べ方なら角の数、
+   * 頂点添字の並べ方ならノードが使う頂点の数。ここが減れば作る量も送る量も減る。 */
+  printf(
+      "FALCON_DRAW 位置の作り直し %.2fms/回  書いた数%ld  "
+      "(角%ld / 頂点%ld = %.2f倍)  %.1fMB/回  [%ld回]\n",
+      double(ns) / 1.0e6 / double(calls),
+      long(written / calls),
+      long(corners / calls),
+      long(verts / calls),
+      verts > 0 ? double(corners) / double(verts) : 0.0,
+      double(written / calls) * 12.0 / 1024.0 / 1024.0,
+      long(calls));
+  fflush(stdout);
+}
+}  // namespace falcon_draw_timing
+
+void falcon_draw_report_positions()
+{
+  falcon_draw_timing::report();
+}
+
+/* ★頂点添字の並べ方を使うかどうか。既定はオン(2026-08-25 に反転)。
+ *
+ * これまでは角ごとに位置を展開して GPU の頂点バッファへ入れ直していた。角は実測で
+ * 頂点の 4.00 倍あるので、その分だけ作り直しと転送を余計に払っていた。実測(400万面):
+ * 位置の作り直し 6.90 -> 1.59ms / 転送量 1/3.80 / 描画は 200万面で 51.2 -> 42.6ms。
+ * 条件別 11 件すべて対照の中に収まっている。
+ *
+ * 戻す口は FALCON_DRAW_WELD=0 だけ。空文字は「未設定」と同じ扱い(=オン)にしてある:
+ * getenv は `FALCON_DRAW_WELD=` の空文字でも非 nullptr を返すので、
+ * `value != nullptr` だけで判定すると外したつもりが外れない。 */
+namespace falcon_weld {
+static bool enabled()
+{
+  static const bool on = []() {
+    const char *value = getenv("FALCON_DRAW_WELD");
+    return !(value != nullptr && value[0] == '0');
+  }();
+  return on;
+}
+}  // namespace falcon_weld
+
 static void update_positions_mesh(const Object &object,
                                   const IndexMask &node_mask,
+                                  const bool welded,
                                   MutableSpan<gpu::VertBufPtr> vbos)
 {
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -583,17 +741,53 @@ static void update_positions_mesh(const Object &object,
   const OffsetIndices<int> faces = mesh.faces();
   const Span<int> corner_verts = mesh.corner_verts();
   const Span<float3> vert_positions = bke::pbvh::vert_positions_eval_from_eval(object);
-  ensure_vbos_allocated_mesh(object, position_format(), node_mask, vbos);
+  if (welded) {
+    ensure_vbos_allocated_mesh_welded(object, position_format(), node_mask, vbos);
+  }
+  else {
+    ensure_vbos_allocated_mesh(object, position_format(), node_mask, vbos);
+  }
+  const bool prf = falcon_draw_timing::enabled();
+  const double t0 = prf ? BLI_time_now_seconds() : 0.0;
   node_mask.foreach_index(
       [&](const int i) {
-        extract_data_vert_mesh<float3>(
-            faces, corner_verts, vert_positions, nodes[i].faces(), *vbos[i]);
+        if (welded) {
+          extract_data_vert_mesh_welded<float3>(vert_positions, nodes[i].all_verts(), *vbos[i]);
+        }
+        else {
+          extract_data_vert_mesh<float3>(
+              faces, corner_verts, vert_positions, nodes[i].faces(), *vbos[i]);
+        }
       },
       exec_mode::grain_size(1));
+  if (prf) {
+    falcon_draw_timing::g_ns.fetch_add(int64_t((BLI_time_now_seconds() - t0) * 1.0e9),
+                                       std::memory_order_relaxed);
+    int64_t corners = 0;
+    int64_t verts = 0;
+    int64_t written = 0;
+    node_mask.foreach_index([&](const int i) {
+      for (const int face : nodes[i].faces()) {
+        corners += faces[face].size();
+      }
+      verts += nodes[i].verts().size();
+      written += welded ? nodes[i].all_verts().size() : nodes[i].corners_num();
+    });
+    falcon_draw_timing::g_corners.fetch_add(corners, std::memory_order_relaxed);
+    falcon_draw_timing::g_verts.fetch_add(verts, std::memory_order_relaxed);
+    falcon_draw_timing::g_written.fetch_add(written, std::memory_order_relaxed);
+    falcon_draw_timing::g_calls.fetch_add(1, std::memory_order_relaxed);
+    /* 10回ごとに出す。ストロークの終わりを跨いで呼ぶ配線を足すより、
+     * ここで完結させるほうが触る面が小さい。 */
+    if (falcon_draw_timing::g_calls.load(std::memory_order_relaxed) >= 1) {
+      falcon_draw_timing::report();
+    }
+  }
 }
 
 static void update_normals_mesh(const Object &object,
                                 const IndexMask &node_mask,
+                                const bool welded,
                                 MutableSpan<gpu::VertBufPtr> vbos)
 {
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -605,6 +799,21 @@ static void update_normals_mesh(const Object &object,
   const Span<float3> face_normals = bke::pbvh::face_normals_eval_from_eval(object);
   const bke::AttributeAccessor attributes = mesh.attributes();
   const VArraySpan sharp_faces = *attributes.lookup<bool>("sharp_face", bke::AttrDomain::Face);
+  if (welded) {
+    /* 頂点添字の並べ方はシャープな面が無い時だけ選ばれる(#mesh_can_use_welded)。
+     * 面ごとの法線は入り得ないので、頂点法線をそのまま並べる。 */
+    ensure_vbos_allocated_mesh_welded(object, normal_format(), node_mask, vbos);
+    node_mask.foreach_index(
+        [&](const int i) {
+          MutableSpan<short4> data = vbos[i]->data<short4>();
+          const Span<int> verts = nodes[i].all_verts();
+          for (const int j : verts.index_range()) {
+            data[j] = normal_float_to_short(vert_normals[verts[j]]);
+          }
+        },
+        exec_mode::grain_size(1));
+    return;
+  }
   ensure_vbos_allocated_mesh(object, normal_format(), node_mask, vbos);
   node_mask.foreach_index(
       [&](const int i) {
@@ -630,6 +839,7 @@ static void update_normals_mesh(const Object &object,
 BLI_NOINLINE static void update_masks_mesh(const Object &object,
                                            const OrigMeshData &orig_mesh_data,
                                            const IndexMask &node_mask,
+                                           const bool welded,
                                            MutableSpan<gpu::VertBufPtr> vbos)
 {
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -639,10 +849,23 @@ BLI_NOINLINE static void update_masks_mesh(const Object &object,
   const Span<int> corner_verts = mesh.corner_verts();
   const VArraySpan mask = *orig_mesh_data.attributes.lookup<float>(".sculpt_mask",
                                                                    bke::AttrDomain::Point);
-  ensure_vbos_allocated_mesh(object, mask_format(), node_mask, vbos);
+  if (welded) {
+    ensure_vbos_allocated_mesh_welded(object, mask_format(), node_mask, vbos);
+  }
+  else {
+    ensure_vbos_allocated_mesh(object, mask_format(), node_mask, vbos);
+  }
   if (!mask.is_empty()) {
     node_mask.foreach_index(
         [&](const int i) {
+          if (welded) {
+            MutableSpan<float> data = vbos[i]->data<float>();
+            const Span<int> verts = nodes[i].all_verts();
+            for (const int j : verts.index_range()) {
+              data[j] = mask[verts[j]];
+            }
+            return;
+          }
           float *data = vbos[i]->data<float>().data();
           for (const int face : nodes[i].faces()) {
             for (const int vert : corner_verts.slice(faces[face])) {
@@ -662,6 +885,7 @@ BLI_NOINLINE static void update_masks_mesh(const Object &object,
 BLI_NOINLINE static void update_face_sets_mesh(const Object &object,
                                                const OrigMeshData &orig_mesh_data,
                                                const IndexMask &node_mask,
+                                               const bool welded,
                                                MutableSpan<gpu::VertBufPtr> vbos)
 {
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -672,6 +896,15 @@ BLI_NOINLINE static void update_face_sets_mesh(const Object &object,
   const int color_seed = orig_mesh_data.face_set_seed;
   const VArraySpan face_sets = *orig_mesh_data.attributes.lookup<int>(".sculpt_face_set",
                                                                       bke::AttrDomain::Face);
+  if (welded) {
+    /* 面セットが無い時は全部白で埋めるだけなので、並べ方を問わず同じ絵になる。
+     * 中身がある面セットは面ドメインなので #mesh_can_use_welded が弾く。 */
+    BLI_assert(face_sets.is_empty());
+    ensure_vbos_allocated_mesh_welded(object, face_set_format(), node_mask, vbos);
+    node_mask.foreach_index([&](const int i) { vbos[i]->data<uchar4>().fill(uchar4(255)); },
+                            exec_mode::grain_size(64));
+    return;
+  }
   ensure_vbos_allocated_mesh(object, face_set_format(), node_mask, vbos);
   if (!face_sets.is_empty()) {
     node_mask.foreach_index(
@@ -706,6 +939,7 @@ BLI_NOINLINE static void update_generic_attribute_mesh(const Object &object,
                                                        const OrigMeshData &orig_mesh_data,
                                                        const IndexMask &node_mask,
                                                        const StringRef name,
+                                                       const bool welded,
                                                        MutableSpan<gpu::VertBufPtr> vbos)
 {
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -719,13 +953,25 @@ BLI_NOINLINE static void update_generic_attribute_mesh(const Object &object,
     return;
   }
   const bke::AttrType data_type = bke::cpp_type_to_attribute_type(attr.varray.type());
-  ensure_vbos_allocated_mesh(
-      object, attribute_format(orig_mesh_data, name, data_type), node_mask, vbos);
+  if (welded) {
+    /* 頂点添字の並べ方は頂点ドメインの属性しか要求されていない時だけ選ばれる。 */
+    BLI_assert(attr.domain == bke::AttrDomain::Point);
+    ensure_vbos_allocated_mesh_welded(
+        object, attribute_format(orig_mesh_data, name, data_type), node_mask, vbos);
+  }
+  else {
+    ensure_vbos_allocated_mesh(
+        object, attribute_format(orig_mesh_data, name, data_type), node_mask, vbos);
+  }
   node_mask.foreach_index(
       [&](const int i) {
         bke::attribute_math::to_static_type(attr.varray.type(), [&]<typename T>() {
           if constexpr (!std::is_void_v<typename AttributeConverter<T>::VBOType>) {
             const VArraySpan<T> src = attr.varray.typed<T>();
+            if (welded) {
+              extract_data_vert_mesh_welded<T>(src, nodes[i].all_verts(), *vbos[i]);
+              return;
+            }
             switch (attr.domain) {
               case bke::AttrDomain::Point:
                 extract_data_vert_mesh<T>(faces, corner_verts, src, nodes[i].faces(), *vbos[i]);
@@ -1458,6 +1704,110 @@ static Array<int> calc_material_indices(const Object &object, const OrigMeshData
   return {};
 }
 
+/* ★このメッシュとこの要求の組み合わせで、頂点添字の並べ方を使えるか。
+ *
+ * Blender の元コメントは「面の角の属性・シャープな面・面セットが無ければ」だが、
+ * それを**メッシュが持っているか**で判定すると、UVMap を持つ普通のメッシュが
+ * 全部弾かれる(実データがまさにそれ)。スカルプト中の描画が実際に要求するのは
+ * 位置・法線・マスクだけなので、**要求された属性のドメイン**で判定する。 */
+static bool mesh_can_use_welded(const Object &object,
+                                const OrigMeshData &orig_mesh_data,
+                                const Span<AttributeRequest> attributes)
+{
+  /* 弾いた理由を1度だけ出す。**「効いているはず」で先へ進まない。**
+   * 実際、最初の実装では要求の中に UVMap が入っていて丸ごと弾かれていた。 */
+  const auto reject = [&](const char *why) {
+    /* ★計時とは別に出す。手で試す時は計時を入れたくない
+     * (毎ダブ全角を数え直すので実測で 6.8ms/ダブ = 16% 乗る)。 */
+    if (!falcon_weld::enabled()) {
+      return false;
+    }
+    static std::atomic<int> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) < 8) {
+      std::string names;
+      for (const AttributeRequest &attr : attributes) {
+        if (const CustomRequest *type = std::get_if<CustomRequest>(&attr)) {
+          const char *labels[] = {"位置", "法線", "マスク", "面セット"};
+          names += labels[int(*type)];
+        }
+        else {
+          names += std::get<GenericRequest>(attr);
+        }
+        names += " ";
+      }
+      printf("FALCON_WELD 見送り: %s  [要求: %s]\n", why, names.c_str());
+      fflush(stdout);
+    }
+    return false;
+  };
+
+  if (!falcon_weld::enabled()) {
+    return false;
+  }
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  if (pbvh.type() != bke::pbvh::Type::Mesh) {
+    return reject("PBVHがメッシュ型でない");
+  }
+  /* シャープな面があると法線が面ごとになり、頂点で共有できない。
+   * #update_normals_mesh は評価後のメッシュから引くので、そちらを見る。
+   *
+   * ★属性が「有るか」ではなく「中身が真の面が1つでも有るか」で見る。
+   * 実データは `sharp_face` を全部 false のまま持っており、有無で判定すると
+   * 一度もシャープにしていないメッシュまで全部弾かれた(実際に弾かれた)。 */
+  const Mesh &mesh = DRW_object_get_data_for_drawing<Mesh>(object);
+  const VArraySpan sharp_faces = *mesh.attributes().lookup<bool>("sharp_face",
+                                                                 bke::AttrDomain::Face);
+  if (!sharp_faces.is_empty()) {
+    const bool any_sharp = threading::parallel_reduce(
+        sharp_faces.index_range(),
+        4096,
+        false,
+        [&](const IndexRange range, const bool init) {
+          if (init) {
+            return true;
+          }
+          return std::any_of(sharp_faces.slice(range).begin(),
+                             sharp_faces.slice(range).end(),
+                             [](const bool value) { return value; });
+        },
+        [](const bool a, const bool b) { return a || b; });
+    if (any_sharp) {
+      return reject("シャープな面がある");
+    }
+  }
+  for (const AttributeRequest &attr : attributes) {
+    if (const CustomRequest *request_type = std::get_if<CustomRequest>(&attr)) {
+      if (*request_type == CustomRequest::FaceSet) {
+        /* 面セットは面ドメイン。ただし属性そのものが無い時は全部白で埋めるだけなので、
+         * 並べ方を問わず同じ絵になる(スカルプトのオーバーレイは面セットが無くても
+         * 要求してくるので、ここを通さないと大半のメッシュで溶接が効かない)。 */
+        if (orig_mesh_data.attributes.contains(".sculpt_face_set")) {
+          return reject("中身のある面セットがある");
+        }
+      }
+      continue;
+    }
+    const bke::GAttributeReader reader = orig_mesh_data.attributes.lookup(
+        std::get<GenericRequest>(attr));
+    if (!reader) {
+      return reject("要求された属性が見つからない");
+    }
+    if (reader.domain != bke::AttrDomain::Point) {
+      return reject("頂点ドメインでない属性が要求されている");
+    }
+  }
+  /* 通った時も1度だけ出す。**見送りだけ出していると「何も出ない = 効いている」
+   * という読み方になり、起動に失敗しても同じ見え方になる。** */
+  {
+    static std::atomic<int> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) == 0) {
+      printf("FALCON_WELD 有効: 頂点添字の並べ方で描いています\n");
+      fflush(stdout);
+    }
+  }
+  return true;
+}
+
 static BitVector<> calc_use_flat_layout(const Object &object, const OrigMeshData &orig_mesh_data)
 {
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -1542,6 +1892,85 @@ static gpu::IndexBufPtr create_tri_index_mesh(const OffsetIndices<int> faces,
   }
 
   return gpu::IndexBufPtr(GPU_indexbuf_build_ex(&builder, 0, node_corner_offset, false));
+}
+
+/* ★頂点添字の並べ方での三角形の添字。角の通し番号でなく、ノード内の頂点番号を指す。
+ * #MeshNode::vert_indices_ は VectorSet なので、全体の頂点番号 → ノード内の番号は
+ * そのまま引ける(自前で対応表を作る必要はない)。 */
+static gpu::IndexBufPtr create_tri_index_mesh_welded(const OffsetIndices<int> faces,
+                                                     const Span<int3> corner_tris,
+                                                     const Span<int> corner_verts,
+                                                     const Span<bool> hide_poly,
+                                                     const bke::pbvh::MeshNode &node)
+{
+  const Span<int> face_indices = node.faces();
+  int tris_num = 0;
+  if (hide_poly.is_empty()) {
+    tris_num = poly_to_tri_count(face_indices.size(), node.corners_num());
+  }
+  else {
+    for (const int face : face_indices) {
+      if (hide_poly[face]) {
+        continue;
+      }
+      tris_num += bke::mesh::face_triangles_num(faces[face].size());
+    }
+  }
+
+  GPUIndexBufBuilder builder;
+  GPU_indexbuf_init(&builder, GPU_PRIM_TRIS, tris_num, INT_MAX);
+  MutableSpan<uint3> data = GPU_indexbuf_get_data(&builder).cast<uint3>();
+
+  int tri_index = 0;
+  for (const int face_index : face_indices) {
+    if (!hide_poly.is_empty() && hide_poly[face_index]) {
+      continue;
+    }
+    for (const int3 &tri : corner_tris.slice(bke::mesh::face_triangles_range(faces, face_index))) {
+      for (const int i : IndexRange(3)) {
+        data[tri_index][i] = uint(node.vert_indices_.index_of(corner_verts[tri[i]]));
+      }
+      tri_index++;
+    }
+  }
+
+  return gpu::IndexBufPtr(GPU_indexbuf_build_ex(&builder, 0, node.all_verts().size(), false));
+}
+
+static gpu::IndexBufPtr create_lines_index_faces_welded(const OffsetIndices<int> faces,
+                                                        const Span<int> corner_verts,
+                                                        const Span<bool> hide_poly,
+                                                        const bke::pbvh::MeshNode &node)
+{
+  const Span<int> face_indices = node.faces();
+  int corners_count = 0;
+  for (const int face : face_indices) {
+    if (!hide_poly.is_empty() && hide_poly[face]) {
+      continue;
+    }
+    corners_count += faces[face].size();
+  }
+
+  GPUIndexBufBuilder builder;
+  GPU_indexbuf_init(&builder, GPU_PRIM_LINES, corners_count, INT_MAX);
+  MutableSpan<uint2> data = GPU_indexbuf_get_data(&builder).cast<uint2>();
+
+  int line_index = 0;
+  for (const int face_index : face_indices) {
+    if (!hide_poly.is_empty() && hide_poly[face_index]) {
+      continue;
+    }
+    const IndexRange face = faces[face_index];
+    const int face_size = face.size();
+    for (const int i : IndexRange(face_size)) {
+      const int next = (i == face_size - 1) ? 0 : i + 1;
+      data[line_index] = uint2(uint(node.vert_indices_.index_of(corner_verts[face[i]])),
+                               uint(node.vert_indices_.index_of(corner_verts[face[next]])));
+      line_index++;
+    }
+  }
+
+  return gpu::IndexBufPtr(GPU_indexbuf_build_ex(&builder, 0, node.all_verts().size(), false));
 }
 
 static gpu::IndexBufPtr create_tri_index_grids(const CCGKey &key,
@@ -1632,10 +2061,12 @@ static gpu::IndexBufPtr create_lines_index_grids(const CCGKey &key,
 Span<gpu::IndexBufPtr> DrawCacheImpl::ensure_lines_indices(const Object &object,
                                                            const OrigMeshData &orig_mesh_data,
                                                            const IndexMask &node_mask,
-                                                           const bool coarse)
+                                                           const bool coarse,
+                                                           const bool welded)
 {
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
-  Vector<gpu::IndexBufPtr> &ibos = coarse ? lines_ibos_coarse_ : lines_ibos_;
+  Vector<gpu::IndexBufPtr> &ibos = welded ? lines_ibos_welded_ :
+                                            (coarse ? lines_ibos_coarse_ : lines_ibos_);
   ibos.resize(pbvh.nodes_num());
 
   IndexMaskMemory memory;
@@ -1647,11 +2078,14 @@ Span<gpu::IndexBufPtr> DrawCacheImpl::ensure_lines_indices(const Object &object,
       const Span<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
       const Mesh &mesh = DRW_object_get_data_for_drawing<Mesh>(object);
       const OffsetIndices<int> faces = mesh.faces();
+      const Span<int> corner_verts = mesh.corner_verts();
       const bke::AttributeAccessor attributes = orig_mesh_data.attributes;
       const VArraySpan hide_poly = *attributes.lookup<bool>(".hide_poly", bke::AttrDomain::Face);
       nodes_to_calculate.foreach_index(
           [&](const int i) {
-            ibos[i] = create_lines_index_faces(faces, hide_poly, nodes[i].faces());
+            ibos[i] = welded ?
+                          create_lines_index_faces_welded(faces, corner_verts, hide_poly, nodes[i]) :
+                          create_lines_index_faces(faces, hide_poly, nodes[i].faces());
           },
           exec_mode::grain_size(1));
       break;
@@ -1695,6 +2129,27 @@ BitSpan DrawCacheImpl::ensure_use_flat_layout(const Object &object,
   return use_flat_layout_;
 }
 
+/* これまでに見た要求をためて、その和で並べ方を1つに決める。 */
+bool DrawCacheImpl::ensure_welded_layout(const Object &object,
+                                         const OrigMeshData &orig_mesh_data,
+                                         const Span<AttributeRequest> attributes)
+{
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  /* ★ここで #use_flat_layout_ の大きさを目印に使ってはいけない。メッシュ型では
+   * #calc_use_flat_layout が空を返すので、その比較は**毎回真になる**。
+   * ためた要求が毎回捨てられ、要求ごとに並べ方が分かれて二重に作られていた。 */
+  if (attrs_seen_nodes_num_ != pbvh.nodes_num()) {
+    attrs_seen_.clear();
+    attrs_seen_nodes_num_ = pbvh.nodes_num();
+  }
+  for (const AttributeRequest &attr : attributes) {
+    if (!attrs_seen_.contains(attr)) {
+      attrs_seen_.append(attr);
+    }
+  }
+  return mesh_can_use_welded(object, orig_mesh_data, attrs_seen_);
+}
+
 BLI_NOINLINE static void flush_vbo_data(const Span<gpu::VertBufPtr> vbos,
                                         const IndexMask &node_mask)
 {
@@ -1704,10 +2159,12 @@ BLI_NOINLINE static void flush_vbo_data(const Span<gpu::VertBufPtr> vbos,
 Span<gpu::VertBufPtr> DrawCacheImpl::ensure_attribute_data(const Object &object,
                                                            const OrigMeshData &orig_mesh_data,
                                                            const AttributeRequest &attr,
-                                                           const IndexMask &node_mask)
+                                                           const IndexMask &node_mask,
+                                                           const bool welded)
 {
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
-  AttributeData &data = attribute_vbos_.lookup_or_add_default(attr);
+  AttributeData &data = (welded ? attribute_vbos_welded_ : attribute_vbos_)
+                            .lookup_or_add_default(attr);
   Vector<gpu::VertBufPtr> &vbos = data.vbos;
   vbos.resize(pbvh.nodes_num());
 
@@ -1729,22 +2186,22 @@ Span<gpu::VertBufPtr> DrawCacheImpl::ensure_attribute_data(const Object &object,
       if (const CustomRequest *request_type = std::get_if<CustomRequest>(&attr)) {
         switch (*request_type) {
           case CustomRequest::Position:
-            update_positions_mesh(object, mask, vbos);
+            update_positions_mesh(object, mask, welded, vbos);
             break;
           case CustomRequest::Normal:
-            update_normals_mesh(object, mask, vbos);
+            update_normals_mesh(object, mask, welded, vbos);
             break;
           case CustomRequest::Mask:
-            update_masks_mesh(object, orig_mesh_data, mask, vbos);
+            update_masks_mesh(object, orig_mesh_data, mask, welded, vbos);
             break;
           case CustomRequest::FaceSet:
-            update_face_sets_mesh(object, orig_mesh_data, mask, vbos);
+            update_face_sets_mesh(object, orig_mesh_data, mask, welded, vbos);
             break;
         }
       }
       else {
         update_generic_attribute_mesh(
-            object, orig_mesh_data, mask, std::get<GenericRequest>(attr), vbos);
+            object, orig_mesh_data, mask, std::get<GenericRequest>(attr), welded, vbos);
       }
       break;
     }
@@ -1814,14 +2271,15 @@ Span<gpu::VertBufPtr> DrawCacheImpl::ensure_attribute_data(const Object &object,
 Span<gpu::IndexBufPtr> DrawCacheImpl::ensure_tri_indices(const Object &object,
                                                          const OrigMeshData &orig_mesh_data,
                                                          const IndexMask &node_mask,
-                                                         const bool coarse)
+                                                         const bool coarse,
+                                                         const bool welded)
 {
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
       const Span<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
 
-      Vector<gpu::IndexBufPtr> &ibos = tris_ibos_;
+      Vector<gpu::IndexBufPtr> &ibos = welded ? tris_ibos_welded_ : tris_ibos_;
       ibos.resize(nodes.size());
 
       /* Whenever a node's visible triangle count has changed the index buffers are freed, so we
@@ -1833,12 +2291,15 @@ Span<gpu::IndexBufPtr> DrawCacheImpl::ensure_tri_indices(const Object &object,
 
       const Mesh &mesh = DRW_object_get_data_for_drawing<Mesh>(object);
       const OffsetIndices<int> faces = mesh.faces();
+      const Span<int> corner_verts = mesh.corner_verts();
       const Span<int3> corner_tris = mesh.corner_tris();
       const bke::AttributeAccessor attributes = orig_mesh_data.attributes;
       const VArraySpan hide_poly = *attributes.lookup<bool>(".hide_poly", bke::AttrDomain::Face);
       nodes_to_calculate.foreach_index(
           [&](const int i) {
-            ibos[i] = create_tri_index_mesh(faces, corner_tris, hide_poly, nodes[i]);
+            ibos[i] = welded ? create_tri_index_mesh_welded(
+                                   faces, corner_tris, corner_verts, hide_poly, nodes[i]) :
+                               create_tri_index_mesh(faces, corner_tris, hide_poly, nodes[i]);
           },
           exec_mode::grain_size(1));
       return ibos;
@@ -1892,18 +2353,32 @@ Span<gpu::Batch *> DrawCacheImpl::ensure_tris_batches(const Object &object,
   this->ensure_use_flat_layout(object, orig_mesh_data);
   this->free_nodes_with_changed_topology(pbvh);
 
+  const bool welded = this->ensure_welded_layout(object, orig_mesh_data, request.attributes);
+  /* 並べ方が変わったらバッチは中身が食い違うので、作り直す。
+   * (要求が同じでも、面セットやシャープな面が後から足されると判定が反転する) */
+  bool &batches_welded = tris_batches_welded_.lookup_or_add(request, welded);
+  if (batches_welded != welded) {
+    batches_welded = welded;
+    if (Vector<gpu::Batch *> *stale = tris_batches_.lookup_ptr(request)) {
+      free_batches(*stale, stale->index_range());
+      stale->clear();
+    }
+  }
+
   const Span<gpu::IndexBufPtr> ibos = this->ensure_tri_indices(
-      object, orig_mesh_data, nodes_to_update, request.use_coarse_grids);
+      object, orig_mesh_data, nodes_to_update, request.use_coarse_grids, welded);
 
   for (const AttributeRequest &attr : request.attributes) {
-    this->ensure_attribute_data(object, orig_mesh_data, attr, nodes_to_update);
+    this->ensure_attribute_data(object, orig_mesh_data, attr, nodes_to_update, welded);
   }
 
   /* Collect VBO spans in a different loop because #ensure_attribute_data invalidates the allocated
    * arrays when its map is changed. */
   Vector<Span<gpu::VertBufPtr>> attr_vbos;
   for (const AttributeRequest &attr : request.attributes) {
-    if (const AttributeData *attr_data = attribute_vbos_.lookup_ptr(attr)) {
+    if (const AttributeData *attr_data = (welded ? attribute_vbos_welded_ : attribute_vbos_)
+                                             .lookup_ptr(attr))
+    {
       attr_vbos.append(attr_data->vbos);
     }
   }
@@ -1938,15 +2413,24 @@ Span<gpu::Batch *> DrawCacheImpl::ensure_lines_batches(const Object &object,
   this->ensure_use_flat_layout(object, orig_mesh_data);
   this->free_nodes_with_changed_topology(pbvh);
 
+  /* 線は位置しか要らないが、頂点バッファを三角形側と共有するので、
+   * 判定も同じ要求で行って並べ方を揃える(食い違うと同じ VBO を2通りで作り直す)。 */
+  const bool welded = this->ensure_welded_layout(object, orig_mesh_data, request.attributes);
+
   const Span<gpu::VertBufPtr> position = this->ensure_attribute_data(
-      object, orig_mesh_data, CustomRequest::Position, nodes_to_update);
+      object, orig_mesh_data, CustomRequest::Position, nodes_to_update, welded);
   const Span<gpu::IndexBufPtr> lines = this->ensure_lines_indices(
-      object, orig_mesh_data, nodes_to_update, request.use_coarse_grids);
+      object, orig_mesh_data, nodes_to_update, request.use_coarse_grids, welded);
 
   /* Except for the first iteration of the draw loop, we only need to rebuild batches for nodes
    * with changed topology (visible triangle count). */
   Vector<gpu::Batch *> &batches = request.use_coarse_grids ? lines_batches_coarse_ :
                                                              lines_batches_;
+  if (lines_batches_welded_ != welded) {
+    lines_batches_welded_ = welded;
+    free_batches(batches, batches.index_range());
+    batches.clear();
+  }
   batches.resize(pbvh.nodes_num(), nullptr);
   nodes_to_update.foreach_index(
       [&](const int i) {

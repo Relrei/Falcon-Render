@@ -476,6 +476,7 @@ endif()
 set(GLSL_SRC
   GPU_shader_shared.hh
 
+  shaders/infos/falcon_sculpt_infos.hh
   shaders/infos/gpu_clip_planes_infos.hh
   shaders/infos/gpu_index_load_infos.hh
   shaders/infos/gpu_interface_infos.hh
@@ -566,6 +567,7 @@ set(GLSL_SRC
   shaders/gpu_shader_keyframe_shape_vert.glsl
   shaders/gpu_shader_keyframe_shape_frag.glsl
 
+  shaders/falcon_sculpt_factors_comp.glsl
   shaders/gpu_shader_sequencer_scope_comp.glsl
   shaders/gpu_shader_sequencer_scope_frag.glsl
   shaders/gpu_shader_sequencer_strips_vert.glsl

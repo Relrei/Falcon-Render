@@ -19,6 +19,7 @@
 #include "BLI_math_vector.hh"
 #include "BLI_task.hh"
 
+#include "editors/sculpt_paint/mesh/falcon_sculpt_gpu.hh"
 #include "editors/sculpt_paint/mesh/mesh_brush_common.hh"
 #include "editors/sculpt_paint/mesh/sculpt_automask.hh"
 #include "editors/sculpt_paint/mesh/sculpt_intern.hh"
@@ -45,21 +46,37 @@ static void calc_faces(const Depsgraph &depsgraph,
                        const bke::pbvh::MeshNode &node,
                        Object &object,
                        LocalData &tls,
-                       const PositionDeformData &position_data)
+                       const PositionDeformData &position_data,
+                       const Span<float> gpu_factors)
 {
   const SculptSession &ss = *object.runtime->sculpt_session;
 
   const Span<int> verts = node.verts();
 
-  calc_factors_common_mesh_indexed(depsgraph,
-                                   brush,
-                                   object,
-                                   attribute_data,
-                                   position_data.eval,
-                                   vert_normals,
-                                   node,
-                                   tls.factors,
-                                   tls.distances);
+  /* ★GPUが出した係数があればそれを使う。空ならCPU(公式通路)。
+   * `verify` の時は**両方出して突き合わせ、CPU の値を使う**ので、
+   * 絵は1画素も変わらないまま差だけが分かる。 */
+  if (gpu_factors.is_empty() || falcon_gpu::verify_mode()) {
+    calc_factors_common_mesh_indexed(depsgraph,
+                                     brush,
+                                     object,
+                                     attribute_data,
+                                     position_data.eval,
+                                     vert_normals,
+                                     node,
+                                     tls.factors,
+                                     tls.distances);
+    if (!gpu_factors.is_empty()) {
+      BLI_assert(gpu_factors.size() == tls.factors.size());
+      for (const int i : tls.factors.index_range()) {
+        falcon_gpu::note_diff(std::abs(tls.factors[i] - gpu_factors[i]));
+      }
+    }
+  }
+  else {
+    tls.factors.resize(verts.size());
+    tls.factors.as_mutable_span().copy_from(gpu_factors);
+  }
 
   tls.translations.resize(verts.size());
   const MutableSpan<float3> translations = tls.translations;
@@ -127,17 +144,34 @@ static void offset_positions(const Depsgraph &depsgraph,
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   const Brush &brush = *BKE_paint_brush_for_read(&sd.paint);
 
+  /* ★係数をGPUで出す(`FALCON_SCULPT_GPU` が立っている時だけ)。
+   * ノードごとに投げず**1回のディスパッチでまとめて**出す。回数がそのまま
+   * 時間になるため(Taichi の実測で GPU 0.9ms に対し壁時計 17.9ms、
+   * 律速はカーネル発行回数だった)。
+   * 条件が合わなければ false が返り、そのままCPUの通路を通る。 */
+  Vector<int> gpu_offsets;
+  Vector<float> gpu_factors;
+  bool use_gpu = false;
+
   threading::EnumerableThreadSpecific<LocalData> all_tls;
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
+      if (falcon_gpu::can_use_factors(depsgraph, sd.paint, object, brush)) {
+        use_gpu = falcon_gpu::calc_factors(
+            depsgraph, object, brush, node_mask, gpu_offsets, gpu_factors);
+      }
       const Mesh &mesh = *id_cast<Mesh *>(object.data);
       const MeshAttributeData attribute_data(mesh);
       const PositionDeformData position_data(depsgraph, object);
       const Span<float3> vert_normals = bke::pbvh::vert_normals_eval(depsgraph, object);
       MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
       node_mask.foreach_index(
-          [&](const int i) {
+          [&](const int i, const int64_t pos) {
             LocalData &tls = all_tls.local();
+            const Span<float> node_gpu_factors =
+                use_gpu ? Span<float>(gpu_factors).slice(gpu_offsets[pos],
+                                                         gpu_offsets[pos + 1] - gpu_offsets[pos]) :
+                          Span<float>();
             calc_faces(depsgraph,
                        sd,
                        brush,
@@ -147,7 +181,8 @@ static void offset_positions(const Depsgraph &depsgraph,
                        nodes[i],
                        object,
                        tls,
-                       position_data);
+                       position_data,
+                       node_gpu_factors);
             bke::pbvh::update_node_bounds_mesh(position_data.eval, nodes[i]);
           },
           exec_mode::grain_size(1));

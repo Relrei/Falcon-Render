@@ -24,7 +24,7 @@ from mathutils import Vector
 # ---------------------------------------------------------------------------
 # SHARC hash grid (must match kernel/integrator/falcon_sharc.h exactly)
 
-CELL_COUNT = 1 << 22
+CELL_COUNT = 1 << 26
 CELL_MASK = CELL_COUNT - 1
 CELL_STRIDE = 4
 CELL_SIZE = 0.2  # overridden by --cell

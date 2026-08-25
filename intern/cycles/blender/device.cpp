@@ -2,6 +2,8 @@
  *
  * SPDX-License-Identifier: Apache-2.0 */
 
+#include <cstdio>
+
 #include "blender/device.h"
 #include "blender/session.h"
 #include "blender/util.h"
@@ -111,16 +113,20 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
   ComputeDevice compute_device = (ComputeDevice)get_enum(
       cpreferences, "compute_device_type", COMPUTE_DEVICE_NUM, COMPUTE_DEVICE_CPU);
 
-  /* Falcon: OptiX x Vulkan viewport interop is broken in this environment (gray
-   * viewport, crash when switching device). Keep all interactive work -- viewport
-   * "Rendered" shading and material previews -- on CUDA, and reserve OptiX for the
-   * final (background) render where it is ~1.35x faster. This lets the user set
-   * OptiX as the default device and have both paths just work. Opt back in to
-   * OptiX for the viewport with FALCON_VIEWPORT_OPTIX=1. */
+  /* Falcon: historically OptiX x Vulkan viewport interop looked broken here (gray
+   * viewport, crash when switching device), so all interactive work -- viewport
+   * "Rendered" shading and material previews -- was downgraded OptiX->CUDA.
+   *
+   * That downgrade is itself broken on this setup: the OptiX->CUDA path fails to
+   * bind the CUDA GPU and silently runs the viewport on the CPU (~10 cores pegged,
+   * GPU idle), while OptiX in the viewport now renders on the GPU just fine. So the
+   * default is flipped: keep the viewport on OptiX, and make the CUDA downgrade
+   * opt-in for anyone who still hits the interop crash, via FALCON_VIEWPORT_CUDA=1.
+   * (FALCON_VIEWPORT_OPTIX is kept as a harmless legacy no-op.) */
   bool falcon_viewport_downgrade = false;
   if (compute_device == COMPUTE_DEVICE_OPTIX && !background) {
-    const char *force = getenv("FALCON_VIEWPORT_OPTIX");
-    if (!(force && force[0] == '1')) {
+    const char *force_cuda = getenv("FALCON_VIEWPORT_CUDA");
+    if (force_cuda && force_cuda[0] == '1') {
       compute_device = COMPUTE_DEVICE_CUDA;
       falcon_viewport_downgrade = true;
     }
@@ -181,6 +187,36 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
     if (!used_devices.empty()) {
       const int threads = blender_device_threads(b_scene);
       preferences_device = Device::get_multi_device(used_devices, threads, background);
+    }
+
+    /* Falcon safety net: a GPU compute device was requested, but device matching
+     * left us on the CPU (this is exactly how the OptiX->CUDA viewport downgrade
+     * used to run the viewport on the CPU). Never silently fall back to the CPU
+     * for interactive rendering -- bind every available OptiX GPU instead. */
+    if (preferences_device.type == DEVICE_CPU && !background) {
+      vector<DeviceInfo> gpu_devices;
+      for (const DeviceInfo &info :
+           Device::available_devices(DEVICE_MASK_CPU | DEVICE_MASK_OPTIX))
+      {
+        if (info.type != DEVICE_CPU) {
+          gpu_devices.push_back(info);
+        }
+      }
+      if (!gpu_devices.empty()) {
+        const int threads = blender_device_threads(b_scene);
+        preferences_device = Device::get_multi_device(gpu_devices, threads, background);
+      }
+    }
+
+    if (getenv("FALCON_DEVICE_DEBUG")) {
+      fprintf(stderr,
+              "[Falcon device] background=%d downgrade=%d compute=%d -> %s (type %d)\n",
+              (int)background,
+              (int)falcon_viewport_downgrade,
+              (int)compute_device,
+              preferences_device.description.c_str(),
+              (int)preferences_device.type);
+      fflush(stderr);
     }
   }
 

@@ -410,17 +410,6 @@ def update_world(self, context):
     context.scene.world.update_tag()
 
 
-def _falcon_point_env_update(self, context):
-    # Live-retune the active Falcon photon point map: only touch the env when a
-    # bake is already wired up (mode=add + points file present), so moving the
-    # sliders before any bake stays inert. Render-time knobs — no rebake.
-    import os
-    if (os.environ.get("FALCON_PHOTON_MODE") == "add"
-            and os.environ.get("FALCON_PHOTON_POINTS")):
-        os.environ["FALCON_PHOTON_RADIUS_M"] = "%.4f" % self.falcon_photon_point_radius
-        os.environ["FALCON_PHOTON_GAIN"] = "%.3f" % self.falcon_photon_point_gain
-
-
 def update_pause(self, context):
     context.area.tag_redraw()
 
@@ -559,6 +548,14 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         "ボリュームはモーションベクタを持たないため移動中に尾を引く"
         "(ボリューム入りシーンはOFF推奨)",
         default=False,
+    )
+    denoising_preroll_passes: IntProperty(
+        name="初回蓄積レンダリング回数",
+        description="アニメーションの1枚目だけ、同じフレームをこの回数だけ焼き直して"
+        "DLSSの時間履歴に独立した推定を溜めてから本番の1枚を出す。"
+        "2枚目以降は履歴を引き継ぐので1回で済む。"
+        "0で無効(1枚目だけノイズが多いまま出る)",
+        min=0, max=16, default=4,
     )
     denoising_warmup_frames: IntProperty(
         name="ウォームアップ枚数",
@@ -1285,10 +1282,12 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
     falcon_photon_photons: IntProperty(
         name="Photons",
         description="Photon count for the caustics bake. More photons = smoother "
-                    "caustics and less chroma sparkle with dispersion; bake time "
-                    "scales linearly on CPU (~2.5min per million); the GPU bake "
-                    "does billions in seconds (1B ~= 9s)",
-        min=10000, max=2000000000, default=2000000,
+                    "caustics and less chroma sparkle with dispersion. The bake "
+                    "runs on the GPU (~20s for a billion); the old 20M default "
+                    "came from the CPU tracer and leaves a wide receiver full of "
+                    "holes -- measured on the ocean scene at 1280x720, 20M gives "
+                    "2973 one-pixel dark specks and 3x the error of 2B",
+        min=10000, max=2000000000, default=1000000000,
     )
     falcon_photon_cell: FloatProperty(
         name="Cell Size",
@@ -1305,11 +1304,15 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
     )
     falcon_photon_radius: FloatProperty(
         name="Caustic Smoothness",
-        description="Photon-map density-estimation radius in cells. Larger spreads "
-                    "each photon over a wider disk: smoother caustics and rainbow "
-                    "rays from fewer photons, but softer detail and a slower bake "
-                    "(more deposits per photon). 1 = legacy sharp 2x2x2 splat",
-        min=1.0, max=8.0, default=3.0,
+        description="Grid-cache density-estimation radius in cells. Larger spreads "
+                    "each photon over a wider disk, which used to be how you bought "
+                    "smoothness from fewer photons. With enough photons it no longer "
+                    "buys anything and costs a lot: each step widens the disk by "
+                    "r^2 cells, so the hash table fills up and starts colliding. "
+                    "Measured at 2e9 photons -- glasszoo error 0.1690 at 1 vs 0.1695 "
+                    "at 3, pabellon 0.1174 vs 0.1178, while table occupancy goes "
+                    "37% -> 70% and 33% -> 82%. Raise it only when baking few photons",
+        min=1.0, max=8.0, default=1.0,
     )
     falcon_photon_gpu: BoolProperty(
         name="GPU",
@@ -1322,12 +1325,18 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
     )
     falcon_photon_point: BoolProperty(
         name="Point Map",
-        description="LuxCore-style point-based photon map (Round 9): the GPU bake "
-                    "stores raw photon points and the render density-estimates at "
-                    "the exact shading point — no grid quantization, so colored "
-                    "cell speckle is gone and radius/gain are render-time knobs "
-                    "(no rebake needed). GPU bake only",
-        default=True,
+        description="Keep every photon as a point and search the neighbours at "
+                    "render time, instead of adding it into the fixed-size grid. "
+                    "Its one advantage is that radius and gain can be changed "
+                    "without rebaking. It pays for that everywhere else: memory "
+                    "and render time both grow with the photon count, so the "
+                    "GPU's ability to fire billions cannot be spent. Measured "
+                    "against the same 1024spp references, the grid wins on all "
+                    "three test scenes -- error 0.1755 vs 0.1690 (glasszoo), "
+                    "0.1187 vs 0.1174 (pabellon), 0.8028 vs 0.1642 (ocean) -- "
+                    "and at 2e9 photons renders in 3.8s where the point map "
+                    "needs 122s. Left in for A/B and for the no-rebake knobs",
+        default=False,
     )
     falcon_photon_point_maxpts: IntProperty(
         name="Point Cap",
@@ -1337,6 +1346,23 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
                     "default is generous since bake time isn't the bottleneck",
         min=1000000, max=200000000, default=40000000,
     )
+    falcon_photon_point_radius_auto: BoolProperty(
+        name="半径を自動",
+        description="ベイクのたびに、コースティクスが落ちる面まで実際にレイを飛ばし、"
+        "そこで1画素が何メートルになるかを測って半径にする。"
+        "半径はぼけの大きさなので、メートルで言うと画角と距離で必要な値が桁で変わり"
+        "毎シーン合わせ直しになるが、画素で言えば答えは一つ(画面で見える手前に隠す)。"
+        "レンダー解像度も見るので、4Kで焼けば自動で半径が縮んで鋭くなる。"
+        "OFFで下の値をそのまま使う",
+        default=True,
+    )
+    falcon_photon_point_radius_px: FloatProperty(
+        name="半径(画素)",
+        description="自動時の目標。半径が何画素分のぼけに相当するかで指定する。"
+        "1がおおよそ手で合わせ込んだ値と一致する。"
+        "大きくすると少ない光子でも滑らかになる代わりにフィラメントが太る",
+        min=0.25, max=8.0, default=1.0,
+    )
     falcon_photon_point_radius: FloatProperty(
         name="Radius (m)",
         description="Point-map lookup radius in meters. Smaller = crisper caustic "
@@ -1344,7 +1370,6 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
                     "smoother/softer. Takes effect on the next render, WITHOUT "
                     "rebaking (0.008-0.015 tabletop, 0.03+ rooms)",
         min=0.001, max=0.5, default=0.010,
-        update=_falcon_point_env_update,
     )
     falcon_photon_point_gain: FloatProperty(
         name="Gain",
@@ -1352,16 +1377,22 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
                     "artistic knob: 1 = physically calibrated). Takes effect on the "
                     "next render, WITHOUT rebaking",
         min=0.0, max=32.0, default=1.0,
-        update=_falcon_point_env_update,
     )
     falcon_lt_blur: FloatProperty(
         name="LT Blur",
-        description="Light-tracing splat blur in pixels (0 = physically exact "
-                    "single-pixel splat). Energy-preserving Gaussian: makes few "
-                    "samples look smooth (16spp at blur 2 beats 256spp physical "
-                    "on caustic noise) at the cost of slight caustic softness. "
-                    "Labeled non-physical knob for heavy scenes",
-        min=0.0, max=4.0, default=0.0,
+        description="Light-tracing splat reconstruction width in pixels. The "
+                    "photons land as a scatter of single points, so what a pixel "
+                    "gets is a random count: the shot noise this leaves is the "
+                    "main reason light-traced caustics look grainy. Spreading "
+                    "each splat over a small energy-preserving Gaussian averages "
+                    "that away without moving any light -- brightness is "
+                    "unchanged to four decimals, only detail below a pixel is "
+                    "given up. 0 is one photon per pixel, which is the raw form "
+                    "and also the noisiest; 4 is the kernel's 9x9 limit. Measured "
+                    "on ocean at 64spp (error against a 1024spp reference): "
+                    "0 = 0.219, 2 = 0.093, 4 = 0.077, and 64spp at 2 beats "
+                    "512spp at 0",
+        min=0.0, max=4.0, default=2.0,
     )
     falcon_lt_gain: FloatProperty(
         name="LT Gain",
@@ -1395,6 +1426,110 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
                     "hurts direct-lit ones, so a direct-lit scene disables it on its own. Turn "
                     "off to always blend at the full amount",
         default=True,
+    )
+    falcon_lt_guide_tiles: EnumProperty(
+        name="LT Emission Guiding",
+        description="Split the light's emission into tiles, measure which ones feed the parts of "
+                    "the caustic that are still noisy, and spend the sample budget there instead "
+                    "of spreading it evenly. Costs a probe pass (kept -- it is part of the result) "
+                    "and needs enough samples to pay for it: 4x4 wants more than 18",
+        items=(
+            ('1', "オフ", "光源の放射全体へ均等に撒く(従来)"),
+            ('2', "2x2", "裾野だけ改善し全体は悪化した(実測 2026-07-29: 裾野 -14.3% / "
+                         "全体 +4.4%)。分割が粗すぎて空撃ち方向を切り出せないため"),
+            ('4', "4x4", "推奨。実測 2026-07-29 で全体 -9.6% / 裾野 -17.5%。16枚中5枚が"
+                         "輸送ゼロと判定され、その予算が効く方向へ回る"),
+            ('8', "8x8", "さらに細かいが未計測。プローブ代が n^2 で増えるのでサンプル数を"
+                         "多く取れる時だけ"),
+        ),
+        default='1',
+    )
+    falcon_sharc_gate_low: FloatProperty(
+        name="Gate Low",
+        description="GI dominance (indirect / (direct + indirect), measured during Warmup) below "
+                    "which the auto gate disables SHARC entirely",
+        min=0.0, max=1.0, default=0.15,
+    )
+    falcon_sharc_gate_high: FloatProperty(
+        name="Gate High",
+        description="GI dominance at and above which the auto gate lets SHARC blend at the full "
+                    "amount. Between Low and High the blend ramps smoothly",
+        min=0.0, max=1.0, default=0.40,
+    )
+    falcon_lt_direct: BoolProperty(
+        name="LT Direct Floor",
+        description="Also splat the bounce-0 direct diffuse hit, which is not a caustic. "
+                    "Calibration aid: it lets the light-traced floor radiance be matched against "
+                    "E*albedo/pi. Keep off for real caustic renders",
+        default=False,
+    )
+    falcon_photon_point_normal_deg: FloatProperty(
+        name="Normal Cone",
+        description="Point-map lookup rejects photons whose surface normal differs from the "
+                    "shading point's by more than this angle, so caustics do not bleed around "
+                    "corners or through thin walls",
+        min=0.0, max=90.0, default=30.0,
+    )
+    falcon_das_map: StringProperty(
+        name="DAS Map",
+        description="Denoiser-aware sampling: per-pixel threshold-scale map written by the OIDN "
+                    "probe. Only valid for a full-frame render at exactly the map's resolution. "
+                    "Leave empty to disable",
+        subtype='FILE_PATH', default="",
+    )
+    falcon_error_map: StringProperty(
+        name="Error Field",
+        description="Measured relative error per world cell, written by the probe tools. With a "
+                    "threshold above zero, a camera-visible cell whose error is at or below it is "
+                    "taken from the radiance cache and the path stops there instead of tracing "
+                    "bounces the cache already answers. Cells the probe never reached are never "
+                    "treated as converged",
+        subtype='FILE_PATH', default="",
+    )
+    falcon_error_cell: FloatProperty(
+        name="Error Cell Size",
+        description="Cell size the error field was measured at, in meters. Deliberately coarser "
+                    "than the radiance cache's cell: the per-cell statistics need pixels to "
+                    "average over (0.8 m measured 2026-07-29, 0.2 m gave 6 pixels per cell)",
+        min=0.05, max=8.0, default=0.8,
+    )
+    falcon_error_threshold: FloatProperty(
+        name="Stop Below Error",
+        description="Relative error at or below which a path is finished from the cache. 0 = off. "
+                    "Higher stops more paths and renders faster, at the cost of trusting cells "
+                    "the measurement says are less settled",
+        min=0.0, max=1.0, default=0.0,
+    )
+    falcon_error_raise_alpha: BoolProperty(
+        name="Trust The Cache Where Measured",
+        description="Let the error field decide that the radiance cache may answer a path in "
+                    "full, not just that an already-decided substitution can skip the rest of "
+                    "the trace. Only meaningful with a field that measures the CACHE's accuracy "
+                    "(the warmup spread sidecar, gated on samples per cell) -- pointing it at "
+                    "the light tracer's error field instead cost 29% of an image's energy",
+        default=False,
+    )
+    falcon_das_strength: FloatProperty(
+        name="DAS Strength",
+        description="How strongly the DAS map scales the adaptive sampling threshold "
+                    "(0 = map loaded but inert)",
+        min=0.0, max=8.0, default=1.0,
+    )
+    # コースティクス自動化(Octane式: ガラス+ライトを置くだけで出す)。
+    # AUTO=CyclesFパネル上部に「検出→ワンクリックで焼く」導線を出す。レシピ
+    # (点マップGPU・実証済み既定値)は falcon_photon_* の既定がそのまま効くので、
+    # 触る人以外は強さ以外のツマミを見なくてよい。OFF=従来どおり手動パネルのみ。
+    falcon_auto_caustics: EnumProperty(
+        name="コースティクス自動化",
+        description="ガラス/屈折マテリアルとライトのあるシーンで、レシピ知識ゼロで"
+                    "コースティクス(集光模様)を出せるようにする。自動=検出したら"
+                    "CyclesFパネル上部にワンクリックの導線が自動で出る。オフ=検出"
+                    "しない(下のPhoton/LTパネルで手動)",
+        items=(
+            ('AUTO', "自動", "ガラス+ライトを検出したらワンクリックで焼ける状態にする(既定)"),
+            ('OFF', "オフ", "自動検出しない"),
+        ),
+        default='AUTO',
     )
 
     @classmethod

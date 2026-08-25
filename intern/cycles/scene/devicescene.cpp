@@ -67,7 +67,8 @@ DeviceScene::DeviceScene(Device *device)
       falcon_photon_grid_start(device, "falcon_photon_grid_start", MEM_GLOBAL),
       falcon_photon_grid_count(device, "falcon_photon_grid_count", MEM_GLOBAL),
       falcon_photon_index(device, "falcon_photon_index", MEM_GLOBAL),
-      falcon_das_scale(device, "falcon_das_scale", MEM_GLOBAL)
+      falcon_das_scale(device, "falcon_das_scale", MEM_GLOBAL),
+      falcon_error_field(device, "falcon_error_field", MEM_GLOBAL)
 {
   memset((void *)&data, 0, sizeof(data));
 }

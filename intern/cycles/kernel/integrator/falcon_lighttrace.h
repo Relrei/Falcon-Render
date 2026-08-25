@@ -102,7 +102,17 @@ ccl_device_inline float3 falcon_lt_connect(KernelGlobals kg,
   }
 
   const float3 to_cam = camera_position(kg) - P;
-  const float cos_surf = fabsf(dot(N, to_cam) * inv_dist); /* |to_cam| == 1/inv_dist */
+  /* ★2026-08-16: fabsf をやめた。N は光子の入射側を向くよう flip 済みなので、
+   * dot(N, to_cam) < 0 は「カメラが光子と反対側」= 片面 Lambert なら寄与ゼロ。
+   * 絶対値を取っていたので、**受光面の裏をカメラが見ているときも全額
+   * スプラットしていた**(薄い一枚板の地形・屋根・床の裏)。
+   * 遮蔽レイ(falcon_lt_visibility)は既定オフな上、自分の prim を self 除外
+   * するので一枚ポリの裏抜けは止められない。
+   * [[issue_falcon_lt_flood_pabellon]] の候補機構。**未検証**。 */
+  const float cos_surf = fmaxf(dot(N, to_cam) * inv_dist, 0.0f); /* |to_cam| == 1/inv_dist */
+  if (!(cos_surf > 0.0f)) {
+    return zero_float3();
+  }
 
   /* We = (W*H) / (A * cos_lens^4): the PER-PIXEL camera importance. Each pixel
    * covers 1/(W*H) of the image-plane area A, so a photon splatted to one pixel

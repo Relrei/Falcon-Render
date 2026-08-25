@@ -155,6 +155,11 @@ class Session {
    * enables the first-frame history pre-roll (see RenderScheduler). */
   void set_is_animation(bool is_animation);
 
+  /* Tell the DLSS-RR scheduler that history was already warmed up by a
+   * previous frame of this job, even though this Session was just freshly
+   * constructed (see RenderScheduler::set_dlss_history_warm). */
+  void set_dlss_history_warm();
+
   void set_output_driver(unique_ptr<OutputDriver> driver);
   void set_display_driver(unique_ptr<DisplayDriver> driver);
 

@@ -97,6 +97,11 @@ class DenoiseParams : public Node {
    * carries across navigation restarts using the interactive motion passes. */
   bool carry_history = false;
 
+  /* DLSS-RR: how many times the first frame of an animation is re-rendered into
+   * the same history before the kept pass. Only independent estimates of the
+   * frame grow the history, so the opening frame needs them made on purpose. */
+  int preroll_passes = 4;
+
   static const NodeEnum *get_type_enum();
   static const NodeEnum *get_prefilter_enum();
   static const NodeEnum *get_quality_enum();

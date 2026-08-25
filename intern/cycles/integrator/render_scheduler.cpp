@@ -116,21 +116,25 @@ int RenderScheduler::get_dlss_preroll_passes() const
    * it. So render the first frame several times over with different sample
    * seeds, denoising each pass into the same history, and keep the last pass as
    * the frame. Only for animations: a still render must honour its sample
-   * count. FALCON_DLSS_PREROLL sets the number of extra passes (0 disables). */
+   * count. FALCON_DLSS_PREROLL overrides the scene setting (0 disables). */
   if (!background_ || !is_animation_ || !dlss_history_cold_ || !denoiser_params_.use ||
       denoiser_params_.type != DENOISER_DLSS || !denoiser_params_.carry_history)
   {
     return 0;
   }
 
-  static const int preroll = getenv("FALCON_DLSS_PREROLL") ? atoi(getenv("FALCON_DLSS_PREROLL")) :
-                                                             4;
-  return max(preroll, 0);
+  const char *env = getenv("FALCON_DLSS_PREROLL");
+  return max(env ? atoi(env) : denoiser_params_.preroll_passes, 0);
 }
 
 void RenderScheduler::set_is_animation(bool is_animation)
 {
   is_animation_ = is_animation;
+}
+
+void RenderScheduler::set_dlss_history_warm()
+{
+  dlss_history_cold_ = false;
 }
 
 int RenderScheduler::get_sample_offset() const

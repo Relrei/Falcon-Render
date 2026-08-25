@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "kernel/integrator/falcon_sharc_size.h"
 #include "kernel/types.h"
 
 #include "util/atomic.h"
@@ -25,11 +26,9 @@ CCL_NAMESPACE_BEGIN
 
 #ifdef __FALCON_SHARC__
 
-/* Hash table size (power of two). ~4M cells * 16 bytes = 64 MB. */
-#  define FALCON_SHARC_CELL_COUNT (1 << 22)
-#  define FALCON_SHARC_CELL_MASK (FALCON_SHARC_CELL_COUNT - 1)
-/* Floats per cell: accumulated R, G, B, sample count. */
-#  define FALCON_SHARC_CELL_STRIDE 4
+/* Table size lives in falcon_sharc_size.h, which the host includes too.
+ * Writing it out here as well is what made a subset-edit look like a valid
+ * experiment (see that header). */
 
 /* World-space voxel size used by the Step 1b-i hash debug visualization. */
 #  ifndef FALCON_SHARC_DEBUG_CELL_SIZE
@@ -85,6 +84,17 @@ ccl_device_inline bool falcon_sharc_lookup(ccl_global const float *cache,
   return true;
 }
 
+/* Read the measured relative error at P. Returns a negative value when the
+ * cell was never filled (the probe only reaches what the camera could see), so
+ * callers can tell "no evidence" from "evidence of low error" -- an unfilled
+ * cell must never be read as "converged, safe to stop". */
+ccl_device_inline float falcon_error_lookup(ccl_global const float *field,
+                                            const float3 P,
+                                            const float cell_size)
+{
+  return field[falcon_sharc_hash(P, cell_size)];
+}
+
 /* Collision tag for photon cells. hash_uint3 picks the cell, so two distant
  * world cells can share a slot and a lookup on one silently reads the other's
  * flux (bright squares floating off-surface). A second, input-decorrelated
@@ -99,6 +109,87 @@ ccl_device_inline float falcon_photon_tag(const uint gx, const uint gy, const ui
 {
   const uint t = hash_uint3(gx ^ 0x517cc1b7u, gy ^ 0x27220a95u, gz ^ 0xfe4db3afu) & 0xFFFFFu;
   return 1.0f + (float)t * (1.0f / 1048576.0f);
+}
+
+/* Linear probing over a short chain, so two sites that hash together do not
+ * have to share one slot.
+ *
+ * The tag alone only tells the LOSER of a collision to stay away; the winner
+ * still reads its own light plus the other site's and prints it. When the other
+ * site is a caustic core and this one is dim seabed, that is a single pixel at
+ * the core's brightness in the middle of nothing -- the isolated white dots
+ * measured on ocean (火の粉 45 vs 3 for the beauty alone, and 1 for light
+ * tracing, tools/caustic_metrics.py).
+ *
+ * The step is a second, independent hash of the same coordinates, so two sites
+ * that collide at i=0 do not walk the same chain afterwards. Making it odd
+ * keeps the chain inside the whole table (the size is a power of two). */
+#define FALCON_PHOTON_PROBES 4
+
+ccl_device_inline uint falcon_photon_slot(const uint gx, const uint gy, const uint gz, const int i)
+{
+  const uint h = hash_uint3(gx, gy, gz);
+  const uint step = hash_uint3(gz ^ 0x9e3779b9u, gx ^ 0x85ebca6bu, gy ^ 0xc2b2ae35u) | 1u;
+  return ((h + (uint)i * step) & FALCON_SHARC_CELL_MASK) * FALCON_SHARC_CELL_STRIDE;
+}
+
+/* Where this cell may accumulate: its own slot if it already claimed one, else
+ * the first free slot on the chain, claimed with a compare-and-swap. Returns -1
+ * when the whole chain belongs to other sites; the caller drops the photon.
+ *
+ * The CAS is not decoration. Claiming with a plain store loses light: two sites
+ * both see a slot free, both add radiance there, and only one tag survives --
+ * the loser's photons sit in a slot it can never read back. Measured that way
+ * on ocean against the brute-force judge, the layer came out 5% short in EVERY
+ * band (0.973 -> 0.924). Probing turns a collision from "too bright" into
+ * "missing" unless the claim is atomic.
+ *
+ * Dropping the photon on a full chain is deliberate: adding it to a slot owned
+ * by somebody else is precisely the bright-dot bug this exists to remove, and
+ * at the default cell size (11% occupancy) four consecutive collisions are
+ * rare enough that losing those photons is the cheaper error. */
+ccl_device_inline int falcon_photon_slot_write(ccl_global float *cache,
+                                               const uint gx,
+                                               const uint gy,
+                                               const uint gz,
+                                               const float tag)
+{
+  for (int i = 0; i < FALCON_PHOTON_PROBES; i++) {
+    const uint base = falcon_photon_slot(gx, gy, gz, i);
+    const float t = cache[base + 3];
+    if (t == tag) {
+      return (int)base;
+    }
+    if (t == 0.0f) {
+      const float prev = atomic_compare_and_swap_float(&cache[base + 3], 0.0f, tag);
+      if (prev == 0.0f || prev == tag) {
+        return (int)base;
+      }
+    }
+  }
+  return -1;
+}
+
+/* Where this cell's light actually is, or -1 if it never got a slot. An empty
+ * slot ends the chain: nothing past it can belong to this cell, because a
+ * deposit would have taken that free slot first. */
+ccl_device_inline int falcon_photon_slot_read(ccl_global const float *cache,
+                                              const uint gx,
+                                              const uint gy,
+                                              const uint gz,
+                                              const float tag)
+{
+  for (int i = 0; i < FALCON_PHOTON_PROBES; i++) {
+    const uint base = falcon_photon_slot(gx, gy, gz, i);
+    const float t = cache[base + 3];
+    if (t == tag) {
+      return (int)base;
+    }
+    if (t == 0.0f) {
+      return -1;
+    }
+  }
+  return -1;
 }
 
 /* Photon-pass deposit with a tangent-plane gaussian splat (mirrors the host
@@ -132,7 +223,18 @@ ccl_device_inline void falcon_photon_deposit_wide(ccl_global float *cache,
 {
   const float inv = 1.0f / cell_size;
   const float r = radius_cells * cell_size;
-  const float cone = 3.0f / (M_PI_F * r * r); /* 2D cone normalization */
+  /* Two divisions by pi, and they are not the same pi. The first normalizes the
+   * 2D cone so it integrates to 1 over the disk (that is the 3/(pi r^2)); the
+   * second is the Lambertian BRDF's 1/pi, turning the irradiance this photon
+   * deposits into the outgoing radiance the lookup reads back. The narrow
+   * rc <= 1 path applies the second one at the call site as inv_area =
+   * 1/(pi cell^2); this path was missing it, so every wide splat came out pi
+   * times too bright -- the same 1/pi that was found and fixed for the point
+   * map on 2026-07-05 and has since regressed here. Measured on glasszoo by
+   * sweeping radius_cells: energy/ref 1.1059 at rc=1 against 1.4062 / 1.4069 /
+   * 1.4073 at rc=2/3/4, which solves to a caustic component exactly pi times
+   * over (the flat response across rc>1 confirms the cone itself is right). */
+  const float cone = 3.0f / (M_PI_F * M_PI_F * r * r);
   const int R = (int)ceilf(radius_cells);
   const int bx = (int)floorf(P.x * inv);
   const int by = (int)floorf(P.y * inv);
@@ -161,12 +263,15 @@ ccl_device_inline void falcon_photon_deposit_wide(ccl_global float *cache,
         }
         const float w = cone * (1.0f - t) * tent;
         const uint ux = (uint)gx, uy = (uint)gy, uz = (uint)gz;
-        const uint base = (hash_uint3(ux, uy, uz) & FALCON_SHARC_CELL_MASK) *
-                          FALCON_SHARC_CELL_STRIDE;
+        const int slot = falcon_photon_slot_write(cache, ux, uy, uz,
+                                                  falcon_photon_tag(ux, uy, uz));
+        if (slot < 0) {
+          continue;
+        }
+        const uint base = (uint)slot;
         atomic_add_and_fetch_float(&cache[base + 0], flux_albedo.x * w);
         atomic_add_and_fetch_float(&cache[base + 1], flux_albedo.y * w);
         atomic_add_and_fetch_float(&cache[base + 2], flux_albedo.z * w);
-        cache[base + 3] = falcon_photon_tag(ux, uy, uz);
       }
     }
   }
@@ -226,12 +331,15 @@ ccl_device_inline void falcon_photon_deposit(ccl_global float *cache,
         const uint gx = (uint)(bx + dx);
         const uint gy = (uint)(by + dy);
         const uint gz = (uint)(bz + dz);
-        const uint base = (hash_uint3(gx, gy, gz) & FALCON_SHARC_CELL_MASK) *
-                          FALCON_SHARC_CELL_STRIDE;
+        const int slot = falcon_photon_slot_write(cache, gx, gy, gz,
+                                                  falcon_photon_tag(gx, gy, gz));
+        if (slot < 0) {
+          continue;
+        }
+        const uint base = (uint)slot;
         atomic_add_and_fetch_float(&cache[base + 0], radiance.x * w);
         atomic_add_and_fetch_float(&cache[base + 1], radiance.y * w);
         atomic_add_and_fetch_float(&cache[base + 2], radiance.z * w);
-        cache[base + 3] = falcon_photon_tag(gx, gy, gz);
       }
     }
   }
@@ -252,9 +360,133 @@ ccl_device_inline bool falcon_photon_lookup(ccl_global const float *cache,
                                             const float3 P,
                                             const float cell_size,
                                             const int normal_axis,
+                                            const int nearest,
                                             ccl_private float3 *radiance)
 {
   const float inv = 1.0f / cell_size;
+  if (nearest) {
+    /* The deposit already spread this photon over the stencil with weights that
+     * sum to one, so the cell holds the reconstructed radiance at its own
+     * centre. Averaging the stencil again applies the same kernel a second time
+     * (w^2), which is only harmless where the photon density is flat -- exactly
+     * what a caustic is not. Read the one cell the shading point lands in. */
+    /* Same cell-centred convention as the deposit (q = P/h - 0.5, centres on
+     * integer q). Without the -0.5 this picked the neighbouring cell whenever
+     * the surface sat past the half-cell mark, so the two layers summed below
+     * were not the two the deposit had written -- half the phases were read one
+     * cell too far and kept their error. */
+    const int cx = (int)floorf(P.x * inv - 0.5f);
+    const int cy = (int)floorf(P.y * inv - 0.5f);
+    const int cz = (int)floorf(P.z * inv - 0.5f);
+    const uint gx = (uint)cx, gy = (uint)cy, gz = (uint)cz;
+    const uint base = (hash_uint3(gx, gy, gz) & FALCON_SHARC_CELL_MASK) *
+                      FALCON_SHARC_CELL_STRIDE;
+    /* Sum along the normal, do not average. The deposit splits one photon
+     * across the two layers that straddle the surface with weights that add to
+     * one, so reading a single layer returns only that layer's share -- and
+     * which share depends on where the surface happens to fall between cell
+     * boundaries. Measured on ocean by sliding the seabed through one cell:
+     * the caustic core swings 0.85 / 1.04 / 0.85 / 1.04 with a half-cell
+     * period, purely from that phase. Adding both layers back recovers the
+     * whole photon regardless of phase. The tangent plane is a different
+     * question -- there the cells are neighbouring estimates of one field, so
+     * the fallback below still interpolates across them. */
+    /* When only one of the two layers is readable -- the other lost its slot to
+     * a distant site -- summing what is there returns just that layer's share
+     * of the photon, which is whatever the tent gave it. That share is not
+     * random noise but a fixed fraction, so the pixel comes out at a definite
+     * step below its neighbours: measured on ocean, the dark specks sit at
+     * 0.489x the surrounding median, one pixel wide. Recover the whole by
+     * dividing by the weight actually collected. The tent weights are the same
+     * ones the deposit used, so they can be recomputed here from the position. */
+    const float qn = ((normal_axis == 0) ? P.x : ((normal_axis == 1) ? P.y : P.z)) * inv - 0.5f;
+    const float fn = qn - floorf(qn);
+    /* nearest == 2: average the two tangential neighbours into each layer
+     * before summing the layers. Cells hold outgoing radiance (intensive) and
+     * the tangential weights below are renormalised to 1, so this is a blur,
+     * not a second division -- the total light is untouched and only the
+     * cell-scale shot noise gets smoothed. (The generic gather further down is
+     * a different thing: it averages ACROSS the normal layers too, which
+     * returns half a photon; that path exists only to fill holes.) */
+    const int soft = (nearest > 1) ? 1 : 0;
+    float tw[2][2];
+    if (soft) {
+      const int ta = (normal_axis == 0) ? 1 : 0;             /* tangent axes */
+      const int tb = (normal_axis == 2) ? 1 : 2;
+      const float qa = ((ta == 0) ? P.x : ((ta == 1) ? P.y : P.z)) * inv - 0.5f;
+      const float qb = ((tb == 0) ? P.x : ((tb == 1) ? P.y : P.z)) * inv - 0.5f;
+      const float fa = qa - floorf(qa), fb = qb - floorf(qb);
+      /* same gaussian the deposit splats with (sig2 = 0.5), renormalised */
+      const float a0 = expf(-(fa * fa) / 0.5f), a1 = expf(-((1.0f - fa) * (1.0f - fa)) / 0.5f);
+      const float b0 = expf(-(fb * fb) / 0.5f), b1 = expf(-((1.0f - fb) * (1.0f - fb)) / 0.5f);
+      const float na = 1.0f / (a0 + a1), nb = 1.0f / (b0 + b1);
+      tw[0][0] = a0 * na * b0 * nb;
+      tw[0][1] = a0 * na * b1 * nb;
+      tw[1][0] = a1 * na * b0 * nb;
+      tw[1][1] = a1 * na * b1 * nb;
+    }
+    float3 acc = make_float3(0.0f, 0.0f, 0.0f);
+    float wn = 0.0f;
+    for (int dn = 0; dn < 2; dn++) {
+      const uint nx = gx + ((normal_axis == 0) ? (uint)dn : 0u);
+      const uint ny = gy + ((normal_axis == 1) ? (uint)dn : 0u);
+      const uint nz = gz + ((normal_axis == 2) ? (uint)dn : 0u);
+      if (soft) {
+        const int ta = (normal_axis == 0) ? 1 : 0;
+        const int tb = (normal_axis == 2) ? 1 : 2;
+        float3 lay = make_float3(0.0f, 0.0f, 0.0f);
+        float lw = 0.0f;
+        for (int da = 0; da < 2; da++) {
+          for (int db = 0; db < 2; db++) {
+            const uint sx = nx + ((ta == 0) ? (uint)da : ((tb == 0) ? (uint)db : 0u));
+            const uint sy = ny + ((ta == 1) ? (uint)da : ((tb == 1) ? (uint)db : 0u));
+            const uint sz = nz + ((ta == 2) ? (uint)da : ((tb == 2) ? (uint)db : 0u));
+            const int s = falcon_photon_slot_read(cache, sx, sy, sz,
+                                                  falcon_photon_tag(sx, sy, sz));
+            if (s < 0) {
+              continue;
+            }
+            const float w = tw[da][db];
+            lay.x += cache[(uint)s + 0] * w;
+            lay.y += cache[(uint)s + 1] * w;
+            lay.z += cache[(uint)s + 2] * w;
+            lw += w;
+          }
+        }
+        if (lw > 1e-6f) {
+          /* Renormalise by the weight actually collected: a missing neighbour
+           * must not darken the layer, the same argument as the tent below. */
+          const float r = 1.0f / lw;
+          acc.x += lay.x * r;
+          acc.y += lay.y * r;
+          acc.z += lay.z * r;
+          wn += (dn == 0) ? (1.0f - fn) : fn;
+        }
+        continue;
+      }
+      const int nslot = falcon_photon_slot_read(cache, nx, ny, nz,
+                                                falcon_photon_tag(nx, ny, nz));
+      if (nslot < 0) {
+        continue;
+      }
+      const uint nbase = (uint)nslot;
+      acc.x += cache[nbase + 0];
+      acc.y += cache[nbase + 1];
+      acc.z += cache[nbase + 2];
+      wn += (dn == 0) ? (1.0f - fn) : fn;
+    }
+    if (wn > 1e-4f) {
+      const float rn = 1.0f / wn;
+      *radiance = make_float3(acc.x * rn, acc.y * rn, acc.z * rn);
+      return true;
+    }
+    /* The cell exists but a distant site took its slot, so its own flux is not
+     * readable. Fall through to the interpolating gather, which fills the hole
+     * from whichever neighbours still own their slots -- that is what the
+     * interpolation was there for. Reading nearest *first* keeps the deposit's
+     * own reconstruction intact everywhere it survived; only collisions pay the
+     * second kernel application. */
+  }
   const float qx = P.x * inv - 0.5f;
   const float qy = P.y * inv - 0.5f;
   const float qz = P.z * inv - 0.5f;
@@ -288,11 +520,12 @@ ccl_device_inline bool falcon_photon_lookup(ccl_global const float *cache,
         const uint gx = (uint)(bx + dx);
         const uint gy = (uint)(by + dy);
         const uint gz = (uint)(bz + dz);
-        const uint base = (hash_uint3(gx, gy, gz) & FALCON_SHARC_CELL_MASK) *
-                          FALCON_SHARC_CELL_STRIDE;
-        if (cache[base + 3] != falcon_photon_tag(gx, gy, gz)) {
-          continue; /* empty, or a hash-collision cell owned by another site */
+        const int slot = falcon_photon_slot_read(cache, gx, gy, gz,
+                                                 falcon_photon_tag(gx, gy, gz));
+        if (slot < 0) {
+          continue; /* empty, or no slot left on this cell's probe chain */
         }
+        const uint base = (uint)slot;
         acc.x += cache[base + 0] * w;
         acc.y += cache[base + 1] * w;
         acc.z += cache[base + 2] * w;

@@ -589,7 +589,43 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
     integrator->set_denoiser_quality(denoise_params.quality);
     integrator->set_denoiser_upscale_factor(denoise_params.upscale_factor);
     integrator->set_denoiser_carry_history(denoise_params.carry_history);
+    integrator->set_denoiser_preroll_passes(denoise_params.preroll_passes);
   }
+
+#ifdef WITH_FALCON_SHARC
+  /* Falcon knobs. Until now these only existed as process-global environment
+   * variables, which meant the viewport and the final render could not disagree
+   * and nothing was saved with the file. Read them from the scene here; the
+   * environment still overrides in device_update() for the A/B harnesses. */
+  {
+    const int sharc_mode = get_enum(cscene, "falcon_sharc_mode", 4, FALCON_SHARC_MODE_OFF);
+    integrator->set_falcon_sharc_mode(sharc_mode);
+    /* The bake operator has always driven both grids from the one cell size. */
+    integrator->set_falcon_sharc_cell(get_float(cscene, "falcon_photon_cell"));
+    integrator->set_falcon_sharc_alpha(get_float(cscene, "falcon_sharc_alpha"));
+    integrator->set_falcon_sharc_keep(get_float(cscene, "falcon_sharc_keep"));
+    integrator->set_falcon_sharc_cache(ustring(get_string(cscene, "falcon_sharc_cache")));
+    integrator->set_falcon_sharc_gate(get_boolean(cscene, "falcon_sharc_gate"));
+    integrator->set_falcon_sharc_gate_low(get_float(cscene, "falcon_sharc_gate_low"));
+    integrator->set_falcon_sharc_gate_high(get_float(cscene, "falcon_sharc_gate_high"));
+    integrator->set_falcon_dispersion_b(get_float(cscene, "falcon_photon_dispersion"));
+    integrator->set_falcon_photon_radius(get_float(cscene, "falcon_photon_radius"));
+    integrator->set_falcon_photon_point_radius_m(get_float(cscene, "falcon_photon_point_radius"));
+    integrator->set_falcon_photon_point_normal_deg(
+        get_float(cscene, "falcon_photon_point_normal_deg"));
+    integrator->set_falcon_photon_point_gain(get_float(cscene, "falcon_photon_point_gain"));
+    integrator->set_falcon_lt_gain(get_float(cscene, "falcon_lt_gain"));
+    integrator->set_falcon_lt_splat_radius(get_float(cscene, "falcon_lt_blur"));
+    integrator->set_falcon_lt_visibility(get_boolean(cscene, "falcon_lt_visibility"));
+    integrator->set_falcon_lt_direct(get_boolean(cscene, "falcon_lt_direct"));
+    integrator->set_falcon_das_map(ustring(get_string(cscene, "falcon_das_map")));
+    integrator->set_falcon_das_strength(get_float(cscene, "falcon_das_strength"));
+    integrator->set_falcon_error_map(ustring(get_string(cscene, "falcon_error_map")));
+    integrator->set_falcon_error_cell(get_float(cscene, "falcon_error_cell"));
+    integrator->set_falcon_error_threshold(get_float(cscene, "falcon_error_threshold"));
+    integrator->set_falcon_error_raise_alpha(get_boolean(cscene, "falcon_error_raise_alpha"));
+  }
+#endif
 
   /* UPDATE_NONE as we don't want to tag the integrator as modified (this was done by the
    * set calls above), but we need to make sure that the dependent things are tagged. */
@@ -940,8 +976,18 @@ void BlenderSync::sync_render_passes(blender::RenderLayer &b_rlay,
    * (otherwise the deposit silently finds no Position pass and does nothing).
    * Only add it if the render layer did not already request it. */
   {
-    const char *mode = getenv("FALCON_SHARC_MODE");
-    if (mode && (strcmp(mode, "warmup") == 0 || strcmp(mode, "live") == 0)) {
+    /* The mode now normally comes from the scene (see sync_integrator); the
+     * environment variable still wins so the harnesses keep working. */
+    blender::PointerRNA sharc_scene_ptr = RNA_id_pointer_create(&b_scene->id);
+    blender::PointerRNA sharc_cscene = RNA_pointer_get(&sharc_scene_ptr, "cycles");
+    int sharc_mode = get_enum(sharc_cscene, "falcon_sharc_mode", 4, FALCON_SHARC_MODE_OFF);
+    if (const char *mode = getenv("FALCON_SHARC_MODE")) {
+      sharc_mode = (strcmp(mode, "warmup") == 0) ? FALCON_SHARC_MODE_WARMUP :
+                   (strcmp(mode, "blend") == 0)  ? FALCON_SHARC_MODE_BLEND :
+                   (strcmp(mode, "live") == 0)   ? FALCON_SHARC_MODE_LIVE :
+                                                   FALCON_SHARC_MODE_OFF;
+    }
+    if (sharc_mode == FALCON_SHARC_MODE_WARMUP || sharc_mode == FALCON_SHARC_MODE_LIVE) {
       bool has_position = false;
       for (const Pass *pass : scene->passes) {
         if (pass->get_type() == PASS_POSITION) {
@@ -1209,6 +1255,29 @@ SessionParams BlenderSync::get_session_params(blender::RenderEngine &b_engine,
   if (background) {
     params.use_auto_tile = true;
     params.tile_size = max(get_int(cscene, "tile_size"), 8);
+
+    /* DLSS denoises the whole frame in one piece, so a tiled frame comes back
+     * written at the wrong stride. The tile size is not a memory limit -- auto
+     * tiling splits purely on this number -- so a 3440x1440 frame gets cut in
+     * two against the 2048 default and the render is refused (see
+     * Session::update_scene) even though it fits in VRAM with room to spare.
+     * Raise the tile size to cover the frame instead of making the user find
+     * this setting. Measured: 3440x1440 renders in 28s and 4K in 46s this way,
+     * both pixel-clean across where the seam would have been; 5K is where DLSS
+     * itself gives up ("GPU denoiser creation has failed"), which the guard
+     * still reports. */
+    const bool dlss_final = get_boolean(cscene, "use_denoising") &&
+                            get_enum(cscene, "denoiser", DENOISER_NUM, DENOISER_NONE) ==
+                                DENOISER_DLSS;
+    if (dlss_final) {
+      const int pct = b_scene.r.size;
+      const int frame_w = (b_scene.r.xsch * pct) / 100;
+      const int frame_h = (b_scene.r.ysch * pct) / 100;
+      const int frame_max = max(frame_w, frame_h);
+      if (params.tile_size < frame_max) {
+        params.tile_size = frame_max;
+      }
+    }
   }
   else {
     params.use_auto_tile = false;
@@ -1283,6 +1352,9 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
       /* Carry the RR history across animation frames (measured best temporal
        * stability); OFF restores the old per-frame reset. */
       denoising.carry_history = get_boolean(cscene, "denoising_carry_history");
+      /* Extra re-renders of the first animation frame that only fill the RR
+       * history; the kept pass is the last one. */
+      denoising.preroll_passes = get_int(cscene, "denoising_preroll_passes");
 
       switch ((DenoiserDLSSQuality)get_enum(
           cscene, "denoising_upscale_quality", DENOISER_DLSS_MODE_NUM, DENOISER_DLSS_MODE_DLAA))

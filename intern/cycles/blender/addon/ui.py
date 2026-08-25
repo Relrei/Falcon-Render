@@ -396,6 +396,10 @@ class CYCLES_RENDER_PT_sampling_render_denoise(CyclesButtonsPanel, Panel):
                 # 履歴持ち越し=アニメでRR履歴をフレーム間継承(実測でちらつき最小)。
                 # OFF=旧来のフレーム毎リセット。
                 col.prop(cscene, "denoising_carry_history", text="履歴持ち越し")
+                sub = col.column()
+                sub.active = cscene.denoising_carry_history
+                sub.prop(cscene, "denoising_preroll_passes",
+                         text="初回蓄積レンダリング回数")
             else:
                 col.label(text="DLSS対応GPUが見つからない", icon='INFO')
 
@@ -2652,6 +2656,8 @@ class CYCLES_RENDER_PT_falcon(CyclesButtonsPanel, Panel):
         self.layout.label(text="%s  %s" % (h[:9], stamp))
 
     def draw(self, context):
+        import os as _os
+        from . import operators as _fops
         layout = self.layout
         cscene = context.scene.cycles
         prefs = context.preferences.addons[__package__].preferences
@@ -2670,6 +2676,37 @@ class CYCLES_RENDER_PT_falcon(CyclesButtonsPanel, Panel):
             col.label(text="ビューポートデノイズ OFF", icon='INFO')
         if cscene.falcon_sharc_mode != 'OFF':
             col.label(text="SHARC: %s" % cscene.falcon_sharc_mode, icon='OUTLINER_OB_LIGHT')
+
+        # --- コースティクス自動化(Octane式: ガラス+ライトを置くだけで出す) ---
+        # レシピ知識ゼロで使える一本道。触りたい人向けの細部は下の子パネルに温存。
+        if cscene.falcon_auto_caustics == 'AUTO':
+            box = layout.box()
+            hdr = box.row(align=True)
+            hdr.label(text="コースティクス", icon='LIGHT_AREA')
+            hdr.prop(cscene, "falcon_auto_caustics", text="")
+            if _fops._falcon_caustics_active():
+                r = box.row(align=True)
+                r.label(text="有効 — レンダーに集光が出ます", icon='CHECKMARK')
+                r.operator("cycles.falcon_photon_clear", text="", icon='X')
+                # 強さは焼き直し不要の render-time ノブ(点マップ gain の env を更新)
+                box.prop(cscene, "falcon_photon_point_gain", text="強さ", slider=True)
+            elif _fops._falcon_scene_has_caustics(context.scene):
+                box.label(text="ガラス+ライトを検出", icon='CHECKMARK')
+                box.operator("cycles.falcon_auto_caustics", icon='SHADERFX')
+            else:
+                # 空状態=「最初の一手」を案内(黙って無反応にしない)
+                box.label(text="ガラス/屈折とライトを置くと出せます", icon='INFO')
+            # 清書コースティクス(LT): フォトンと別経路の仕上げ。検出時は常に選べる。
+            if _fops._falcon_scene_has_caustics(context.scene):
+                sub = box.column(align=True)
+                sub.operator("cycles.falcon_lt_clean_caustics",
+                             text="清書コースティクス (LT・数分)", icon='RENDER_STILL')
+                risk = _fops._falcon_lt_flood_risk(context.scene)
+                if risk:
+                    sub.label(text=risk, icon='ERROR')
+        else:
+            # OFF でも戻す導線を1行だけ残す(見つかる/Discoverability)
+            layout.prop(cscene, "falcon_auto_caustics", text="コースティクス自動化")
 
 
 
@@ -2710,13 +2747,27 @@ class CYCLES_RENDER_PT_falcon_photon(CyclesButtonsPanel, Panel):
         row = col.row(align=True)
         row.prop(cscene, "falcon_photon_gpu", text="GPU (速い)")
         row.prop(cscene, "falcon_photon_point", text="点マップ")
-        if cscene.falcon_photon_point and cscene.falcon_photon_gpu:
-            # Round 9 point map: these two are render-time knobs (no rebake)
+        if cscene.falcon_photon_gpu:
+            # The blur width is asked for in pixels and measured out in the
+            # scene, so it reads the same whether it ends up as a lookup radius
+            # (point map) or a cell size (grid).
             row = col.row(align=True)
-            row.prop(cscene, "falcon_photon_point_radius", text="半径(m)")
-            row.prop(cscene, "falcon_photon_point_gain", text="ゲイン")
+            row.prop(cscene, "falcon_photon_point_radius_auto", text="半径を自動")
+            if cscene.falcon_photon_point_radius_auto:
+                row.prop(cscene, "falcon_photon_point_radius_px", text="画素")
             row = col.row(align=True)
-            row.prop(cscene, "falcon_photon_point_maxpts", text="点上限")
+            sub = row.row()
+            sub.active = not cscene.falcon_photon_point_radius_auto
+            if cscene.falcon_photon_point:
+                sub.prop(cscene, "falcon_photon_point_radius", text="半径(m)")
+                row.prop(cscene, "falcon_photon_point_gain", text="ゲイン")
+            else:
+                sub.prop(cscene, "falcon_photon_cell", text="セル(m)")
+                row.prop(cscene, "falcon_photon_radius", text="広がり")
+            if cscene.falcon_photon_point:
+                row = col.row(align=True)
+                row.prop(cscene, "falcon_photon_point_maxpts", text="点上限")
+                row.prop(cscene, "falcon_photon_point_normal_deg", text="法線角(度)")
         else:
             row = col.row(align=True)
             row.prop(cscene, "falcon_photon_radius", text="滑らかさ")
@@ -2750,8 +2801,14 @@ class CYCLES_RENDER_PT_falcon_lt(CyclesButtonsPanel, Panel):
         row = col.row(align=True)
         row.prop(cscene, "falcon_lt_visibility", text="可視性 (遮蔽/ガラス越し除去)")
         row = col.row(align=True)
+        row.prop(cscene, "falcon_lt_direct", text="直接光の床も撒く (明るさ較正用)")
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_lt_guide_tiles", text="発射誘導")
+        row = col.row(align=True)
         row.prop(cscene, "falcon_lt_world", text="ワールド光子 (影の中の埋め込みコースティクス)")
         col.operator("cycles.falcon_lighttrace_render", icon='RENDER_STILL')
+        # 生パスが残っていれば、ゲイン/ぼかし変更は再レンダー不要で反映できる
+        col.operator("cycles.falcon_lt_recomposite", icon='FILE_REFRESH')
 
 
 class CYCLES_RENDER_PT_falcon_culling(CyclesButtonsPanel, Panel):
@@ -2823,6 +2880,10 @@ class CYCLES_RENDER_PT_falcon_sharc(CyclesButtonsPanel, Panel):
         sub.prop(cscene, "falcon_sharc_alpha", text="ブレンド", slider=True)
         if mode in {'BLEND', 'LIVE'}:
             sub.prop(cscene, "falcon_sharc_gate", text="自動GIゲート")
+            if cscene.falcon_sharc_gate:
+                gate = sub.row(align=True)
+                gate.prop(cscene, "falcon_sharc_gate_low", text="ゲート下限")
+                gate.prop(cscene, "falcon_sharc_gate_high", text="上限")
         if mode == 'LIVE':
             sub.prop(cscene, "falcon_sharc_keep", text="履歴保持", slider=True)
         sub.prop(cscene, "falcon_sharc_cache", text="キャッシュ")

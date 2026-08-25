@@ -16,6 +16,7 @@
 #include "scene/bake.h"
 #include "scene/camera.h"
 #include "scene/film.h"
+#include "kernel/integrator/falcon_sharc_size.h"
 #include "scene/integrator.h"
 #include "scene/light.h"
 #include "scene/object.h"
@@ -29,6 +30,7 @@
 
 #include "util/hash.h"
 #include "util/log.h"
+#include "util/path.h"
 #include "util/task.h"
 #include "util/time.h"
 
@@ -56,6 +58,133 @@ float2 HaltonSequence::next()
 {
   return make_float2(halton(a2, b2, 2) - 0.5f, halton(a3, b3, 3) - 0.5f);
 }
+
+#ifdef WITH_FALCON_SHARC
+/* Falcon knobs live on Integrator sockets (fed from the scene properties in
+ * sync.cpp), but the environment variable of the same name still wins when it
+ * is set: the measurement harnesses drive whole sweeps that way, and a stray
+ * export should keep behaving as it always has. A GUI session exports nothing,
+ * so there the socket -- i.e. the value saved in the .blend, per scene, and
+ * different between the viewport and the final render -- is what renders. */
+static float falcon_knob_float(const char *env_name, const float socket_value)
+{
+  const char *value = getenv(env_name);
+  return value ? (float)atof(value) : socket_value;
+}
+
+/* Presence means on, as it always did, except for an explicit "0". */
+static bool falcon_knob_flag(const char *env_name, const bool socket_value)
+{
+  const char *value = getenv(env_name);
+  return value ? strcmp(value, "0") != 0 : socket_value;
+}
+
+static string falcon_knob_string(const char *env_name, const ustring &socket_value)
+{
+  const char *value = getenv(env_name);
+  return value ? string(value) : string(socket_value.c_str());
+}
+
+static int falcon_knob_sharc_mode(const int socket_value)
+{
+  const char *value = getenv("FALCON_SHARC_MODE");
+  if (!value) {
+    return socket_value;
+  }
+  if (strcmp(value, "warmup") == 0) {
+    return FALCON_SHARC_MODE_WARMUP;
+  }
+  if (strcmp(value, "blend") == 0) {
+    return FALCON_SHARC_MODE_BLEND;
+  }
+  if (strcmp(value, "live") == 0) {
+    return FALCON_SHARC_MODE_LIVE;
+  }
+  return FALCON_SHARC_MODE_OFF;
+}
+
+/* ---------------------------------------------------------------------------
+ * Falcon の値は .blend から来る「外部入力」である (2026-08-21)
+ *
+ * scene.cycles の Falcon プロパティは PropertyGroup の IDProperty なので、
+ * .blend を読み込むときに RNA の min/max が当て直されない。実測: RNA 上限 8.0 の
+ * falcon_photon_radius に 1e9 を書いた .blend が 1000000000.0 のまま読み戻る。
+ * つまりここへ届く値は全部が無検証の外部入力で、ファイルを開いただけで踏める。
+ * 以下はその検証だけを足したもので、アルゴリズムには触っていない。
+ * ------------------------------------------------------------------------- */
+
+/* falcon_photon_deposit_wide() の三重ループの上限。RNA スライダと同じ 8。 */
+static const float FALCON_PHOTON_RADIUS_MAX = 8.0f;
+
+/* キャッシュファイルの置き場。ベイク操作 (operators.py の
+ * _falcon_photon_cache_paths) が使うのと同じディレクトリで、ここが唯一の
+ * 書き込み先になる。両方を直すときは片方だけ変えないこと。 */
+static string falcon_cache_dir()
+{
+  const char *xdg = getenv("XDG_CACHE_HOME");
+  string base;
+  if (xdg && xdg[0] != '\0') {
+    base = string(xdg);
+  }
+  else {
+    const char *home = getenv("HOME");
+    base = path_join(string(home && home[0] != '\0' ? home : "/tmp"), ".cache");
+  }
+  return path_join(base, "falcon_photon");
+}
+
+/* SHARC / フォトンキャッシュの書き込み先を、上のディレクトリの中へ閉じ込める。
+ *
+ * ここは検証がまったく無かった。LIVE モードは PathTrace::render_pipeline を
+ * 通る = Rendered シェーディングのビューポートで走るので、Rendered 状態で保存
+ * された .blend を開いた瞬間に path_trace.cpp が fopen(path,"wb") + 1GiB の
+ * fwrite を実行する。実測で、出荷バイナリが .blend に書かれた任意のパスを
+ * 1,073,741,824 バイトで上書きした (.spread / .meta も同時に作られる)。
+ *
+ * ベイク操作が作るパス (falcon_photon_*.bin / .L0 / _lt_scratch.bin) はどれも
+ * このディレクトリの中なので素通りする。外を指していたらベース名だけ取って
+ * 中へ移す。計測ハーネスのように外へ書きたいときだけ
+ * FALCON_SHARC_ALLOW_ABSOLUTE_CACHE=1 で従来どおりになる (既定は安全側)。 */
+static string falcon_confine_cache_path(const string &requested)
+{
+  if (requested.empty()) {
+    return requested;
+  }
+  if (getenv("FALCON_SHARC_ALLOW_ABSOLUTE_CACHE")) {
+    return requested;
+  }
+
+  const string dir = falcon_cache_dir();
+  const string prefix = dir + "/";
+  const string absolute = path_is_relative(requested) ? path_join(dir, requested) : requested;
+  const string normalized = path_normalize(absolute);
+
+  /* すでに中にいるなら何もしない。".." が残っていたら正規化で消えているはずだが、
+   * 残っていた場合は下のベース名扱いへ落とす。 */
+  if (normalized.size() > prefix.size() && normalized.compare(0, prefix.size(), prefix) == 0 &&
+      normalized.find("..") == string::npos)
+  {
+    return normalized;
+  }
+
+  string name = path_filename(requested);
+  for (size_t i = 0; i < name.size(); i++) {
+    if (name[i] == '/' || name[i] == '\\') {
+      name[i] = '_';
+    }
+  }
+  if (name.empty() || name == "." || name == "..") {
+    name = "falcon_sharc_cache.bin";
+  }
+  const string confined = path_join(dir, name);
+  /* ベイクを通さずに LIVE を使った場合、置き場がまだ無いことがある。 */
+  path_create_directories(confined);
+  LOG_WARNING << "Falcon: キャッシュの書き込み先 " << requested << " は "
+              << dir << " の外なので " << confined << " に読み替えました "
+              << "(FALCON_SHARC_ALLOW_ABSOLUTE_CACHE=1 で従来どおり)";
+  return confined;
+}
+#endif
 
 NODE_DEFINE(Integrator)
 {
@@ -201,6 +330,36 @@ NODE_DEFINE(Integrator)
   SOCKET_ENUM(denoiser_quality, "Denoiser Quality", denoiser_quality_enum, DENOISER_QUALITY_HIGH);
   SOCKET_FLOAT(denoiser_upscale_factor, "Denoiser Upscale Factor", 1.0f);
   SOCKET_BOOLEAN(denoiser_carry_history, "Denoiser Carry History", false);
+  SOCKET_INT(denoiser_preroll_passes, "Denoiser Preroll Passes", 4);
+
+#ifdef WITH_FALCON_SHARC
+  /* Falcon knobs, see integrator.h. Defaults repeat the values device_update()
+   * used when the matching environment variable was absent, so a scene that
+   * never touches them renders exactly as before. */
+  SOCKET_INT(falcon_sharc_mode, "Falcon SHARC Mode", FALCON_SHARC_MODE_OFF);
+  SOCKET_FLOAT(falcon_sharc_cell, "Falcon SHARC Cell Size", 0.2f);
+  SOCKET_FLOAT(falcon_sharc_alpha, "Falcon SHARC Blend", 0.7f);
+  SOCKET_FLOAT(falcon_sharc_keep, "Falcon SHARC Live Keep", 0.9f);
+  SOCKET_STRING(falcon_sharc_cache, "Falcon SHARC Cache File", ustring());
+  SOCKET_BOOLEAN(falcon_sharc_gate, "Falcon SHARC Auto GI Gate", true);
+  SOCKET_FLOAT(falcon_sharc_gate_low, "Falcon SHARC Gate Low", 0.15f);
+  SOCKET_FLOAT(falcon_sharc_gate_high, "Falcon SHARC Gate High", 0.40f);
+  SOCKET_FLOAT(falcon_dispersion_b, "Falcon Dispersion B", 0.0f);
+  SOCKET_FLOAT(falcon_photon_radius, "Falcon Photon Deposit Radius", 3.0f);
+  SOCKET_FLOAT(falcon_photon_point_radius_m, "Falcon Photon Point Radius", 0.03f);
+  SOCKET_FLOAT(falcon_photon_point_normal_deg, "Falcon Photon Point Normal Cone", 30.0f);
+  SOCKET_FLOAT(falcon_photon_point_gain, "Falcon Photon Point Gain", 1.0f);
+  SOCKET_FLOAT(falcon_lt_gain, "Falcon LT Gain", 1.0f);
+  SOCKET_FLOAT(falcon_lt_splat_radius, "Falcon LT Splat Radius", 0.0f);
+  SOCKET_BOOLEAN(falcon_lt_visibility, "Falcon LT Visibility", false);
+  SOCKET_BOOLEAN(falcon_lt_direct, "Falcon LT Direct Floor", false);
+  SOCKET_STRING(falcon_das_map, "Falcon DAS Map", ustring());
+  SOCKET_FLOAT(falcon_das_strength, "Falcon DAS Strength", 1.0f);
+  SOCKET_STRING(falcon_error_map, "Falcon Error Field File", ustring());
+  SOCKET_FLOAT(falcon_error_cell, "Falcon Error Field Cell Size", 0.8f);
+  SOCKET_FLOAT(falcon_error_threshold, "Falcon Error Termination Threshold", 0.0f);
+  SOCKET_BOOLEAN(falcon_error_raise_alpha, "Falcon Error Field May Take The Cache", false);
+#endif
 
   return type;
 }
@@ -427,47 +586,84 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
    * Everything below is gated on this so a normal render pays nothing: no 64 MB
    * cache allocation and (via falcon_sharc_active) no in-kernel cache lookup. */
   {
-    const char *mode = getenv("FALCON_SHARC_MODE");
-    const bool sharc_active = mode &&
-                              (strcmp(mode, "warmup") == 0 || strcmp(mode, "blend") == 0 ||
-                               strcmp(mode, "live") == 0);
+    const int sharc_mode = falcon_knob_sharc_mode(falcon_sharc_mode);
+    const bool sharc_active = sharc_mode != FALCON_SHARC_MODE_OFF;
     kintegrator->falcon_sharc_active = sharc_active ? 1 : 0;
+
+    /* Hand the render loop the knobs it needs but the kernel does not, resolved
+     * here once so path_trace.cpp never has to read the environment itself. */
+    dscene->falcon_sharc_mode = sharc_mode;
+    const string cache_setting = falcon_confine_cache_path(
+        falcon_knob_string("FALCON_SHARC_CACHE", falcon_sharc_cache));
+    dscene->falcon_sharc_cache_path = cache_setting.empty() ?
+                                          string("/tmp/falcon_sharc_cache.bin") :
+                                          cache_setting;
+    const float keep = falcon_knob_float("FALCON_SHARC_KEEP", falcon_sharc_keep);
+    dscene->falcon_sharc_keep = keep < 0.0f ? 0.0f : (keep > 1.0f ? 1.0f : keep);
 
     /* Grid resolution shared by SHARC and the photon cache. Runtime knob so
      * caustic-scale grids (0.05-0.1) need no rebuild; must match the cell
      * size the host tracer used when depositing. */
-    float cell = 0.2f;
-    const char *cell_env = getenv("FALCON_SHARC_CELL");
-    if (cell_env) {
-      cell = (float)atof(cell_env);
-      cell = cell > 1e-4f ? cell : 0.2f;
-    }
+    float cell = falcon_knob_float("FALCON_SHARC_CELL", falcon_sharc_cell);
+    cell = cell > 1e-4f ? cell : 0.2f;
     kintegrator->falcon_sharc_cell_size = cell;
 
     /* Falcon Dispersion v0: global on-demand spectral knob. Cauchy B in um^2
      * (BK7 0.0042 / flint 0.013 / movie 0.030); 0 = off, zero overhead. */
-    float dispersion_b = 0.0f;
-    const char *dispersion_env = getenv("FALCON_DISPERSION_B");
-    if (dispersion_env) {
-      dispersion_b = (float)atof(dispersion_env);
-      dispersion_b = dispersion_b > 0.0f ? dispersion_b : 0.0f;
-    }
+    float dispersion_b = falcon_knob_float("FALCON_DISPERSION_B", falcon_dispersion_b);
+    dispersion_b = dispersion_b > 0.0f ? dispersion_b : 0.0f;
     kintegrator->falcon_dispersion_b = dispersion_b;
 
     /* Falcon Photon map deposit radius (cells). FALCON_PHOTON_RADIUS, default 3
-     * = kernel density estimation footprint; <=1 falls back to the 2x2x2 splat. */
-    float photon_radius = 3.0f;
-    const char *pradius_env = getenv("FALCON_PHOTON_RADIUS");
-    if (pradius_env) {
-      const float pr = (float)atof(pradius_env);
-      photon_radius = pr > 0.0f ? pr : 3.0f;
+     * = kernel density estimation footprint; <=1 falls back to the 2x2x2 splat.
+     *
+     * The upper clamp is not cosmetic. falcon_photon_deposit_wide() walks
+     * (2*ceil(r)+1)^3 cells per photon, so the cost is cubic in this number and
+     * a big enough value hangs the GPU until the driver watchdog fires. The RNA
+     * slider stops at 8, but a PropertyGroup IDProperty is NOT re-clamped when a
+     * .blend is loaded (measured: 1e9 written into the file reads back as 1e9),
+     * so the value arriving here is untrusted input. Clamp to the same 8 the UI
+     * shows -- inside the slider's range nothing changes. */
+    const float pr = falcon_knob_float("FALCON_PHOTON_RADIUS", falcon_photon_radius);
+    if (pr > FALCON_PHOTON_RADIUS_MAX) {
+      LOG_WARNING << "Falcon: コースティクスの広がり " << pr << " は上限 "
+                  << FALCON_PHOTON_RADIUS_MAX << " を超えているので切り詰めました "
+                  << "(この値のまま焼くと GPU が返ってきません)";
     }
-    kintegrator->falcon_photon_radius = photon_radius;
+    kintegrator->falcon_photon_radius = pr > 0.0f ?
+                                            (pr > FALCON_PHOTON_RADIUS_MAX ?
+                                                 FALCON_PHOTON_RADIUS_MAX :
+                                                 pr) :
+                                            3.0f;
 
     /* Falcon Photon Cache: FALCON_PHOTON_MODE=add + FALCON_SHARC_CACHE file
      * (written by tools/falcon_photon_trace.py). Loads into the same buffer as
      * SHARC -- the two modes share storage and are not meant to run together. */
     kintegrator->falcon_photon_add = 0;
+    /* Restrict cache lookups to surfaces the bake could have deposited on.
+     * FALCON_PHOTON_NO_LOOKUP_GATE=1 restores the old look-everywhere
+     * behaviour for A/B. */
+    kintegrator->falcon_photon_lookup_gate = getenv("FALCON_PHOTON_NO_LOOKUP_GATE") ? 0 : 1;
+    /* How many diffuse vertices may add the layer (FALCON_PHOTON_LOOKUP_BOUNCES,
+     * 0 = every one of them, which is the behaviour up to 2026-08-15). */
+    kintegrator->falcon_photon_lookup_bounces = (int)falcon_knob_float(
+        "FALCON_PHOTON_LOOKUP_BOUNCES", 0.0f);
+    /* Deposit radius (cells) for photons whose last segment is under 2 cells,
+     * i.e. the caster is touching the receiver. 0 = off. */
+    kintegrator->falcon_photon_contact_radius = falcon_knob_float(
+        "FALCON_PHOTON_CONTACT_RADIUS", 0.0f);
+    kintegrator->falcon_photon_contact_cells = falcon_knob_float(
+        "FALCON_PHOTON_CONTACT_CELLS", 2.0f);
+    /* Grid lookup: read the single cell the shading point falls in, instead
+     * of averaging the deposit stencil a second time. FALCON_PHOTON_INTERP=1
+     * restores the old interpolating read for A/B. */
+    /* 0 = the hole-filling gather (halves the light: it averages across the
+     * normal layers too), 1 = read the cell the shading point lands in,
+     * 2 = same but averaged over the tangential neighbours first (a blur that
+     * keeps the total; FALCON_PHOTON_SOFT). */
+    kintegrator->falcon_photon_nearest = getenv("FALCON_PHOTON_INTERP") ?
+                                             0 :
+                                             (getenv("FALCON_PHOTON_HARD") ? 1 : 2);
     kintegrator->falcon_photon_pass = 0;
     kintegrator->falcon_photon_is_world = 0;
     kintegrator->falcon_photon_point_store = 0;
@@ -489,12 +685,13 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
      * until the camera importance We is calibrated. */
     if (getenv("FALCON_LIGHTTRACE") && strcmp(getenv("FALCON_LIGHTTRACE"), "1") == 0) {
       kintegrator->falcon_lighttrace = 1;
-      const char *ltg = getenv("FALCON_LIGHTTRACE_GAIN");
-      kintegrator->falcon_lighttrace_gain = ltg ? (float)atof(ltg) : 1.0f;
+      kintegrator->falcon_lighttrace_gain = falcon_knob_float("FALCON_LIGHTTRACE_GAIN",
+                                                              falcon_lt_gain);
       /* FALCON_LT_DIRECT=1 also splats the bounce-0 direct diffuse hit (not a
        * caustic) so its floor radiance can be matched to E*albedo/pi -- the
        * absolute-brightness calibration control. Off for real caustic renders. */
-      kintegrator->falcon_lt_direct = getenv("FALCON_LT_DIRECT") ? 1 : 0;
+      kintegrator->falcon_lt_direct = falcon_knob_flag("FALCON_LT_DIRECT", falcon_lt_direct) ? 1 :
+                                                                                              0;
       /* SPP of the driving render: the splat is multiplied by it to cancel the
        * combined pass's /sample_count divide (see falcon_lighttrace.h). Must
        * match cs.samples; fixed (non-adaptive) sampling only. */
@@ -502,16 +699,16 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
       kintegrator->falcon_lt_samples = lts ? atoi(lts) : 1;
       /* FALCON_LT_SPLAT_RADIUS (px): Gaussian splat-reconstruction blur, the
        * labeled non-physical smoothness-for-photons trade (0 = physical). */
-      const char *ltsr = getenv("FALCON_LT_SPLAT_RADIUS");
-      if (ltsr) {
-        const float r = (float)atof(ltsr);
-        kintegrator->falcon_lt_splat_radius = r > 0.0f ? r : 0.0f;
-      }
+      const float r = falcon_knob_float("FALCON_LT_SPLAT_RADIUS", falcon_lt_splat_radius);
+      kintegrator->falcon_lt_splat_radius = r > 0.0f ? r : 0.0f;
       /* FALCON_LT_VISIBILITY: occlusion ray vertex->camera before splatting.
        * Needs the raytrace kernel variant -- get_kernel_features() adds
        * KERNEL_FEATURE_NODE_RAYTRACE and intersect_closest routes all shading
        * there while this is set. */
-      kintegrator->falcon_lt_visibility = getenv("FALCON_LT_VISIBILITY") ? 1 : 0;
+      kintegrator->falcon_lt_visibility = falcon_knob_flag("FALCON_LT_VISIBILITY",
+                                                           falcon_lt_visibility) ?
+                                              1 :
+                                              0;
     }
 
     /* GPU photon bake: the render becomes a photon pass (init_from_camera
@@ -540,9 +737,31 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
      * the CUDA queue on the second render call ("Illegal address ... in
      * integrator_sorted_paths_array"), so device_vector state apparently isn't
      * safe to keep across separate render invocations. File-level merging
-     * avoids touching that lifecycle at all. Kept as `false` rather than
-     * removed so the reset logic stays in one place if revisited. */
+     * avoids touching that lifecycle at all.
+     *
+     * FALCON_PHOTON_ACCUM=1 accumulates through the FILE instead: start this
+     * pass from the cache the previous one wrote, rather than from zeros. That
+     * is the same alloc-and-upload the add-mode path already does every render,
+     * so it does not touch the device_vector lifecycle that crashed.
+     *
+     * It exists because file-level merging cannot survive collision probing
+     * (falcon_sharc.h): a site takes the first FREE slot on its chain, and
+     * which slot that is depends on what else was already in the table, so two
+     * independently baked passes put the same site in different slots and
+     * summing the files element-wise mixes strangers. Measured on ocean at
+     * shipping resolution, merging a lamp pass with a sky pass put 253 dark
+     * specks into a frame that had 0 -- one site's light split across two
+     * slots, each read back as a fixed step below its neighbours. Accumulating
+     * through the file makes the second pass see the first pass's tags, so it
+     * probes to the same answer. */
     const bool accumulate = false;
+    /* ...and this one is the file-based version, which is NOT the same thing:
+     * `accumulate` above means "the device buffer from the previous render is
+     * still live, do not re-upload the host copy", and the point-map buffers
+     * below rely on that reading (turning it on for them skips zeroing the
+     * point counter -- the device then appends at a garbage index and the
+     * whole context dies with an illegal address, measured 2026-08-14). */
+    const bool grid_accumulate = getenv("FALCON_PHOTON_ACCUM") != nullptr;
     /* FALCON_PHOTON_WORLD=<L>: photon pass emitting from a uniform environment
      * of radiance L instead of a lamp (the world pass runs with every lamp
      * hidden, so photon_light is null then). Covers the world->glass->shadow
@@ -553,14 +772,29 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
                                 nullptr;
     const float world_radiance = world_env ? (float)atof(world_env) : 0.0f;
     if (photon_light || world_radiance > 0.0f) {
-      const size_t floats = (size_t(1) << 22) * 4;
+      const size_t floats = size_t(FALCON_SHARC_CELL_COUNT) * FALCON_SHARC_CELL_STRIDE;
       if (dscene->falcon_sharc_cache.size() != floats) {
         if (dscene->falcon_sharc_cache.size() != 0) {
           dscene->falcon_sharc_cache.free();
         }
         dscene->falcon_sharc_cache.alloc(floats);
       }
-      if (!accumulate) {
+      bool loaded = false;
+      if (grid_accumulate) {
+        /* Start from what the previous pass wrote. A missing or short file is
+         * not an error -- the first pass of a bake has nothing to read. */
+        FILE *pf = fopen(dscene->falcon_sharc_cache_path.c_str(), "rb");
+        if (pf) {
+          loaded = fread(dscene->falcon_sharc_cache.data(), sizeof(float), floats, pf) == floats;
+          fclose(pf);
+          if (loaded) {
+            dscene->falcon_sharc_cache.copy_to_device();
+            LOG_INFO << "Falcon Photon: accumulating into "
+                     << dscene->falcon_sharc_cache_path;
+          }
+        }
+      }
+      if (!loaded) {
         memset(dscene->falcon_sharc_cache.data(), 0, floats * sizeof(float));
         dscene->falcon_sharc_cache.copy_to_device();
       }
@@ -571,11 +805,23 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
       if (n_env) {
         n_photons = atof(n_env);
       }
-      float gain = 1.0f;
-      const char *gain_env = getenv("FALCON_PHOTON_GAIN");
-      if (gain_env) {
-        gain = (float)atof(gain_env);
-      }
+      /* ★焼き側では gain を掛けない(2026-08-16)。
+       *
+       * 以前はここでも掛けていて、読み出し側(shade_surface.h の
+       * `cached *= falcon_photon_point_gain`)と**二重に掛かって g^2** に
+       * なっていた。既定 1.0 では 1^2 = 1 なので出荷状態では気づけず、
+       * スライダーを動かした時だけ効きが二乗になる。
+       * 実測(glasszoo_worldfit・点マップ): gain 1 -> 2 で層の合計が
+       * 181.8 -> 727.2、比ちょうど 4.000(正常なら 2.0)。
+       *
+       * どちらを残すかは説明文が決めている —— properties.py は
+       * "applied at lookup time" かつ "Takes effect on the next render,
+       * WITHOUT rebaking" と書いてある。**焼き側に掛けるとその約束が破れる**
+       * (焼き直さないと変わらなくなる)ので、外すのは焼き側。
+       *
+       * 環境変数 FALCON_PHOTON_GAIN は焼きの光束を直接いじる逃げ道として
+       * 残す(既定は 1.0 = 掛けない)。 */
+      const float gain = falcon_knob_float("FALCON_PHOTON_GAIN", 1.0f);
       kintegrator->falcon_photon_pass = 1;
 
       Light *light = photon_light;
@@ -645,7 +891,41 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
         const SpotLight *spot = dynamic_cast<const SpotLight *>(light);
         const float cos_half = cosf((spot ? spot->get_angle() : M_PI_F) * 0.5f);
         const float omega = M_2PI_F * (1.0f - cos_half);
-        kintegrator->falcon_photon_flux = (float)(watts * (omega / (4.0f * M_PI_F)) * gain /
+        double share = 1.0;
+
+        /* FALCON_PHOTON_TILE="ti,tj,n": emit only from tile (ti,tj) of an n x n
+         * split of the cone's sampling square (u = the uniform cos-parameter,
+         * v = the azimuth). Uniform cone sampling makes that split an exact
+         * partition of the solid angle, so each tile carries 1/n^2 of the
+         * power and the n^2 tiles add up to the untiled pass -- but each tile
+         * can be given its own photon count. That is what emission guiding
+         * needs: the guide field says the caustic fringe is still noisy while
+         * its core has converged, and the fringe is fed by particular
+         * directions out of this cone.
+         *
+         * The window rides in the sun_* fields, which the spot path does not
+         * otherwise use, so no kernel data layout changes (see the 5.2 port
+         * lesson about float2 alignment in data_template.h). sizex == 0 means
+         * "no window", which is what every existing scene has. */
+        kintegrator->falcon_photon_sun_minx = 0.0f;
+        kintegrator->falcon_photon_sun_miny = 0.0f;
+        kintegrator->falcon_photon_sun_sizex = 0.0f;
+        kintegrator->falcon_photon_sun_sizey = 0.0f;
+        const char *tile_env = getenv("FALCON_PHOTON_TILE");
+        int ti = 0, tj = 0, tn = 0;
+        if (tile_env && sscanf(tile_env, "%d,%d,%d", &ti, &tj, &tn) == 3 && tn > 0 && ti >= 0 &&
+            tj >= 0 && ti < tn && tj < tn)
+        {
+          const float step = 1.0f / tn;
+          kintegrator->falcon_photon_sun_minx = ti * step;
+          kintegrator->falcon_photon_sun_miny = tj * step;
+          kintegrator->falcon_photon_sun_sizex = step;
+          kintegrator->falcon_photon_sun_sizey = step;
+          share = double(step) * double(step);
+          LOG_INFO << "Falcon Photon: spot cone tile " << ti << "," << tj << " of " << tn << "x"
+                   << tn << " (solid-angle share " << share << ")";
+        }
+        kintegrator->falcon_photon_flux = (float)(watts * (omega / (4.0f * M_PI_F)) * share * gain /
                                                   n_photons);
       }
 
@@ -693,6 +973,30 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
             kintegrator->falcon_photon_sun_sizey = 2.0f * pad;
             LOG_INFO << "Falcon Photon: sun launch targeted at (" << tc[0] << ", " << tc[1]
                      << ", " << tc[2] << ") r " << tc[3] << ", pad " << pad;
+          }
+
+          /* FALCON_PHOTON_TILE="ti,tj,n": launch only from tile (ti,tj) of an
+           * n x n split of the square computed above. The tiles partition it
+           * exactly, so rendering all n^2 tiles and adding the layers gives the
+           * same total energy as one untiled pass -- with each tile free to
+           * spend its own photon count. That is the knob emission guiding needs:
+           * the fringe of a caustic (where the guide field says the light
+           * tracer is still noisy) can be fed more photons than its converged
+           * core, without touching the kernel. The split happens here because
+           * this is where the launch square is known. */
+          const char *tile_env = getenv("FALCON_PHOTON_TILE");
+          int ti = 0, tj = 0, tn = 0;
+          if (tile_env && sscanf(tile_env, "%d,%d,%d", &ti, &tj, &tn) == 3 && tn > 0 && ti >= 0 &&
+              tj >= 0 && ti < tn && tj < tn)
+          {
+            const float tw = kintegrator->falcon_photon_sun_sizex / tn;
+            const float th = kintegrator->falcon_photon_sun_sizey / tn;
+            kintegrator->falcon_photon_sun_minx += ti * tw;
+            kintegrator->falcon_photon_sun_miny += tj * th;
+            kintegrator->falcon_photon_sun_sizex = tw;
+            kintegrator->falcon_photon_sun_sizey = th;
+            LOG_INFO << "Falcon Photon: launch tile " << ti << "," << tj << " of " << tn << "x"
+                     << tn << " (" << tw << " x " << th << " m)";
           }
 
           const float area = kintegrator->falcon_photon_sun_sizex *
@@ -769,22 +1073,12 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
           }
           float *pts = dscene->falcon_photon_points.data();
           if (fread(pts, sizeof(float), pfloats, pf) == pfloats) {
-            float radius = 0.03f;
-            const char *radius_env = getenv("FALCON_PHOTON_RADIUS_M");
-            if (radius_env) {
-              radius = (float)atof(radius_env);
-            }
+            float radius = falcon_knob_float("FALCON_PHOTON_RADIUS_M",
+                                             falcon_photon_point_radius_m);
             radius = radius > 1e-4f ? radius : 1e-4f;
-            float normal_deg = 30.0f;
-            const char *ndeg_env = getenv("FALCON_PHOTON_NORMAL_DEG");
-            if (ndeg_env) {
-              normal_deg = (float)atof(ndeg_env);
-            }
-            float gain = 1.0f;
-            const char *gain_env2 = getenv("FALCON_PHOTON_GAIN");
-            if (gain_env2) {
-              gain = (float)atof(gain_env2);
-            }
+            const float normal_deg = falcon_knob_float("FALCON_PHOTON_NORMAL_DEG",
+                                                       falcon_photon_point_normal_deg);
+            const float gain = falcon_knob_float("FALCON_PHOTON_GAIN", falcon_photon_point_gain);
 
             /* Counting sort of photon indices into the uniform neighbor grid
              * (cell = radius; slot = hash_uint3 of cell coords). */
@@ -853,11 +1147,10 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
       }
 
       if (!kintegrator->falcon_photon_point_mode) {
-        const char *cache_env = getenv("FALCON_SHARC_CACHE");
-        const char *path = cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin";
-        FILE *f = fopen(path, "rb");
+        const string &path = dscene->falcon_sharc_cache_path;
+        FILE *f = fopen(path.c_str(), "rb");
         if (f) {
-          const size_t floats = (size_t(1) << 22) * 4;
+          const size_t floats = size_t(FALCON_SHARC_CELL_COUNT) * FALCON_SHARC_CELL_STRIDE;
           if (dscene->falcon_sharc_cache.size() != floats) {
             if (dscene->falcon_sharc_cache.size() != 0) {
               dscene->falcon_sharc_cache.free();
@@ -879,9 +1172,9 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
     if (sharc_active) {
       /* Allocate and zero the spatial hash radiance cache. Size must match
        * FALCON_SHARC_CELL_COUNT * FALCON_SHARC_CELL_STRIDE in
-       * kernel/integrator/falcon_sharc.h (4M cells * 4 floats = 64 MB). Read-only
+       * kernel/integrator/falcon_sharc.h (64M cells * 4 floats = 1 GB). Read-only
        * from the kernel; the host fills it during the warmup pass. */
-      const size_t falcon_sharc_floats = (size_t(1) << 22) * 4;
+      const size_t falcon_sharc_floats = size_t(FALCON_SHARC_CELL_COUNT) * FALCON_SHARC_CELL_STRIDE;
       if (dscene->falcon_sharc_cache.size() != falcon_sharc_floats) {
         if (dscene->falcon_sharc_cache.size() != 0) {
           dscene->falcon_sharc_cache.free();
@@ -894,12 +1187,8 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
 
       /* Blend factor: runtime knob via FALCON_SHARC_ALPHA (default 0.7, clamped
        * to [0,1]). Uploaded in kernel_data so tuning needs no recompile. */
-      float alpha = 0.7f;
-      const char *alpha_env = getenv("FALCON_SHARC_ALPHA");
-      if (alpha_env) {
-        alpha = (float)atof(alpha_env);
-        alpha = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
-      }
+      float alpha = falcon_knob_float("FALCON_SHARC_ALPHA", falcon_sharc_alpha);
+      alpha = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
 
       /* Auto GI gate: SHARC helps GI-dominated scenes but hurts direct-lit ones
        * (Phase0 data), so scale alpha by the scene's GI dominance measured during
@@ -907,26 +1196,17 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
        * smoothsteps from off below GATE_LOW to full above GATE_HIGH, so a direct-
        * lit scene self-disables SHARC. Only for blend/live (warmup's blend is a
        * no-op). Missing meta or FALCON_SHARC_GATE=0 -> no gating (alpha as-is). */
-      const bool is_blend = strcmp(mode, "blend") == 0 || strcmp(mode, "live") == 0;
-      const char *gate_env = getenv("FALCON_SHARC_GATE");
-      const bool gate_on = !(gate_env && strcmp(gate_env, "0") == 0);
+      const bool is_blend = sharc_mode == FALCON_SHARC_MODE_BLEND ||
+                            sharc_mode == FALCON_SHARC_MODE_LIVE;
+      const bool gate_on = falcon_knob_flag("FALCON_SHARC_GATE", falcon_sharc_gate);
       if (is_blend && gate_on) {
-        const char *cache_env = getenv("FALCON_SHARC_CACHE");
-        const string meta_path = string(cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin") +
-                                 ".meta";
+        const string meta_path = dscene->falcon_sharc_cache_path + ".meta";
         FILE *mf = fopen(meta_path.c_str(), "r");
         if (mf) {
           float gi_ratio = 1.0f;
           if (fscanf(mf, "%f", &gi_ratio) == 1) {
-            float low = 0.15f, high = 0.40f;
-            const char *lo = getenv("FALCON_SHARC_GATE_LOW");
-            const char *hi = getenv("FALCON_SHARC_GATE_HIGH");
-            if (lo) {
-              low = (float)atof(lo);
-            }
-            if (hi) {
-              high = (float)atof(hi);
-            }
+            const float low = falcon_knob_float("FALCON_SHARC_GATE_LOW", falcon_sharc_gate_low);
+            const float high = falcon_knob_float("FALCON_SHARC_GATE_HIGH", falcon_sharc_gate_high);
             float t = (high > low) ? (gi_ratio - low) / (high - low) : (gi_ratio >= high);
             t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
             const float gate = t * t * (3.0f - 2.0f * t);
@@ -955,16 +1235,30 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
    * threshold-scale map built by the OIDN probe (raw file: int32 width, int32
    * height, then width*height float32 scales, render_pixel_index order). Only
    * valid for full-frame renders at exactly that resolution: the kernel indexes
-   * the map by render_pixel_index, so border/tiled renders would misalign. */
+   * the map by render_pixel_index, so border/tiled renders would misalign.
+   *
+   * That "only valid at exactly that resolution" was a comment, not a check
+   * (2026-08-21). The header's dims sized the allocation while the kernel kept
+   * indexing by render_pixel_index, so a 12-byte das.raw claiming 1x1 next to a
+   * 1920x1080 render had the kernel read up to 2.07M floats out of a 4-byte
+   * allocation -- and the path arrives from the .blend, which is not re-clamped
+   * on load. Two things now stop it: the resolution has to match here, and the
+   * kernel bounds-checks the index (falcon_das_active carries the element
+   * count). Neither changes anything for a correctly built map. */
   {
     kintegrator->falcon_das_active = 0;
     kintegrator->falcon_das_strength = 0.0f;
-    const char *map_path = getenv("FALCON_DAS_MAP");
-    if (map_path && map_path[0]) {
-      FILE *f = fopen(map_path, "rb");
+    const string map_path = falcon_knob_string("FALCON_DAS_MAP", falcon_das_map);
+    if (!map_path.empty()) {
+      const int render_width = scene->camera ? scene->camera->get_full_width() : 0;
+      const int render_height = scene->camera ? scene->camera->get_full_height() : 0;
+      FILE *f = fopen(map_path.c_str(), "rb");
       if (f) {
         int32_t dims[2] = {0, 0};
-        if (fread(dims, sizeof(int32_t), 2, f) == 2 && dims[0] > 0 && dims[1] > 0) {
+        const bool header_ok = (fread(dims, sizeof(int32_t), 2, f) == 2);
+        if (header_ok && dims[0] > 0 && dims[1] > 0 && dims[0] == render_width &&
+            dims[1] == render_height)
+        {
           const size_t count = (size_t)dims[0] * (size_t)dims[1];
           if (dscene->falcon_das_scale.size() != count) {
             if (dscene->falcon_das_scale.size() != 0) {
@@ -976,22 +1270,81 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
           if (fread(map, sizeof(float), count, f) == count) {
             dscene->falcon_das_scale.copy_to_device();
             dscene->falcon_das_scale.clear_modified();
-            float strength = 1.0f;
-            const char *strength_env = getenv("FALCON_DAS_STRENGTH");
-            if (strength_env) {
-              strength = (float)atof(strength_env);
-            }
-            kintegrator->falcon_das_active = 1;
+            const float strength = falcon_knob_float("FALCON_DAS_STRENGTH", falcon_das_strength);
+            kintegrator->falcon_das_active = (int)count;
             kintegrator->falcon_das_strength = strength;
             LOG_INFO << "Falcon DAS: loaded " << dims[0] << "x" << dims[1]
                      << " threshold-scale map (strength " << strength << ")";
           }
+        }
+        else {
+          LOG_WARNING << "Falcon DAS: " << map_path << " は " << dims[0] << "x" << dims[1]
+                      << " で、このレンダーの " << render_width << "x" << render_height
+                      << " と一致しないので使いません";
         }
         fclose(f);
       }
     }
     if (!kintegrator->falcon_das_active && dscene->falcon_das_scale.size() != 0) {
       dscene->falcon_das_scale.free();
+    }
+  }
+
+  /* Falcon error field: the measured relative error per world cell, written by
+   * the probe tooling (cyclesf-lab/tools). One float per SHARC hash slot, in
+   * the same hash the kernel uses, with a negative value for cells the probe
+   * never reached. Armed only when a threshold is set, so a scene that does
+   * not opt in pays neither the 16 MB nor the lookup. */
+  {
+    kintegrator->falcon_error_cell_size = 0.8f;
+    kintegrator->falcon_error_threshold = 0.0f;
+    kintegrator->falcon_error_raise_alpha = 0;
+    /* falcon_error_pad1 は falcon_photon_contact_cells になった(上で設定済み) */
+    const float threshold = falcon_knob_float("FALCON_ERROR_THRESHOLD", falcon_error_threshold);
+    const string field_path = falcon_knob_string("FALCON_ERROR_FIELD", falcon_error_map);
+    if (threshold > 0.0f && !field_path.empty()) {
+      FILE *f = fopen(field_path.c_str(), "rb");
+      if (f) {
+        uint32_t header[2] = {0, 0};
+        float cell_size = 0.0f;
+        const size_t cells = size_t(FALCON_SHARC_CELL_COUNT);
+        if (fread(header, sizeof(uint32_t), 2, f) == 2 && header[0] == 0x46454631u &&
+            header[1] == cells && fread(&cell_size, sizeof(float), 1, f) == 1 &&
+            cell_size > 1e-4f)
+        {
+          if (dscene->falcon_error_field.size() != cells) {
+            if (dscene->falcon_error_field.size() != 0) {
+              dscene->falcon_error_field.free();
+            }
+            dscene->falcon_error_field.alloc(cells);
+          }
+          float *field = dscene->falcon_error_field.data();
+          if (fread(field, sizeof(float), cells, f) == cells) {
+            dscene->falcon_error_field.copy_to_device();
+            dscene->falcon_error_field.clear_modified();
+            kintegrator->falcon_error_cell_size = cell_size;
+            kintegrator->falcon_error_threshold = threshold;
+            kintegrator->falcon_error_raise_alpha = falcon_knob_flag("FALCON_ERROR_RAISE_ALPHA",
+                                                                    falcon_error_raise_alpha) ?
+                                                        1 :
+                                                        0;
+            size_t filled = 0;
+            for (size_t i = 0; i < cells; i++) {
+              filled += (field[i] >= 0.0f);
+            }
+            LOG_INFO << "Falcon error field: " << filled << " measured cells from " << field_path
+                     << " (cell " << cell_size << " m), terminating at error <= " << threshold;
+          }
+        }
+        else {
+          LOG_WARNING << "Falcon error field: " << field_path
+                      << " is not a 4M-cell field file, ignored";
+        }
+        fclose(f);
+      }
+    }
+    if (kintegrator->falcon_error_threshold <= 0.0f && dscene->falcon_error_field.size() != 0) {
+      dscene->falcon_error_field.free();
     }
   }
 #endif
@@ -1005,6 +1358,7 @@ void Integrator::device_free(Device * /*unused*/, DeviceScene *dscene, bool forc
 #ifdef WITH_FALCON_SHARC
   dscene->falcon_sharc_cache.free_if_need_realloc(force_free);
   dscene->falcon_das_scale.free_if_need_realloc(force_free);
+  dscene->falcon_error_field.free_if_need_realloc(force_free);
 #endif
 }
 
@@ -1061,9 +1415,12 @@ uint Integrator::get_kernel_features() const
   /* Falcon light tracing with the visibility ray traces vertex->camera from
    * shade_surface: the raytrace kernel variant must be in the pipeline (on
    * OptiX the plain kernel cannot trace). */
-  if (getenv("FALCON_LIGHTTRACE") && getenv("FALCON_LT_VISIBILITY")) {
+#ifdef WITH_FALCON_SHARC
+  if (getenv("FALCON_LIGHTTRACE") && falcon_knob_flag("FALCON_LT_VISIBILITY", falcon_lt_visibility))
+  {
     kernel_features |= KERNEL_FEATURE_NODE_RAYTRACE;
   }
+#endif
 
   return kernel_features;
 }
@@ -1144,6 +1501,7 @@ DenoiseParams Integrator::get_denoise_params() const
   denoise_params.quality = denoiser_quality;
   denoise_params.upscale_factor = denoiser_upscale_factor;
   denoise_params.carry_history = denoiser_carry_history;
+  denoise_params.preroll_passes = denoiser_preroll_passes;
 
   return denoise_params;
 }

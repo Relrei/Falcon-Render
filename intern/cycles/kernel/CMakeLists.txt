@@ -182,6 +182,13 @@ set(SRC_KERNEL_INTEGRATOR_HEADERS
   integrator/displacement_shader.h
   integrator/falcon_dispersion.h
   integrator/falcon_sharc.h
+  # ★この2本が抜けていて、**配布した v0.2 で GPU レンダーが使えなかった**。
+  #   GPU(CUDA/OptiX/HIP/oneAPI)のカーネルは実行時に
+  #   scripts/addons_core/cycles/source/ を読んでコンパイルされるので、
+  #   ここに載せ忘れると **ビルドは通り CPU レンダーも通り、GPU だけが落ちる**。
+  #   門 = tools/falcon_check_kernel_install.py(2026-08-24)
+  integrator/falcon_sharc_size.h
+  integrator/falcon_lighttrace.h
   integrator/init_from_bake.h
   integrator/init_from_camera.h
   integrator/intersect_dedicated_light.h

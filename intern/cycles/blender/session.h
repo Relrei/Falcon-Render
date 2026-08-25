@@ -147,6 +147,17 @@ class BlenderSession {
 
   static bool print_render_stats;
 
+  /* Background animation renders: a fresh BlenderSession (and therefore a
+   * fresh inner Session/RenderScheduler) is constructed for every single
+   * frame -- Persistent Data does not keep the BlenderSession itself alive,
+   * only whether the frame-boundary sync tears down the *inner* Session (see
+   * reset_session()). A per-instance member can therefore never see a
+   * previous frame's state; this has to be process-global. Set once a frame
+   * has completed with DLSS-RR history established, so a freshly constructed
+   * BlenderSession/Session for the next frame is told the history is already
+   * warm instead of re-running the first-frame pre-roll on every frame. */
+  static bool dlss_history_warmed_this_job;
+
  protected:
   void stamp_view_layer_metadata(Scene *scene, const string &view_layer_name);
 

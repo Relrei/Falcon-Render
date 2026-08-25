@@ -44,6 +44,7 @@ CCL_NAMESPACE_BEGIN
 DeviceTypeMask BlenderSession::device_override = DEVICE_MASK_ALL;
 bool BlenderSession::headless = false;
 bool BlenderSession::print_render_stats = false;
+bool BlenderSession::dlss_history_warmed_this_job = false;
 
 BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
                                blender::UserDef &b_userpref,
@@ -74,6 +75,9 @@ BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
   last_redraw_time = 0.0;
   start_resize_time = 0.0;
   last_status_time = 0.0;
+  if (getenv("FALCON_DEBUG_LIFECYCLE")) {
+    fprintf(stderr, "[lifecycle] BlenderSession CONSTRUCTED (offline) this=%p\n", (void *)this);
+  }
 }
 
 BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
@@ -113,6 +117,9 @@ BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
 
 BlenderSession::~BlenderSession()
 {
+  if (getenv("FALCON_DEBUG_LIFECYCLE")) {
+    fprintf(stderr, "[lifecycle] BlenderSession DESTROYED this=%p\n", (void *)this);
+  }
   free_session();
 }
 
@@ -132,6 +139,13 @@ void BlenderSession::create_session()
 
   /* create session */
   session = make_unique<Session>(session_params, scene_params);
+  if (getenv("FALCON_DEBUG_LIFECYCLE")) {
+    fprintf(stderr,
+            "[lifecycle] inner Session CREATED this=%p session=%p warmed_flag=%d\n",
+            (void *)this,
+            (void *)session.get(),
+            int(dlss_history_warmed_this_job));
+  }
   session->progress.set_update_callback([this] { tag_redraw(); });
   session->progress.set_cancel_callback([this] { test_cancel(); });
   session->set_pause(session_pause);
@@ -454,6 +468,32 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
 
   session->set_is_animation((b_engine.flag & blender::RE_ENGINE_ANIMATION) != 0);
 
+  /* dlss_history_warmed_this_job is process-global (BlenderSession itself is
+   * rebuilt every frame, see its declaration), so it never sees a *job*
+   * boundary on its own -- once set, it would otherwise stay true for every
+   * later animation render in this Blender session, including the genuine
+   * cold first frame of an unrelated job. The start frame of the current
+   * range is the signal we actually have for "this is frame 1 of this job";
+   * treat reaching it as a fresh start and force the pre-roll again. */
+  if (b_scene->r.cfra == b_scene->r.sfra) {
+    dlss_history_warmed_this_job = false;
+  }
+
+  if (getenv("FALCON_DEBUG_LIFECYCLE")) {
+    fprintf(stderr,
+            "[lifecycle] render() this=%p session=%p cfra=%d sfra=%d warmed_flag=%d\n",
+            (void *)this,
+            (void *)session.get(),
+            b_scene->r.cfra,
+            b_scene->r.sfra,
+            int(dlss_history_warmed_this_job));
+  }
+  if (dlss_history_warmed_this_job) {
+    /* Session may have just been freshly rebuilt (Persistent Data off) --
+     * tell it not to treat this frame as the cold first frame of the job. */
+    session->set_dlss_history_warm();
+  }
+
   session->full_buffer_written_cb = [&](string_view filename) { full_buffer_written(filename); };
 
   blender::ViewLayer &b_view_layer = *DEG_get_evaluated_view_layer(b_depsgraph);
@@ -583,6 +623,11 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
   session->progress.get_time(total_time, render_time);
   LOG_INFO << "Total render time: " << total_time;
   LOG_INFO << "Render time (without synchronization): " << render_time;
+
+  /* This frame is done: any later frame in this job (even one rendered by a
+   * freshly rebuilt Session, see set_dlss_history_warm above) no longer
+   * needs the cold-start DLSS-RR pre-roll. */
+  dlss_history_warmed_this_job = true;
 }
 
 void BlenderSession::render_frame_finish()

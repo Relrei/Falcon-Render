@@ -154,8 +154,15 @@ ccl_device_forceinline void integrate_surface_emission(KernelGlobals kg,
       kg, state, path_visibility, path_flag, sd);
 
   guiding_record_surface_emission(kg, state, L, mis_weight);
-  film_write_surface_emission(
-      kg, state, L, mis_weight, render_buffer, object_lightgroup(kg, sd->object));
+#ifdef __FALCON_SHARC__
+  /* ★2026-08-25: 光子パスでは発光メッシュに当たってもフィルムに書かない。
+   * 理由は shade_light.h の同じ囲いを参照(発射番号の画素へ書くと一様な下駄になる)。 */
+  if (!kernel_data.integrator.falcon_photon_pass)
+#endif
+  {
+    film_write_surface_emission(
+        kg, state, L, mis_weight, render_buffer, object_lightgroup(kg, sd->object));
+  }
 }
 
 ccl_device int integrate_surface_ray_portal(KernelGlobals kg,
@@ -623,7 +630,29 @@ ccl_device_forceinline int integrate_surface_bsdf_bssrdf_bounce(
   }
 
   /* Update throughput. */
-  const Spectrum bsdf_weight = bsdf_eval_sum(&bsdf_eval) / bsdf_pdf;
+  Spectrum bsdf_weight = bsdf_eval_sum(&bsdf_eval) / bsdf_pdf;
+
+  /* Falcon: light tracing and photon baking carry FLUX from the light; camera
+   * paths carry radiance. Cycles' refraction BTDF includes the eta^2
+   * radiance-compression factor (bsdf_microfacet.h, the sqr(bsdf->ior *
+   * inv_len_H) term) -- correct for a camera path, wrong for a photon, because
+   * flux is conserved across a refraction while radiance is not. Reusing the
+   * camera throughput for photons therefore makes every refracted photon land
+   * eta^2 too bright. This is the classic non-symmetric scattering correction
+   * (PBRT 16.1.3).
+   *
+   * Measured on ocean_caustics 2026-08-02, LT layer vs a 1024spp reference:
+   *   IOR 1.33 -> 1.762x too much energy (eta^2 = 1.769)
+   *   IOR 1.50 -> 2.302x                 (eta^2 = 2.250)
+   * i.e. the excess tracked eta^2 and nothing else. The existing calibration
+   * control (the E*albedo/pi direct floor, 0.158 vs 0.159 analytic) could not
+   * see this because that path never refracts. */
+  if ((kernel_data.integrator.falcon_lighttrace || kernel_data.integrator.falcon_photon_pass) &&
+      (label & LABEL_TRANSMIT) && bsdf_eta != 1.0f)
+  {
+    bsdf_weight /= sqr(bsdf_eta);
+  }
+
   INTEGRATOR_STATE_WRITE(state, path, throughput) *= bsdf_weight;
 
   if (kernel_data.kernel_features & KERNEL_FEATURE_LIGHT_PASSES) {
@@ -841,12 +870,58 @@ ccl_device int integrate_surface(KernelGlobals kg,
       ccl_global const float *cache = kernel_data_array(falcon_sharc_cache);
       float3 cached;
       if (falcon_sharc_lookup(cache, sd.P, cell_size, &cached)) {
-        const float alpha = kernel_data.integrator.falcon_sharc_alpha;
+        float alpha = kernel_data.integrator.falcon_sharc_alpha;
+
+        /* Path termination on measured evidence. The blend above already has
+         * the shape of a termination -- take alpha of the cached radiance and
+         * scale the path's remaining contribution by (1 - alpha) -- so the
+         * error field only has to decide when alpha may go all the way to 1.
+         * At alpha = 1 the pixel gets the cache's answer and the path is
+         * finished here instead of tracing bounces whose result the cache
+         * already knows to within the measured error.
+         *
+         * The threshold is compared against the *measured* relative error of
+         * this cell (PT vs LT double estimator), not against a variance guess,
+         * and a cell the probe never filled reads negative and is skipped: no
+         * evidence must never be read as "converged". */
+        const float thr = kernel_data.integrator.falcon_error_threshold;
+        const bool raise_alpha = kernel_data.integrator.falcon_error_raise_alpha != 0;
+        bool terminate = false;
+        if (thr > 0.0f && (raise_alpha || alpha >= 0.999f)) {
+          /* Only when the cache is *already* being taken in full. Measured
+           * 2026-07-29: raising alpha to 1 on the strength of the error field
+           * cost 29% of the image's energy, because the field measures how
+           * settled the LIGHT TRACER is on a cell, not how well the radiance
+           * cache stands in for the rest of the path -- and the auto GI gate
+           * had set alpha to 0 for that scene precisely because its cache was
+           * not trustworthy. So termination is now purely a speed shortcut of
+           * a substitution the blend was going to make anyway: the image is
+           * identical with and without it, and the error field only decides
+           * where the shortcut is allowed to skip the remaining trace. */
+          const float err = falcon_error_lookup(kernel_data_array(falcon_error_field),
+                                                sd.P,
+                                                kernel_data.integrator.falcon_error_cell_size);
+          if (err >= 0.0f && err <= thr) {
+            /* Measured on classroom 2026-07-30: cells that pass a
+             * count>=16 gate at spread<=0.15 sit 1.9% (median) from a 512spp
+             * reference, p90 5.5%, against 4.2%/17.0% for the cache at large.
+             * That is the evidence for answering the path from the cache here
+             * and stopping; elsewhere the scene-level blend stands. */
+            if (raise_alpha) {
+              alpha = 1.0f;
+            }
+            terminate = true;
+          }
+        }
+
         ccl_global float *pixel = film_pass_pixel_render_buffer(kg, state, render_buffer);
         const int sample = INTEGRATOR_STATE(state, path, sample);
         film_write_combined_pass(
             kg, path_visibility, path_flag, sample, rgb_to_spectrum(alpha * cached), pixel);
         INTEGRATOR_STATE_WRITE(state, path, throughput) *= (1.0f - alpha);
+        if (terminate) {
+          return LABEL_NONE;
+        }
       }
     }
 
@@ -861,10 +936,50 @@ ccl_device int integrate_surface(KernelGlobals kg,
      * (FALCON_PHOTON.md). Avoid combining with MNEE on the same lights:
      * refractive-direct caustics would be counted twice. */
     if (kernel_data.integrator.falcon_photon_add) {
+      /* Only ask the cache about surfaces it could have stored anything on. The
+       * deposit below keeps photons on surfaces with a diffuse component; the
+       * lookup used to run at every vertex regardless, so glass and mirrors --
+       * where nothing was ever deposited -- still picked up whatever photons
+       * shared their grid cell and added it as if the mirror itself glowed. The
+       * cache holds outgoing radiance of *diffuse* surfaces, so there is no
+       * reading of it that makes a specular vertex correct.
+       *
+       * LuxCore gates its lookups the same way (IsPhotonGIEnabled,
+       * photongicache.cpp:66-74: a surface with transmit/specular events, or a
+       * glossy one sharper than the glossiness threshold, is not a cache
+       * location). Matching the deposit test exactly is the version of that
+       * which cannot disagree with our own bake. */
+      const float3 lookup_diff = spectrum_to_rgb(surface_shader_diffuse(kg, &sd));
+      bool photon_receiver = (lookup_diff.x + lookup_diff.y + lookup_diff.z) > 0.0f ||
+                             !kernel_data.integrator.falcon_photon_lookup_gate;
+      /* How many diffuse vertices along ONE camera path may add the layer.
+       *
+       * The layer is added like emission at every diffuse vertex, which is the
+       * right shape for "caustic light that then bounces": the second vertex
+       * carries the caustic of the first one further into the room.
+       *
+       * ⚠ This knob does NOT fix the glass-on-table defect it was written for.
+       * Measured on cupgap01 against a brute-force judge (2026-08-15): limits
+       * of 1/2/4 all render within 1e-5 per pixel of no limit at all. The
+       * multi-diffuse re-add is simply not where that light comes from -- the
+       * bounce-cap sweep that suggested it (+0.21/+0.40/+0.57/+0.68 at caps
+       * 2/4/8/32) was cutting the FOUR refractions a camera ray needs to get
+       * through the cup wall, not the diffuse vertices. Kept because it is the
+       * one knob that bounds how far cached caustic light may propagate, and
+       * because measuring it again should not cost another rebuild.
+       *
+       * 0 = no limit (the behaviour up to 2026-08-15, and still the default). */
+      const int lim = kernel_data.integrator.falcon_photon_lookup_bounces;
+      if (lim > 0 && (int)INTEGRATOR_STATE(state, path, diffuse_bounce) >= lim) {
+        photon_receiver = false;
+      }
       const float3 n_off = (dot(sd.Ng, sd.wi) > 0.0f) ? sd.Ng : -sd.Ng;
       float3 cached;
       bool hit = false;
-      if (kernel_data.integrator.falcon_photon_point_mode) {
+      if (!photon_receiver) {
+        /* nothing to gather here */
+      }
+      else if (kernel_data.integrator.falcon_photon_point_mode) {
         /* Point map (Round 9): fixed-radius gather at the exact shading point,
          * radius/normal-angle/gain are render-time knobs. */
         if (falcon_photon_point_lookup(kernel_data_array(falcon_photon_points),
@@ -887,8 +1002,12 @@ ccl_device int integrate_surface(KernelGlobals kg,
         /* Same half-cell normal offset and stencil as the deposit so the gather
          * reads the field the splat wrote (front side w.r.t. the viewing ray). */
         const float3 Pq = sd.P + n_off * (0.5f * cell_size);
-        hit = falcon_photon_lookup(
-            cache, Pq, cell_size, falcon_photon_normal_axis(n_off), &cached);
+        hit = falcon_photon_lookup(cache,
+                                   Pq,
+                                   cell_size,
+                                   falcon_photon_normal_axis(n_off),
+                                   kernel_data.integrator.falcon_photon_nearest,
+                                   &cached);
       }
       if (hit) {
         const Spectrum throughput = INTEGRATOR_STATE(state, path, throughput);
@@ -940,6 +1059,14 @@ ccl_device int integrate_surface(KernelGlobals kg,
            * bounce; FALCON_LT_DIRECT=1 also splats the bounce-0 direct hit, whose
            * floor radiance E*albedo/pi is analytically known and PT-confirmed --
            * the absolute calibration control. */
+          /* Note (2026-08-02): a PATH_RAY_DIFFUSE_ANCESTOR test was tried here,
+           * on the theory that a caustic is L (S+) D E and photons that had
+           * already scattered diffusely were being double counted against the
+           * beauty pass. It was a complete no-op -- pabellon stayed at 10.9085
+           * and ocean moved 0.9717 -> 0.9719 -- so every splat LT makes is
+           * already a first diffuse hit. Removed rather than left in: it costs
+           * a state read on a hot path and buys nothing. The 10.9x on pabellon
+           * remains unexplained (memory/issue_falcon_lt_flood_pabellon.md). */
           if (d_avg > 0.0f && world_frontface &&
               (bounce > 0 || kernel_data.integrator.falcon_lt_direct)) {
             /* Throughput is RELATIVE (init 1.0, see init_from_camera); the
@@ -1029,7 +1156,21 @@ ccl_device int integrate_surface(KernelGlobals kg,
                   kernel_data.integrator.falcon_photon_flux,
               make_float3(fcap, fcap, fcap));
 
-          const float radius_cells = kernel_data.integrator.falcon_photon_radius;
+          float radius_cells = kernel_data.integrator.falcon_photon_radius;
+          /* Contact caustics get a wider estimate, and only they do. A photon
+           * whose last segment is shorter than two cells came off a specular
+           * surface that is sitting on this receiver, so its caustic is pinned
+           * to the contact LINE; dividing that by a cell area is what makes the
+           * stored radiance grow as 1/cell instead of settling. Widening only
+           * here keeps the shipped Caustic Smoothness at 1.0, which is what
+           * holds hash occupancy down on heavy scenes (raising it globally took
+           * glasszoo 37% -> 70%, properties.py). */
+          const float contact_rc = kernel_data.integrator.falcon_photon_contact_radius;
+          if (contact_rc > radius_cells &&
+              sd.ray_length <
+                  kernel_data.integrator.falcon_photon_contact_cells * cell_size) {
+            radius_cells = contact_rc;
+          }
           if (radius_cells > 1.0f) {
             /* Photon-map density estimation: cone supplies 1/(pi r^2). */
             falcon_photon_deposit_wide(cache, Pd, cell_size, radius_cells, flux * diff,

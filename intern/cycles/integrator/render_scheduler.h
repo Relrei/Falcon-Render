@@ -116,6 +116,14 @@ class RenderScheduler {
    * history pre-roll. */
   void set_is_animation(bool is_animation);
 
+  /* Tell the scheduler that DLSS-RR history was already warmed up by a
+   * previous frame of this same animation job, even though this Session (and
+   * therefore this RenderScheduler) was just freshly constructed -- e.g.
+   * because Persistent Data is off and the engine tears the Session down
+   * and rebuilds it between frames. Without this, every frame looks cold and
+   * re-runs the pre-roll pass count instead of just the first one. */
+  void set_dlss_history_warm();
+
   /* Extra renders of the frame that starts with no DLSS-RR history, used to
    * fill that history with independent estimates before the kept pass (0 when
    * there is nothing to pre-roll). */

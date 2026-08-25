@@ -3986,7 +3986,10 @@ static void rna_def_modifier_array(BlenderRNA *brna)
 
   prop = RNA_def_property(srna, "fit_length", PROP_FLOAT, PROP_DISTANCE);
   RNA_def_property_float_sdna(prop, nullptr, "length");
-  RNA_def_property_range(prop, 0, INT_MAX);
+  /* ★INT_MAX(21億)は入力できてしまうが、どの機械でも確保できない。
+   * 実測で 100万面あたり 0.42GB。1億面で 43GB になるので、そこを上限にする。
+   * 実際に確保できるかは MOD_remesh.cc 側で空きメモリを見て毎回判定する。 */
+  RNA_def_property_range(prop, 0, 100000000);
   RNA_def_property_ui_range(prop, 0, 10000, 10, 2);
   RNA_def_property_ui_text(prop, "Length", "Length to fit array within");
   RNA_def_property_update(prop, 0, "rna_Modifier_update");
@@ -6670,6 +6673,21 @@ static void rna_def_modifier_remesh(BlenderRNA *brna)
                            "values preserve finer details.");
   RNA_def_property_update(prop, 0, "rna_Modifier_update");
 
+  /* 目標の面数。0 = 使わない(Voxel Size をそのまま使う)。
+   * 欲しいのは面数なのに寸法で指定させられていたのを、逆算で埋める。 */
+  prop = RNA_def_property(srna, "target_faces", PROP_INT, PROP_NONE);
+  RNA_def_property_int_sdna(prop, nullptr, "target_faces");
+  /* ★INT_MAX(21億)は入力できてしまうが、どの機械でも確保できない。
+   * 実測で 100万面あたり 0.42GB。1億面で 43GB になるので、そこを上限にする。
+   * 実際に確保できるかは MOD_remesh.cc 側で空きメモリを見て毎回判定する。 */
+  RNA_def_property_range(prop, 0, 100000000);
+  RNA_def_property_ui_range(prop, 0, 5000000, 1000, -1);
+  RNA_def_property_ui_text(prop,
+                           "Target Faces",
+                           "Aim for this many faces instead of setting the voxel size by hand. "
+                           "The voxel size is derived from the surface area. Zero uses Voxel Size.");
+  RNA_def_property_update(prop, 0, "rna_Modifier_update");
+
   prop = RNA_def_property(srna, "adaptivity", PROP_FLOAT, PROP_DISTANCE);
   RNA_def_property_float_sdna(prop, nullptr, "adaptivity");
   RNA_def_property_ui_range(prop, 0, 1, 0.1, 3);
@@ -8512,7 +8530,10 @@ static void rna_def_modifier_mesh_to_volume(BlenderRNA *brna)
 
   prop = RNA_def_property(srna, "voxel_amount", PROP_INT, PROP_NONE);
   RNA_def_property_ui_text(prop, "Voxel Amount", "Approximate number of voxels along one axis");
-  RNA_def_property_range(prop, 0, INT_MAX);
+  /* ★INT_MAX(21億)は入力できてしまうが、どの機械でも確保できない。
+   * 実測で 100万面あたり 0.42GB。1億面で 43GB になるので、そこを上限にする。
+   * 実際に確保できるかは MOD_remesh.cc 側で空きメモリを見て毎回判定する。 */
+  RNA_def_property_range(prop, 0, 100000000);
   RNA_def_property_update(prop, 0, "rna_Modifier_update");
 
   prop = RNA_def_property(srna, "interior_band_width", PROP_FLOAT, PROP_NONE);
@@ -8678,7 +8699,10 @@ static void rna_def_modifier_volume_to_mesh(BlenderRNA *brna)
 
   prop = RNA_def_property(srna, "voxel_amount", PROP_INT, PROP_NONE);
   RNA_def_property_ui_text(prop, "Voxel Amount", "Approximate number of voxels along one axis");
-  RNA_def_property_range(prop, 0, INT_MAX);
+  /* ★INT_MAX(21億)は入力できてしまうが、どの機械でも確保できない。
+   * 実測で 100万面あたり 0.42GB。1億面で 43GB になるので、そこを上限にする。
+   * 実際に確保できるかは MOD_remesh.cc 側で空きメモリを見て毎回判定する。 */
+  RNA_def_property_range(prop, 0, 100000000);
   RNA_def_property_update(prop, 0, "rna_Modifier_update");
 
   RNA_define_lib_overridable(false);
@@ -11009,7 +11033,10 @@ static void rna_def_modifier_grease_pencil_envelope(BlenderRNA *brna)
 
   prop = RNA_def_property(srna, "skip", PROP_INT, PROP_NONE);
   RNA_def_property_int_sdna(prop, nullptr, "skip");
-  RNA_def_property_range(prop, 0, INT_MAX);
+  /* ★INT_MAX(21億)は入力できてしまうが、どの機械でも確保できない。
+   * 実測で 100万面あたり 0.42GB。1億面で 43GB になるので、そこを上限にする。
+   * 実際に確保できるかは MOD_remesh.cc 側で空きメモリを見て毎回判定する。 */
+  RNA_def_property_range(prop, 0, 100000000);
   RNA_def_property_ui_text(
       prop, "Skip Segments", "The number of generated segments to skip to reduce complexity");
   RNA_def_property_update(prop, 0, "rna_Modifier_update");

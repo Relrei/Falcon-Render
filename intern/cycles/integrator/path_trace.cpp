@@ -4,6 +4,8 @@
 
 #include "integrator/path_trace.h"
 
+#include "kernel/integrator/falcon_sharc_size.h"
+
 #include "device/cpu/device.h"
 #include "device/device.h"
 
@@ -12,6 +14,7 @@
 #include "integrator/path_trace_tile.h"
 #include "integrator/render_scheduler.h"
 
+#include "scene/integrator.h"
 #include "scene/pass.h"
 #include "scene/scene.h"
 
@@ -38,15 +41,25 @@ CCL_NAMESPACE_BEGIN
 #ifdef WITH_FALCON_SHARC
 /* Host-side replica of the SHARC world-space cell hash. Must stay in sync with
  * falcon_sharc_hash() / falcon_sharc_cell_size() in
- * kernel/integrator/falcon_sharc.h (constant grid, cell size 0.2, 4M cells). */
-static const float FALCON_SHARC_HOST_CELL_SIZE = 0.2f;
-static const unsigned int FALCON_SHARC_HOST_CELL_COUNT = 1u << 22;
+ * kernel/integrator/falcon_sharc.h.
+ *
+ * The cell size is a RUNTIME value and has to be passed in. It used to be a
+ * hard-coded 0.2 here while the kernel looked cells up at the scene's cell size
+ * (0.05 by default), so warmup deposited into one grid and blend read another:
+ * the lookups missed and the cache did nothing. Measured 2026-07-30 on
+ * classroom -- taking the cache in full (alpha=1) moved the image by 1%, and
+ * the whole 4M table held 2408 cells because the deposits were keyed at 0.2. */
+static const float FALCON_SHARC_HOST_CELL_SIZE_FALLBACK = 0.2f;
+static const unsigned int FALCON_SHARC_HOST_CELL_COUNT = FALCON_SHARC_CELL_COUNT;
 static const unsigned int FALCON_SHARC_HOST_CELL_MASK = FALCON_SHARC_HOST_CELL_COUNT - 1u;
 static const int FALCON_SHARC_HOST_CELL_STRIDE = 4;
 
-static inline unsigned int falcon_sharc_host_hash(float px, float py, float pz)
+static inline unsigned int falcon_sharc_host_hash(float px,
+                                                  float py,
+                                                  float pz,
+                                                  const float cell_size)
 {
-  const float inv = 1.0f / FALCON_SHARC_HOST_CELL_SIZE;
+  const float inv = 1.0f / cell_size;
   const unsigned int gx = (unsigned int)((int)floorf(px * inv));
   const unsigned int gy = (unsigned int)((int)floorf(py * inv));
   const unsigned int gz = (unsigned int)((int)floorf(pz * inv));
@@ -248,14 +261,16 @@ void PathTrace::render_pipeline(RenderWork render_work)
    * rendering so the camera-hit kernel can blend with it. In warmup mode the
    * device cache stays zero, so the kernel blend is a no-op. */
   {
-    const char *mode = getenv("FALCON_SHARC_MODE");
     /* Both "blend" (offline 2-pass) and "live" (viewport temporal accumulation)
      * seed the device cache from the file before rendering so the camera-hit
      * kernel can blend with it. In "live" the same file is re-loaded and re-saved
-     * every refresh, so the cache accumulates across frames. */
-    if (mode && (strcmp(mode, "blend") == 0 || strcmp(mode, "live") == 0)) {
-      const char *cache_env = getenv("FALCON_SHARC_CACHE");
-      const char *cache_path = cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin";
+     * every refresh, so the cache accumulates across frames.
+     *
+     * Mode and path come from the scene now (Integrator::device_update resolves
+     * the socket against the environment override), not from getenv here. */
+    const int sharc_mode = device_scene_->falcon_sharc_mode;
+    if (sharc_mode == FALCON_SHARC_MODE_BLEND || sharc_mode == FALCON_SHARC_MODE_LIVE) {
+      const char *cache_path = device_scene_->falcon_sharc_cache_path.c_str();
       float *cache = device_scene_->falcon_sharc_cache.data();
       const size_t cache_floats = device_scene_->falcon_sharc_cache.size();
       FILE *cf = fopen(cache_path, "rb");
@@ -291,8 +306,7 @@ void PathTrace::render_pipeline(RenderWork render_work)
     if (pmode && strcmp(pmode, "bake") == 0 &&
         device_scene_->falcon_sharc_cache.size() != 0) {
       device_scene_->falcon_sharc_cache.copy_from_device();
-      const char *cache_env = getenv("FALCON_SHARC_CACHE");
-      const char *cache_path = cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin";
+      const char *cache_path = device_scene_->falcon_sharc_cache_path.c_str();
       FILE *f = fopen(cache_path, "wb");
       if (f) {
         fwrite(device_scene_->falcon_sharc_cache.data(),
@@ -327,12 +341,14 @@ void PathTrace::render_pipeline(RenderWork render_work)
       }
     }
 
-    const char *mode = getenv("FALCON_SHARC_MODE");
-    const bool is_warmup = mode && strcmp(mode, "warmup") == 0;
-    const bool is_live = mode && strcmp(mode, "live") == 0;
+    const bool is_warmup = device_scene_->falcon_sharc_mode == FALCON_SHARC_MODE_WARMUP;
+    const bool is_live = device_scene_->falcon_sharc_mode == FALCON_SHARC_MODE_LIVE;
     if (is_warmup || is_live) {
-      const char *cache_env = getenv("FALCON_SHARC_CACHE");
-      const char *cache_path = cache_env ? cache_env : "/tmp/falcon_sharc_cache.bin";
+      /* The grid the kernel will look up with -- deposit into the same one. */
+      const float kernel_cell = device_scene_->data.integrator.falcon_sharc_cell_size;
+      const float host_cell_size = (kernel_cell > 1e-4f) ? kernel_cell :
+                                                           FALCON_SHARC_HOST_CELL_SIZE_FALLBACK;
+      const char *cache_path = device_scene_->falcon_sharc_cache_path.c_str();
       path_trace_works_[0]->copy_render_buffers_from_device();
       const RenderBuffers *rb = path_trace_works_[0]->get_render_buffers();
       const BufferParams &p = rb->params;
@@ -361,16 +377,23 @@ void PathTrace::render_pipeline(RenderWork render_work)
            * 0.9). Decaying sum and count together leaves sum/count (the estimate)
            * unchanged but bounds how much history a cell keeps -- this is what
            * lets a static viewport converge while a moving one still adapts. */
-          float keep = 0.9f;
-          const char *keep_env = getenv("FALCON_SHARC_KEEP");
-          if (keep_env) {
-            keep = (float)atof(keep_env);
-            keep = keep < 0.0f ? 0.0f : (keep > 1.0f ? 1.0f : keep);
-          }
+          const float keep = device_scene_->falcon_sharc_keep;
           for (size_t i = 0; i < cache_floats; i++) {
             cache[i] *= keep;
           }
         }
+        /* Within-cell dispersion, written next to the cache as a sidecar.
+         *
+         * How wrong is it to answer a path with this cell's mean? Not "how
+         * noisy is the mean" -- two warmup bakes at different seeds agree to
+         * 1e-6 here, because a cell averages ~18 pixels x 64 spp (measured
+         * 2026-07-30, and it is why the seed-pair version of this measurement
+         * was useless). The mean is wrong where the radiance genuinely VARIES
+         * inside the cell: geometry detail, a shadow edge, view dependence.
+         * That is a spread, so accumulate sum and sum-of-squares of luminance
+         * and let the tooling turn it into a relative standard deviation. */
+        std::vector<double> lum_sum(FALCON_SHARC_HOST_CELL_COUNT, 0.0);
+        std::vector<double> lum_sq(FALCON_SHARC_HOST_CELL_COUNT, 0.0);
         for (int y = 0; y < h; y++) {
           for (int x = 0; x < w; x++) {
             const int idx = p.offset + x + y * stride;
@@ -380,9 +403,13 @@ void PathTrace::render_pipeline(RenderWork render_work)
             if (pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) {
               continue;
             }
-            const unsigned int cell = falcon_sharc_host_hash(pos[0], pos[1], pos[2]);
+            const unsigned int cell = falcon_sharc_host_hash(
+                pos[0], pos[1], pos[2], host_cell_size);
             const float *px = buf + (size_t)idx * pass_stride + combined_offset;
             const size_t cbase = (size_t)cell * FALCON_SHARC_HOST_CELL_STRIDE;
+            const double l = (0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]) * inv_s;
+            lum_sum[cell] += l;
+            lum_sq[cell] += l * l;
             cache[cbase + 0] += px[0] * inv_s;
             cache[cbase + 1] += px[1] * inv_s;
             cache[cbase + 2] += px[2] * inv_s;
@@ -402,6 +429,31 @@ void PathTrace::render_pipeline(RenderWork render_work)
           fclose(cf);
           LOG_INFO << "Falcon SHARC " << (is_live ? "live" : "warmup") << ": " << num_samples
                    << " spp, deposited " << deposited << " pixels, cache " << cache_path;
+        }
+
+        /* Sidecar: relative standard deviation of luminance inside each cell,
+         * negative where nothing landed. Same 4M layout as the cache so the
+         * tooling can hand it to the kernel's error-field slot unchanged. */
+        {
+          const string var_path = string(cache_path) + ".spread";
+          std::vector<float> spread(FALCON_SHARC_HOST_CELL_COUNT, -1.0f);
+          for (size_t c = 0; c < FALCON_SHARC_HOST_CELL_COUNT; c++) {
+            const float n = cache[c * FALCON_SHARC_HOST_CELL_STRIDE + 3];
+            if (n >= 1.0f) {
+              const double mean = lum_sum[c] / n;
+              const double var = max(lum_sq[c] / n - mean * mean, 0.0);
+              spread[c] = (mean > 1e-9) ? (float)(sqrt(var) / mean) : 0.0f;
+            }
+          }
+          FILE *vf = fopen(var_path.c_str(), "wb");
+          if (vf) {
+            const uint32_t header[2] = {0x46454631u, (uint32_t)FALCON_SHARC_HOST_CELL_COUNT};
+            fwrite(header, sizeof(uint32_t), 2, vf);
+            fwrite(&host_cell_size, sizeof(float), 1, vf);
+            fwrite(spread.data(), sizeof(float), spread.size(), vf);
+            fclose(vf);
+            LOG_INFO << "Falcon SHARC: cell spread written to " << var_path;
+          }
         }
 
         /* Measure GI dominance for the auto-gate: luminance of Diffuse Indirect

@@ -89,6 +89,7 @@ set(SRC
   mesh/paint_vertex_weight_ops.cc
   mesh/paint_vertex_weight_utils.cc
   mesh/paint_weight.cc
+  mesh/falcon_sculpt_gpu.cc
   mesh/sculpt.cc
   mesh/sculpt_automasking.cc
   mesh/sculpt_boundary.cc
@@ -140,6 +141,7 @@ set(SRC
   mesh/sculpt_geodesic.hh
   mesh/sculpt_gesture.hh
   mesh/sculpt_hide.hh
+  mesh/falcon_sculpt_gpu.hh
   mesh/sculpt_intern.hh
   mesh/sculpt_islands.hh
   mesh/sculpt_pose.hh

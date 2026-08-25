@@ -43,6 +43,17 @@
 
 // NOLINTBEGIN
 #define MNEE_MAX_ITERATIONS 64
+/* Falcon: REVERTED to upstream 10/6 on 2026-08-03 after measuring the cost.
+ * Six manifold vertices is six INTERFACES, not six objects -- a pane of glass
+ * eats two, so upstream dies between the 3rd and 4th stacked pane (shadow
+ * 0.600 -> 0.050, a hard cliff: one interface past the cap returns
+ * SHADER_EVAL_EMPTY). Raising it to 10/16 does remove the cliff, but the
+ * ManifoldVertex arrays are per-thread state and the whole kernel pays:
+ * classroom baseline, a scene with no MNEE at all, went 3.724s -> 5.350s
+ * (+44%) for a benefit only scenes with 4+ stacked panes ever collect.
+ * To raise it properly, first shrink ManifoldVertex (dn_du/dn_dv and the a/b/c
+ * matrices could be recomputed instead of stored) or make the array size a
+ * compile-time feature of scenes that need it. */
 #define MNEE_MAX_INTERSECTION_COUNT 10
 #define MNEE_SOLVER_THRESHOLD 0.001f
 #define MNEE_MINIMUM_STEP_SIZE 0.0001f
@@ -179,20 +190,38 @@ ccl_device_inline void mnee_setup_manifold_vertex(KernelGlobals kg,
     vtx->ng = -vtx->ng;
   }
 
-  /* Shading normals: Interpolate normals between vertices. */
-  float n_len;
-  vtx->n = normalize_len(normals[0] * (1.0f - sd_vtx->u - sd_vtx->v) + normals[1] * sd_vtx->u +
-                             normals[2] * sd_vtx->v,
-                         &n_len);
+  /* Shading normals: Interpolate normals between vertices.
+   *
+   * Falcon: flat-shaded casters use the face normal with zero derivatives
+   * instead. Upstream rejects them outright (see the caster-acceptance test
+   * in mnee_path_contribution's probe walk), which turns off shadow caustics
+   * for every flat-shaded pane of architectural glass. A flat facet has
+   * perfectly well-defined differential geometry -- zero curvature -- and the
+   * Newton solver's Jacobian keeps its positional term. What must NOT happen
+   * is solving the chain with interpolated vertex normals while the actual
+   * BSDF shades with the face normal: the solved directions would not match
+   * what the surface really does. Face normal + zero dn is consistent. */
+  float3 dn_du, dn_dv;
+  if (!(sd_vtx->shader & SHADER_SMOOTH_NORMAL)) {
+    vtx->n = vtx->ng;
+    dn_du = make_float3(0.0f, 0.0f, 0.0f);
+    dn_dv = make_float3(0.0f, 0.0f, 0.0f);
+  }
+  else {
+    float n_len;
+    vtx->n = normalize_len(normals[0] * (1.0f - sd_vtx->u - sd_vtx->v) + normals[1] * sd_vtx->u +
+                               normals[2] * sd_vtx->v,
+                           &n_len);
 
-  /* Shading normal derivatives WRT barycentric (u, v)
-   * we calculate the derivative of n = |u*n0 + v*n1 + (1-u-v)*n2| using:
-   * d/du [f(u)/|f(u)|] = [d/du f(u)]/|f(u)| - f(u)/|f(u)|^3 <f(u), d/du f(u)>. */
-  const float inv_n_len = 1.f / n_len;
-  float3 dn_du = inv_n_len * (normals[1] - normals[0]);
-  float3 dn_dv = inv_n_len * (normals[2] - normals[0]);
-  dn_du -= vtx->n * dot(vtx->n, dn_du);
-  dn_dv -= vtx->n * dot(vtx->n, dn_dv);
+    /* Shading normal derivatives WRT barycentric (u, v)
+     * we calculate the derivative of n = |u*n0 + v*n1 + (1-u-v)*n2| using:
+     * d/du [f(u)/|f(u)|] = [d/du f(u)]/|f(u)| - f(u)/|f(u)|^3 <f(u), d/du f(u)>. */
+    const float inv_n_len = 1.f / n_len;
+    dn_du = inv_n_len * (normals[1] - normals[0]);
+    dn_dv = inv_n_len * (normals[2] - normals[0]);
+    dn_du -= vtx->n * dot(vtx->n, dn_du);
+    dn_dv -= vtx->n * dot(vtx->n, dn_dv);
+  }
 
   /* Orthonormalize (dp_du,dp_dv) using a linear transformation, which
    * we use on (dn_du,dn_dv) as well so the new (u,v) are consistent. */
@@ -1011,12 +1040,15 @@ ccl_device_inline ShaderEvalResult kernel_path_mnee_sample(KernelGlobals kg,
       /* Setup shader data on caustic caster and evaluate context. */
       shader_setup_from_ray(kg, sd_mnee, &probe_ray, &probe_isect);
 
-      /* Reject caster if smooth normals are not available: Manifold exploration assumes local
-       * differential geometry can be created at any point on the surface which is not possible if
-       * normals are not smooth. */
-      if (!(sd_mnee->shader & SHADER_SMOOTH_NORMAL)) {
-        return SHADER_EVAL_EMPTY;
-      }
+      /* Falcon: flat-shaded casters are accepted. Upstream returned
+       * SHADER_EVAL_EMPTY here -- measured 2026-08-02, a flat-shaded 1 cm
+       * glass pane's shadow read 0.046 (identical to caustics off) vs 0.775
+       * with smooth shading, i.e. the feature was silently dead on exactly
+       * the geometry architectural glass is made of. The vertex setup now
+       * uses the face normal with zero normal derivatives for these (see
+       * mnee_setup_manifold_vertex); a flat facet is legitimate differential
+       * geometry. The walk can still fail across a hard edge mid-iteration --
+       * that path returns empty exactly as before. */
 
       /* Last bool argument is the MNEE flag (for TINY_MAX_CLOSURE cap in kernel_shader.h). */
       surface_shader_eval<KERNEL_FEATURE_NODE_MASK_SURFACE_SHADOW>(

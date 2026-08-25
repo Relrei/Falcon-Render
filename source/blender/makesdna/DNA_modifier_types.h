@@ -1874,6 +1874,13 @@ struct RemeshModifierData {
   /* OpenVDB Voxel remesh properties. */
   float voxel_size = 0.1f;
   float adaptivity = 0.0f;
+
+  /* 目標の面数。0 = 使わない(voxel_size をそのまま使う)。
+   * >0 なら voxel_size を無視し、入力の表面積から逆算する。
+   * ボクセル面の枚数は「表面積 / ボクセル寸法^2」に比例するので、
+   * 二分探索でリメッシュを何度も回さずに1回で当てられる。 */
+  int target_faces = 0;
+  char _pad2[4] = {};
 };
 
 /** #SkinModifierData.symmetry_axes */

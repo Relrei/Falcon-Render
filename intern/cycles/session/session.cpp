@@ -320,6 +320,13 @@ RenderWork Session::run_update_for_next_iteration()
   /* Update scene */
   const bool reset_scene = update_scene(delayed_reset_.do_reset);
 
+  /* An error raised while updating the scene means the render is refused, not
+   * merely interrupted: the device was never brought up for it, so the camera
+   * and buffer updates below would talk to an unloaded module. */
+  if (progress.get_cancel()) {
+    return RenderWork();
+  }
+
   /* Update buffers for new parameters. After scene update which influences the passes used. */
   bool have_tiles = true;
   bool switched_to_new_tile = false;
@@ -622,6 +629,11 @@ void Session::set_is_animation(bool is_animation)
   render_scheduler_.set_is_animation(is_animation);
 }
 
+void Session::set_dlss_history_warm()
+{
+  render_scheduler_.set_dlss_history_warm();
+}
+
 void Session::set_samples(const int samples)
 {
   if (samples == params.samples) {
@@ -763,6 +775,26 @@ bool Session::update_scene(const bool reset_samples)
     LOG_WARNING << "DLSS upscaling is not supported when the frame is rendered in tiles "
                    "(too large to fit in memory); rendering at native resolution instead.";
     scene->integrator->set_denoiser_upscale_factor(1.0f);
+  }
+
+  /* Falcon safety guard: at native resolution DLSS still denoises the whole
+   * frame at once, so a tiled frame is written back at the wrong stride whatever
+   * the upscale factor is. Refuse rather than hand back repeated black strips.
+   * Resolution itself is not the condition -- what matters is whether the frame
+   * fits in one tile, which depends on the GPU and the passes in use.
+   * FALCON_DLSS_ALLOW_HIGHRES=1 lifts the guard for development. */
+  if (params.background && tile_manager_.has_multiple_tiles() &&
+      scene->integrator->get_use_denoise() &&
+      scene->integrator->get_denoiser_type() == DENOISER_DLSS &&
+      getenv("FALCON_DLSS_ALLOW_HIGHRES") == nullptr)
+  {
+    progress.set_error(string_printf(
+        "Falcon: DLSS denoising needs the whole %dx%d frame at once, but it is being rendered "
+        "in tiles. The tile size is raised to fit the frame automatically, so reaching this "
+        "means the frame is larger than that could cover -- lower the resolution, or switch "
+        "the denoiser.",
+        buffer_params_.full_width,
+        buffer_params_.full_height));
   }
 
   const bool reset = scene->need_reset(false);

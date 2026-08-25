@@ -383,6 +383,12 @@ bool DLSSDenoiser::denoise_create_if_needed(DenoiseContext &context)
   tex_output_.destroy();
 
   if (context.buffer_params.width <= 128 || context.buffer_params.height <= 96) {
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr,
+              "[dlss] skip create: buffer %dx%d too small (<=128x96)\n",
+              context.buffer_params.width,
+              context.buffer_params.height);
+    }
     last_width_ = 0;
     last_height_ = 0;
     return false;
@@ -438,8 +444,27 @@ bool DLSSDenoiser::denoise_create_if_needed(DenoiseContext &context)
   NVSDK_NGX_CUDA.DestroyParameters(params);
 
   if (NVSDK_NGX_FAILED(result)) {
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr,
+              "[dlss] CreateFeature1 failed: result=%d size=%dx%d out=%dx%d\n",
+              int(result),
+              context.buffer_params.width,
+              context.buffer_params.height,
+              context.denoised_buffer_params.width,
+              context.denoised_buffer_params.height);
+    }
     set_error("Failed to create DLSS instance");
     return false;
+  }
+
+  if (getenv("FALCON_DLSS_DEBUG")) {
+    fprintf(stderr,
+            "[dlss] recreate: in=%dx%d out=%dx%d upscale=%.3f\n",
+            context.buffer_params.width,
+            context.buffer_params.height,
+            context.denoised_buffer_params.width,
+            context.denoised_buffer_params.height,
+            context.denoise_params.upscale_factor);
   }
 
   tex_color_.init(cuda_device, context.buffer_params.width, context.buffer_params.height, 4);

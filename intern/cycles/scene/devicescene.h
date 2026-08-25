@@ -113,6 +113,19 @@ class DeviceScene {
    * FALCON_DAS_MAP, built by the OIDN probe script). */
   device_vector<float> falcon_das_scale;
 
+  /* Falcon error field: measured relative error per world cell, one float per
+   * SHARC hash slot (negative = the probe never filled that cell). Drives path
+   * termination in shade_surface. */
+  device_vector<float> falcon_error_field;
+
+  /* Falcon knobs the render loop needs but the kernel does not, resolved once in
+   * Integrator::device_update() (scene socket, environment variable wins). Host
+   * side only, so changing them never rebuilds the kernel. Mode values match
+   * FalconSharcMode in scene/integrator.h (0 off, 1 warmup, 2 blend, 3 live). */
+  int falcon_sharc_mode = 0;
+  string falcon_sharc_cache_path = "/tmp/falcon_sharc_cache.bin";
+  float falcon_sharc_keep = 0.9f;
+
   KernelData data;
 
   DeviceScene(Device *device);

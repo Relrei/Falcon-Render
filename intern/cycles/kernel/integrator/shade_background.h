@@ -155,9 +155,26 @@ ccl_device_inline ShaderEvalResult integrate_background(
     L *= mis_weight;
   }
 
-  /* Write to render buffer. */
+  /* Write to render buffer.
+   *
+   * Not during a Falcon photon/light-trace pass: there the "camera" ray is a
+   * photon launched from the light (init_from_camera), so a photon that leaves
+   * the scene has no business painting the world into the pixel it happened to
+   * launch from. The layer is meant to hold splats only. Measured on the
+   * luxcore-vs-CyclesF probe: this background copy was 730 of the layer's 3523
+   * total (21%), and because every pass carried its own copy the additive
+   * composite counted it once per pass -- the reason a 2x2 launch-tiled sum
+   * came out 1.62x the untiled pass while the *difference* was pass-count
+   * times the same fixed image. */
+#ifdef __FALCON_SHARC__
+  if (!kernel_data.integrator.falcon_photon_pass) {
+    film_write_background(kg, state, L, transparent, is_transparent_background_ray, render_buffer);
+    film_write_data_passes_background(kg, state, render_buffer);
+  }
+#else
   film_write_background(kg, state, L, transparent, is_transparent_background_ray, render_buffer);
   film_write_data_passes_background(kg, state, render_buffer);
+#endif
 
 #ifdef __DENOISING_FEATURES__
   film_write_denoising_features_background(kg, state, render_buffer);

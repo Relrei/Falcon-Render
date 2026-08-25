@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import random
+
 import bpy
 from bpy.types import Operator
 from bpy.props import BoolProperty, StringProperty
@@ -30,14 +32,53 @@ def _falcon_reset_photon_state(*_args):
         os.environ.pop(k, None)
 
 
+def _falcon_flatten_name(name):
+    """Turn an ID name into something that can only ever be one path component.
+
+    Blender lets a .blend carry a scene called "../../etc/x", and these names go
+    straight into the cache file name. Replacing the separators (and NUL) leaves
+    ordinary names untouched -- only names that already produced an unusable
+    path change, so no existing cache is orphaned.
+    """
+    import os
+    out = name or ""
+    for ch in ("/", "\\", os.sep, os.altsep or "/", "\x00"):
+        out = out.replace(ch, "_")
+    return out
+
+
 def _falcon_photon_cache_paths(scene):
     """(grid cache, point cache) keyed by file *and* scene so distinct scenes —
-    and any two unsaved files (both basename '') — never share a cache file."""
+    and any two unsaved files (both basename '') — never share a cache file.
+
+    These live under the user cache directory, not the system temp dir. The grid
+    cache is a fixed 1 GB per scene, and on this setup /tmp is a tmpfs: nine
+    baked scenes filled 16 GB of RAM and the next bake died with "no space left"
+    rather than anything that pointed at the cache. Disk-backed is also the right
+    place for something that is meant to survive between sessions.
+
+    The key is flattened first. Blender ID names may contain '/', so a .blend
+    whose scene is called "../../x" used to build a path that resolves outside
+    the cache directory. Measured 2026-08-22: the escape is real at the path
+    level (realpath lands outside ~/.cache/falcon_photon) but the write does
+    *not* land there -- the leading component "falcon_photon_<file>__.." is not
+    an existing directory and nothing here creates it, so the bake just dies
+    with ENOENT. Flattening keeps it that way for good: add one os.makedirs on
+    the dirname later and the unflattened version would have become a real
+    out-of-cache 1 GB write.
+    """
     import os
-    import tempfile
-    base = bpy.path.basename(bpy.data.filepath) or "scene"
-    key = "%s__%s" % (base, scene.name)
-    cache_path = os.path.join(tempfile.gettempdir(), "falcon_photon_%s.bin" % key)
+    base = _falcon_flatten_name(bpy.path.basename(bpy.data.filepath)) or "scene"
+    key = "%s__%s" % (base, _falcon_flatten_name(scene.name))
+    cache_dir = os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+        "falcon_photon")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        import tempfile
+        cache_dir = tempfile.gettempdir()
+    cache_path = os.path.join(cache_dir, "falcon_photon_%s.bin" % key)
     return cache_path, cache_path[:-4] + ".fph"
 
 
@@ -336,18 +377,39 @@ def _falcon_merge_grid(files, out_path):
     return False
 
 
-def _falcon_specular_mat(mat):
+def _falcon_specular_mat(mat, rough_max=0.2):
     """True if the material is refractive/metallic — a photon-worthy
-    specular caster in the bake's sense."""
+    specular caster in the bake's sense.
+
+    Roughness is part of the test. A Glossy node on its own is not evidence
+    of a caustic caster: pavillon_barcelone is a pre-Principled file whose
+    floors, walls and marble are all Diffuse+Glossy mixes, so treating every
+    BSDF_GLOSSY as specular tagged 78 of its 90 meshes and inflated the sun
+    photon target sphere to a 110m radius. With the gate it is 14 meshes and
+    24m -- the glass and the polished stone, which is what a caster means
+    here. (Measured 2026-08-02.)
+
+    A roughness input driven by a texture counts as not-specular: a surface
+    whose roughness varies across it is not the mirror or lens that focuses
+    light into a caustic.
+    """
     if mat is None or not mat.use_nodes:
         return False
+
+    def smooth(sock):
+        return sock is not None and not sock.is_linked and sock.default_value < rough_max
+
     for n in mat.node_tree.nodes:
         if n.type == 'BSDF_PRINCIPLED':
             if (n.inputs['Transmission Weight'].default_value > 0.5
-                    or n.inputs['Metallic'].default_value > 0.5):
+                    or (n.inputs['Metallic'].default_value > 0.5
+                        and smooth(n.inputs.get('Roughness')))):
                 return True
-        elif n.type in ('BSDF_GLASS', 'BSDF_REFRACTION', 'BSDF_GLOSSY'):
+        elif n.type in ('BSDF_GLASS', 'BSDF_REFRACTION'):
             return True
+        elif n.type == 'BSDF_GLOSSY':
+            if smooth(n.inputs.get('Roughness')):
+                return True
     return False
 
 
@@ -379,10 +441,9 @@ def _falcon_range_wants_perframe(scene):
     return False
 
 
-def _falcon_sun_target(scene):
-    """FALCON_PHOTON_TARGET string: bounding sphere over objects whose first
-    material is refractive/metallic (the photon-worthy specular casters), or
-    None if the scene has none."""
+def _falcon_caster_sphere(scene):
+    """Bounding sphere over the objects that can actually cast a caustic
+    (refractive/metallic first material). Returns (center, radius) or None."""
     from mathutils import Vector
     corners = []
     for ob in scene.objects:
@@ -397,7 +458,52 @@ def _falcon_sun_target(scene):
     cz = sum(c.z for c in corners) / len(corners)
     rad = max(((c.x - cx) ** 2 + (c.y - cy) ** 2 + (c.z - cz) ** 2) ** 0.5
               for c in corners) + 0.05
-    return "%.4f,%.4f,%.4f,%.4f" % (cx, cy, cz, rad)
+    return (Vector((cx, cy, cz)), rad)
+
+
+def _falcon_sun_target(scene):
+    """FALCON_PHOTON_TARGET string, or None if the scene has no caster."""
+    sph = _falcon_caster_sphere(scene)
+    if sph is None:
+        return None
+    c, rad = sph
+    return "%.4f,%.4f,%.4f,%.4f" % (c.x, c.y, c.z, rad)
+
+
+def _falcon_light_reach(light_ob, sphere):
+    """How much of this lamp's emission can even arrive at the casters, as a
+    fraction of what it emits (1.0 = all of it).
+
+    ★★★2026-08-15 これが無いと**明るい灯が予算を持って行く**。classroom は
+    窓の外の補助光(1963W)が光子の**97%**を取り、その光子は室内にある唯一の
+    ガラス箱にほとんど届かない——焼き339秒の中身がそれだった。ワット数は
+    「部屋の明るさ」であって「集光の作りやすさ」ではない。
+
+    見込み角で割る: ランプから見たキャスター外接球の立体角 ÷ そのランプが
+    配る立体角。太陽は既に発射窓をキャスターへ向けているので 1.0。
+    球の中にランプが居る(囲まれている)場合も 1.0。
+    """
+    import math
+    if sphere is None:
+        return 1.0
+    kind = light_ob.data.type
+    if kind == 'SUN':
+        return 1.0            # 発射窓がキャスターを狙っている(FALCON_PHOTON_TARGET)
+    center, rad = sphere
+    d = (light_ob.matrix_world.translation - center).length
+    if d <= rad:
+        return 1.0
+    sin_half = min(1.0, rad / d)
+    cos_half = math.sqrt(max(0.0, 1.0 - sin_half * sin_half))
+    omega = 2.0 * math.pi * (1.0 - cos_half)
+    if kind == 'SPOT':
+        half = max(1e-4, light_ob.data.spot_size * 0.5)
+        full = 2.0 * math.pi * (1.0 - math.cos(min(half, math.pi)))
+    elif kind == 'AREA':
+        full = 2.0 * math.pi   # 面光源は片側の半球へ出す
+    else:
+        full = 4.0 * math.pi   # 点光源は全球
+    return min(1.0, omega / max(full, 1e-6))
 
 
 def _falcon_world_radiance(scene):
@@ -446,6 +552,212 @@ def _falcon_transmissive_objects(scene):
         if trans:
             out.append(ob)
     return out
+
+
+def _falcon_lt_flood_risk(scene):
+    """Cheap heuristic for the LT 'flood' failure mode (returns a short warning
+    string or None; never blocks). The LT camera-connection pass passes glass
+    bodies straight through (LuxCore's caustics-caster approximation). When a
+    lamp is embedded near the *base* of a glass object that sits right on a big
+    diffuse receiver, that receiver looks almost straight at the light through
+    only a thin slab of glass -> the near-unattenuated light splats across the
+    whole surface and the caustic layer floods (the lt_fan_test v1 case).
+    A lamp partway *up* inside the glass (v2) refracts through slanted walls and
+    is safe, so we only warn on the low/embedded geometry."""
+    from mathutils import Vector
+
+    def _wbox(ob):
+        wc = [ob.matrix_world @ Vector(c) for c in ob.bound_box]
+        return (min(c.x for c in wc), max(c.x for c in wc),
+                min(c.y for c in wc), max(c.y for c in wc),
+                min(c.z for c in wc), max(c.z for c in wc))
+
+    glass = []
+    for ob in scene.objects:
+        if ob.type != 'MESH' or ob.hide_render or not ob.material_slots:
+            continue
+        if _falcon_specular_mat(ob.material_slots[0].material):
+            glass.append((ob, _wbox(ob)))
+    if not glass:
+        return None
+    # large diffuse receivers = big flat meshes that are not specular casters
+    receivers = []
+    for ob in scene.objects:
+        if ob.type != 'MESH' or ob.hide_render:
+            continue
+        if ob.material_slots and _falcon_specular_mat(ob.material_slots[0].material):
+            continue
+        x0, x1, y0, y1, z0, z1 = _wbox(ob)
+        if max(x1 - x0, y1 - y0) >= 4.0:
+            receivers.append(z1)  # top surface height
+    if not receivers:
+        return None
+    lights = [o for o in scene.objects if o.type == 'LIGHT' and not o.hide_render]
+    for li in lights:
+        p = li.matrix_world.translation
+        for ob, (x0, x1, y0, y1, z0, z1) in glass:
+            if not (x0 - 1e-4 <= p.x <= x1 + 1e-4 and y0 - 1e-4 <= p.y <= y1 + 1e-4):
+                continue  # light not over/inside this glass footprint
+            frac = (p.z - z0) / max(z1 - z0, 1e-4)  # 0 = base, 1 = top
+            if frac > 0.25:
+                continue  # mid/high inside the glass -> walls refract (safe)
+            for rz1 in receivers:
+                if rz1 <= p.z + 1e-3 and (p.z - rz1) <= 0.6:
+                    return ("LT氾濫の危険: ライト「%s」がガラス「%s」の底部に埋込 → "
+                            "大きな拡散面がガラス越しにライトを直視 (中腹へ上げると改善)"
+                            % (li.name, ob.name))
+    return None
+
+
+def _falcon_scene_has_caustics(scene):
+    """AUTO detection: does this scene have both a photon-worthy specular caster
+    (glass / refraction / Principled transmission / smooth metal, via the first
+    material slot) AND a light that can emit photons? Cheap scan (first slot
+    only) so it is safe to call from panel draw. No caster or no light => no
+    caustics to make, so the AUTO UI stays silent and no cost is paid."""
+    has_light = any(
+        o.type == 'LIGHT' and not o.hide_render
+        and getattr(o.data, "type", None) in ('SUN', 'AREA', 'SPOT', 'POINT')
+        for o in scene.objects)
+    if not has_light:
+        return False
+    for ob in scene.objects:
+        if ob.type == 'MESH' and not ob.hide_render and ob.material_slots:
+            if _falcon_specular_mat(ob.material_slots[0].material):
+                return True
+    return False
+
+
+def _falcon_caustics_active():
+    """True when a photon bake has been composited into the beauty render this
+    session (env set by falcon_photon_bake, cleared on file load / clear)."""
+    import os
+    return os.environ.get("FALCON_PHOTON_MODE") == "add"
+
+
+class CYCLES_OT_falcon_auto_caustics(Operator):
+    """ガラス+ライトのコースティクス(集光模様)を、実証済みの推奨設定で焼く。
+    レシピ設定は不要。完了後は通常のレンダー(F12/ビューポート)に自動で合成される。
+    強さはあとから焼き直し無しで調整できる。"""
+    bl_idname = "cycles.falcon_auto_caustics"
+    bl_label = "コースティクスを出す"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def execute(self, context):
+        cscene = context.scene.cycles
+        if not _falcon_scene_has_caustics(context.scene):
+            self.report({'ERROR'},
+                        "ガラス/屈折マテリアルとライト(SUN/AREA/SPOT/POINT)が要ります")
+            return {'CANCELLED'}
+        # Guarantee only the delivery mechanism: GPU point-map is the path that
+        # composites in-kernel into the normal render (the Octane-like result).
+        # Leave radius / gain / maxpts / dispersion to the property defaults or
+        # the user's own values -- those are artistic knobs, not correctness.
+        cscene.falcon_photon_gpu = True
+        cscene.falcon_photon_point = True
+        return bpy.ops.cycles.falcon_photon_bake()
+
+
+def _falcon_photon_auto_radius(context, pixels=1.0, samples=512):
+    """Pick the point-map lookup radius by measuring how big a pixel is out where
+    the caustics land.
+
+    A density estimate is blurry over its lookup radius, so the radius states how
+    much detail is being given up. In metres that is unanswerable without knowing
+    the shot -- 1cm is fine on a tabletop and invisible across a room -- which is
+    why the manual value had to be retuned per scene. In pixels it has one answer:
+    keep the blur under what the frame can resolve and nothing else matters.
+
+    So: shoot camera rays, carry them through glass and mirrors the way the
+    photons will travel, and at the first surface that can actually receive a
+    caustic, ask how wide one pixel is in metres there. The average is the radius.
+
+    This is LuxCore's Film2SceneRadius machinery (film2sceneradius.cpp) aimed at a
+    different target. LuxCore only ever runs it for the indirect cache and the
+    visibility particles, at 2% of the frame -- and says outright that the caustic
+    radius is far smaller than that ("Caustic radius is too small for visibility
+    check", photongicache.cpp:418); its caustic radius stays a hand-set number.
+    Measured here, 2% of the frame is 38 pixels, and the radius this scene was
+    hand-tuned to over months lands at 0.8 pixels. A pixel is the target that
+    reproduces hand tuning, and it makes rendering the same shot at 4K sharpen the
+    caustics on its own instead of needing the number retyped.
+
+    Returns None when there is no camera or nothing was hit, so the caller keeps
+    whatever the user had.
+    """
+    from . import falcon_photon
+
+    scene = context.scene
+    cam = scene.camera
+    if cam is None or cam.type != 'CAMERA':
+        return None
+
+    depsgraph = context.evaluated_depsgraph_get()
+    try:
+        frame = cam.data.view_frame(scene=scene)
+    except Exception:
+        return None
+    # view_frame gives the corners at unit depth in camera space, so directions
+    # to any point on the frame come from lerping them -- and the separation
+    # between two such directions IS the beam spread per metre travelled.
+    top_right, bottom_right, bottom_left, top_left = frame
+    rot = cam.matrix_world.to_3x3()
+    origin = cam.matrix_world.translation
+
+    def direction(u, v):
+        top = top_left.lerp(top_right, u)
+        bottom = bottom_left.lerp(bottom_right, u)
+        return (rot @ bottom.lerp(top, v)).normalized()
+
+    # The render resolution is what "one pixel" means, so the same scene baked
+    # for a 4K delivery gets a smaller radius than one baked for a preview.
+    pct = scene.render.resolution_percentage / 100.0
+    res_x = max(int(scene.render.resolution_x * pct), 1)
+    res_y = max(int(scene.render.resolution_y * pct), 1)
+    du = pixels / res_x
+    dv = pixels / res_y
+
+    rng = random.Random(0x5EED)          # same radius every bake of the same shot
+    accumulated = 0.0
+    count = 0
+    for _ in range(samples):
+        u = rng.random()
+        v = rng.random()
+        d = direction(u, v)
+        # One pixel, as a world-space width per metre of travel.
+        spread = max((direction(min(u + du, 1.0), v) - d).length,
+                     (direction(u, min(v + dv, 1.0)) - d).length)
+        if spread <= 0.0:
+            continue
+
+        pos = origin
+        travelled = 0.0
+        for _bounce in range(8):
+            hit, location, _normal, _index, obj, _matrix = scene.ray_cast(depsgraph, pos, d)
+            if not hit:
+                break
+            travelled += (location - pos).length
+            if falcon_photon.classify(obj)[0] == 'DIFFUSE':
+                # A surface that can hold a caustic: this is the distance that
+                # decides how wide the estimate is allowed to be.
+                accumulated += spread * travelled
+                count += 1
+                break
+            # Glass and mirrors are where caustics come from, not where they
+            # land. Carry on through them; the extra path length is the point,
+            # since a caustic seen through a window is further away than the
+            # window. Straight through is close enough for a 2% quantity -- the
+            # bend does not change the distance much.
+            pos = location + d * 1e-4
+        else:
+            continue
+
+    if count == 0:
+        return None
+    return accumulated / count
 
 
 class CYCLES_OT_falcon_photon_bake(Operator):
@@ -503,6 +815,40 @@ class CYCLES_OT_falcon_photon_bake(Operator):
             return {'CANCELLED'}
         cache_path, points_path = _falcon_photon_cache_paths(scene)
 
+        # Delivery guarantee: only the GPU point-map path composites into the
+        # normal render. With either toggle off this operator used to "succeed"
+        # while nothing appeared (and stock caustics still got disabled below).
+        # Which of the two stores gets used is the scene's own setting now; the
+        # environment only overrides it for A/B (FALCON_PHOTON_GRID=1 /
+        # FALCON_PHOTON_POINT=1).
+        cscene.falcon_photon_gpu = True
+        if os.environ.get("FALCON_PHOTON_GRID") == "1":
+            cscene.falcon_photon_point = False
+        elif os.environ.get("FALCON_PHOTON_POINT") == "1":
+            cscene.falcon_photon_point = True
+
+        # Measure the radius before baking, while the camera is where the user
+        # left it. It is a lookup-time value, so this does not constrain the
+        # bake -- it just means the number is chosen from the shot instead of
+        # typed in metres.
+        if cscene.falcon_photon_point_radius_auto:
+            measured = _falcon_photon_auto_radius(
+                context, pixels=cscene.falcon_photon_point_radius_px)
+            if measured is None:
+                self.report({'WARNING'},
+                            "半径の自動測定に失敗(カメラが無い/何にも当たらない)。"
+                            "%.3fm をそのまま使います" % cscene.falcon_photon_point_radius)
+            else:
+                measured = min(max(measured, 0.001), 0.5)
+                self.report({'INFO'}, "半径を自動決定: %.4fm (%.1f画素相当)"
+                            % (measured, cscene.falcon_photon_point_radius_px))
+                cscene.falcon_photon_point_radius = measured
+                # The accumulation grid wants its cell at the same size and for
+                # the same reason: one pixel's footprint is where quantization
+                # stops being visible. Same measurement, second consumer.
+                if not cscene.falcon_photon_point:
+                    cscene.falcon_photon_cell = measured
+
         disp = cscene.falcon_photon_dispersion
         use_points = cscene.falcon_photon_point and cscene.falcon_photon_gpu
         t0 = time.time()
@@ -519,7 +865,26 @@ class CYCLES_OT_falcon_photon_bake(Operator):
             if not lights:
                 self.report({'ERROR'}, "ライトが見つかりません(1灯必要)")
                 return {'CANCELLED'}
-            total_energy = sum(max(li.data.energy, 1e-6) for li in lights)
+            # ★★★2026-08-15 予算は「ワット数 × 届く割合」で配る(→ [_falcon_light_reach])。
+            #   ワット数だけで割ると、集光に関係のない明るい灯が全部持って行く
+            #   (classroom: 窓の外の補助光が97%=9.7億発を取り、焼き339秒の大半が
+            #   ガラスに当たらない光子だった)。
+            # ★★分母も同じ重みで割る=**取り上げた分は届く灯へ回り、総数は変わらない**。
+            #   最初は分母をワット数のままにして総数を減らしたが、それだと届く割合が
+            #   中くらいの灯で**粒が72%増えた**(`reachglass`台・1.7%で 0.735 -> 1.267)。
+            #   「光子数」の設定は**実際に撃つ数**であるべきで、シーンによって黙って
+            #   減らしてはいけない。速くなるのは「安い灯へ移る」ぶんだけにする。
+            # A/B用の逃げ道: FALCON_PHOTON_NO_REACH=1 でワット数だけの旧配分に戻す。
+            caster_sphere = None if os.environ.get("FALCON_PHOTON_NO_REACH") else \
+                _falcon_caster_sphere(scene)
+            reach = {li.name: _falcon_light_reach(li, caster_sphere) for li in lights}
+            for li in lights:
+                print("SHOOT_INFO reach %-20s %-6s %.4f" % (li.name, li.data.type,
+                                                            reach[li.name]))
+            total_energy = sum(max(li.data.energy, 1e-6) * reach[li.name] for li in lights)
+            if total_energy <= 0.0:
+                total_energy = sum(max(li.data.energy, 1e-6) for li in lights)
+                reach = {li.name: 1.0 for li in lights}
             saved_hide = {li.name: li.hide_render for li in lights}
             single = len(lights) == 1
 
@@ -528,16 +893,10 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                      cscene.samples, cscene.use_adaptive_sampling,
                      cscene.max_bounces, cscene.transmission_bounces,
                      cscene.glossy_bounces)
+            # Cell size / deposit radius / dispersion ride on the scene
+            # properties now (integrator sockets), so nothing to export here.
+            # Only the per-pass state below still travels by environment.
             os.environ["FALCON_PHOTON_MODE"] = "bake"
-            os.environ["FALCON_SHARC_CELL"] = "%.4f" % cscene.falcon_photon_cell
-            # Photon-map density-estimation radius (cells): wider = smoother
-            # caustics/rainbow rays from fewer photons.
-            os.environ["FALCON_PHOTON_RADIUS"] = "%.3f" % cscene.falcon_photon_radius
-            # Dispersion works on the GPU path too: the shared kernel hook
-            # (falcon_dispersion.h) fires for photon paths when this env is set,
-            # so refracted photons carry a wavelength and deposit rainbow flux.
-            if disp > 0.0:
-                os.environ["FALCON_DISPERSION_B"] = "%.4f" % disp
 
             per_light_cache = []
             per_light_pts = []
@@ -546,7 +905,7 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                     for other in lights:
                         other.hide_render = (other is not light)
 
-                    weight = max(light.data.energy, 1e-6) / total_energy
+                    weight = (max(light.data.energy, 1e-6) / total_energy) * reach[light.name]
                     n_photons = max(10000, round(cscene.falcon_photon_photons * weight))
                     # res capped at 4096 so the frame stays ONE tile (a bigger
                     # frame gets tiled and per-tile buffer re-uploads wipe the
@@ -557,9 +916,23 @@ class CYCLES_OT_falcon_photon_bake(Operator):
 
                     # per-light output files (single light => write straight to
                     # the final paths, skipping the merge/copy)
-                    li_cache = cache_path if single else (cache_path + ".L%d" % i)
+                    #
+                    # The grid does not use them: it accumulates through the
+                    # file instead, every pass writing and re-reading the one
+                    # cache. Summing separately baked grids cannot survive
+                    # collision probing (falcon_sharc.h) -- a site takes the
+                    # first free slot on its chain, so two independent passes
+                    # put it in different slots and an element-wise sum mixes
+                    # strangers: 253 dark specks on ocean at shipping
+                    # resolution, in a frame that had 0.
+                    li_cache = cache_path if (single or not use_points) else (
+                        cache_path + ".L%d" % i)
                     li_pts = points_path if single else (points_path + ".L%d" % i)
                     os.environ["FALCON_SHARC_CACHE"] = li_cache
+                    if use_points or i == 0:
+                        os.environ.pop("FALCON_PHOTON_ACCUM", None)
+                    else:
+                        os.environ["FALCON_PHOTON_ACCUM"] = "1"
                     if use_points:
                         os.environ["FALCON_PHOTON_POINTS"] = li_pts
                         # cap split by energy so the merged total <= user cap
@@ -592,6 +965,53 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                     per_light_cache.append(li_cache)
                     if use_points:
                         per_light_pts.append(li_pts)
+
+                # --- world (sky) photon pass -----------------------------
+                # The sky refracts through the same water and glass and lands
+                # as a caustic too, and nothing else in the frame carries it:
+                # the bake switches Cycles' own caustic paths off, and the lamp
+                # passes only shoot lamps. Light tracing has fired this pass
+                # since the beginning -- the bake never did, and that gap IS
+                # the layer's shortfall. Measured on ocean against a
+                # brute-force judge (tools/caustic_bands.py): grid 0.924, LT
+                # with its world pass 0.976, LT WITHOUT it 0.922. The two
+                # numbers that match are the two without a sky.
+                # Budget: one emitter's share, so a scene with a sky pays about
+                # one extra lamp's worth of bake time. Off = FALCON_PHOTON_NO_WORLD.
+                world_l = (0.0 if os.environ.get("FALCON_PHOTON_NO_WORLD")
+                           else _falcon_world_radiance(scene))
+                if world_l > 0.0:
+                    for other in lights:
+                        other.hide_render = True
+                    n_photons = max(10000, round(cscene.falcon_photon_photons /
+                                                 (len(lights) + 1)))
+                    res = max(64, min(4096, int(round(n_photons ** 0.5))))
+                    samples = max(1, round(n_photons / (res * res)))
+                    os.environ["FALCON_PHOTON_N"] = str(res * res * samples)
+                    os.environ["FALCON_PHOTON_WORLD"] = "%.6g" % world_l
+                    w_cache = (cache_path + ".W") if use_points else cache_path
+                    os.environ["FALCON_SHARC_CACHE"] = w_cache
+                    if use_points:
+                        w_pts = points_path + ".W"
+                        os.environ["FALCON_PHOTON_POINTS"] = w_pts
+                    else:
+                        os.environ["FALCON_PHOTON_ACCUM"] = "1"
+                    tgt = _falcon_sun_target(scene)
+                    if tgt:
+                        os.environ["FALCON_PHOTON_TARGET"] = tgt
+                    else:
+                        os.environ.pop("FALCON_PHOTON_TARGET", None)
+                    r.resolution_x = r.resolution_y = res
+                    r.resolution_percentage = 100
+                    cscene.samples = samples
+                    bpy.ops.render.render(write_still=False)
+                    os.environ.pop("FALCON_PHOTON_WORLD", None)
+                    if use_points:
+                        per_light_cache.append(w_cache)
+                        per_light_pts.append(w_pts)
+                        # the point map still merges files, so the merge has to
+                        # run even when there was only one lamp
+                        single = False
             except Exception as e:
                 self.report({'ERROR'}, "GPUフォトンベイク失敗: %s" % e)
                 return {'CANCELLED'}
@@ -605,19 +1025,19 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                 os.environ.pop("FALCON_PHOTON_N", None)
                 os.environ.pop("FALCON_PHOTON_MAXPTS", None)
                 os.environ.pop("FALCON_PHOTON_TARGET", None)
+                os.environ.pop("FALCON_PHOTON_ACCUM", None)
 
             # Merge per-light files into the final cache/points (no-op for a
             # single light -- it already wrote the final paths). Clean up temps.
-            if not single:
+            if not single and use_points:
                 try:
-                    if use_points:
-                        _falcon_merge_points(per_light_pts, points_path)
-                    else:
-                        _falcon_merge_grid(per_light_cache, cache_path)
+                    _falcon_merge_points(per_light_pts, points_path)
                 except Exception as e:
                     self.report({'ERROR'}, "フォトンマージ失敗: %s" % e)
                     return {'CANCELLED'}
                 for fp in per_light_cache + per_light_pts:
+                    if fp in (cache_path, points_path):
+                        continue  # a single lamp wrote the final file itself
                     try:
                         os.remove(fp)
                     except OSError:
@@ -639,24 +1059,16 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                 return {'CANCELLED'}
 
         os.environ["FALCON_PHOTON_MODE"] = "add"
+        # The cache path is computed per bake (per-light files), so it stays a
+        # per-pass value. Cell size, lookup radius, normal cone and gain are
+        # scene properties the integrator reads directly -- editing a slider
+        # now takes effect on the next render without any environment hop.
         os.environ["FALCON_SHARC_CACHE"] = cache_path
-        os.environ["FALCON_SHARC_CELL"] = "%.4f" % cscene.falcon_photon_cell
         if use_points and os.path.exists(points_path):
-            # Point map wins over the grid cache at load; radius/gain are
-            # render-time knobs (the sliders re-set these envs live).
+            # Point map wins over the grid cache at load.
             os.environ["FALCON_PHOTON_POINTS"] = points_path
-            os.environ["FALCON_PHOTON_RADIUS_M"] = "%.4f" % cscene.falcon_photon_point_radius
-            os.environ["FALCON_PHOTON_NORMAL_DEG"] = "30"
-            os.environ["FALCON_PHOTON_GAIN"] = "%.3f" % cscene.falcon_photon_point_gain
         else:
             os.environ.pop("FALCON_PHOTON_POINTS", None)
-        # Match the camera render to the bake: with dispersion on, through-glass
-        # camera paths should split too (the gem body rainbow), not just the
-        # baked floor caustic. Persist/clear the global knob accordingly.
-        if disp > 0.0:
-            os.environ["FALCON_DISPERSION_B"] = "%.4f" % disp
-        else:
-            os.environ.pop("FALCON_DISPERSION_B", None)
         # The photon layer now carries the caustic paths exclusively. Kill
         # PT's own caustics: with soft/large lights PT finds the same light
         # itself and the add mode double-counts (audit 2026-07-05: truth-base
@@ -794,6 +1206,166 @@ class CYCLES_OT_falcon_bake_and_render_range(Operator):
         return {'FINISHED'}
 
 
+def _falcon_lt_normconv(layer, radius):
+    """Composite-stage replica of the kernel splat blur (falcon_lt_splat):
+    per-splat gaussian with sigma = radius/2, footprint clamped to 9x9,
+    weights normalized over the in-bounds pixels of each SOURCE pixel.
+    Splatting raw (radius 0, gain 1) and blurring the accumulated layer here
+    is exactly the same image, because every splat shares one kernel and the
+    edge normalization depends only on the source pixel:
+        blurred = conv(raw / conv(ones, w), w)
+    (separable, zero padding = out-of-bounds contributes nothing). Moving the
+    blur here makes it re-tunable without a re-render (falcon_lt_recomposite).
+    Verified against a brute-force per-splat simulator, 2026-07-28."""
+    import numpy as np
+    if radius < 0.5:  # kernel early-out: physical single-pixel splat
+        return layer
+    R = min(int(np.ceil(radius)), 4)
+    k = 2.0 / (radius * radius)  # sigma = radius/2 -> 1/(2 sigma^2)
+    v = np.exp(-k * np.arange(-R, R + 1, dtype=np.float64) ** 2)
+
+    def conv1d(img, axis):
+        pad = [(0, 0)] * img.ndim
+        pad[axis] = (R, R)
+        p = np.pad(img, pad)
+        out = np.zeros(img.shape, dtype=np.float64)
+        for j, wj in enumerate(v):
+            sl = [slice(None)] * img.ndim
+            sl[axis] = slice(j, j + img.shape[axis])
+            out += wj * p[tuple(sl)]
+        return out
+
+    h, w = layer.shape[:2]
+    wsum = conv1d(conv1d(np.ones((h, w)), 0), 1)
+    return conv1d(conv1d(layer / wsum[:, :, None], 0), 1).astype(np.float32)
+
+
+def _falcon_lt_guide_from_pair(a, b, block=8):
+    """Where is the light tracer still noisy? Two independent estimates of the
+    same layer disagree exactly where the estimator has not converged, so
+    |a - b| / mean is a reference-free noise map. Averaged over blocks because
+    per-pixel it is itself mostly noise (2026-07-29: the world-cell version of
+    this is the error-field route's guide field; blocks are its screen-space
+    stand-in, which needs no Position pass)."""
+    import numpy as np
+
+    h, w = a.shape[:2]
+    lum = lambda x: 0.2126 * x[..., 0] + 0.7152 * x[..., 1] + 0.0722 * x[..., 2]
+    la, lb = lum(a).astype(np.float64), lum(b).astype(np.float64)
+    bh, bw = (h + block - 1) // block, (w + block - 1) // block
+
+    def pool(x):
+        pad = np.zeros((bh * block, bw * block), dtype=np.float64)
+        pad[:h, :w] = x
+        return pad.reshape(bh, block, bw, block).sum(axis=(1, 3))
+
+    mean = 0.5 * (pool(la) + pool(lb))
+    diff = pool(np.abs(la - lb))
+    guide = np.zeros_like(diff)
+    floor = np.percentile(mean[mean > 0], 20) if (mean > 0).any() else 0.0
+    live = mean > floor
+    guide[live] = diff[live] / mean[live]
+    return np.repeat(np.repeat(guide, block, axis=0), block, axis=1)[:h, :w]
+
+
+def _falcon_lt_tile_scores(layers, guide):
+    """Score each launch tile by how much of the still-noisy transport it
+    carries: sum over pixels of guide * layer. A tile that lands only where the
+    layer has already converged scores low even if it carries most of the
+    energy -- measured 2026-07-29, weighting by energy instead leaves the
+    fringe noise untouched (-0.1%) while this weighting cuts it 15.9%."""
+    import numpy as np
+
+    lum = lambda x: 0.2126 * x[..., 0] + 0.7152 * x[..., 1] + 0.0722 * x[..., 2]
+    return [float((guide * lum(l)).sum()) for l in layers]
+
+
+def _falcon_lt_allocate(scores, energies, budget):
+    """Split a sample budget over the tiles by score. Tiles that carry no
+    transport at all (the probe found nothing) are dropped -- on the probe
+    scene that was 5 of 16 tiles, a third of the cone spent on directions that
+    miss the caster entirely. Every tile that does carry transport keeps at
+    least one sample: dropping it would remove its energy from the layer, which
+    is bias, not noise."""
+    live = [i for i, e in enumerate(energies) if e > 0.0]
+    if not live:
+        return {}
+    total = sum(scores[i] for i in live)
+    if total <= 0.0:
+        share = {i: 1.0 / len(live) for i in live}
+    else:
+        share = {i: scores[i] / total for i in live}
+    alloc = {i: max(1, int(round(share[i] * budget))) for i in live}
+    while sum(alloc.values()) > budget and any(v > 1 for v in alloc.values()):
+        k = max(alloc, key=lambda i: alloc[i])
+        alloc[k] -= 1
+    return alloc
+
+
+def _falcon_lt_write_exr(path, layer, w, h):
+    """Write an RGB float layer out as the raw pass EXR the composite reads."""
+    import numpy as np
+
+    name = "Falcon LT raw"
+    if name in bpy.data.images:
+        bpy.data.images.remove(bpy.data.images[name])
+    img = bpy.data.images.new(name, w, h, alpha=True, float_buffer=True)
+    rgba = np.concatenate([layer, np.ones((h, w, 1), dtype=layer.dtype)], axis=2)
+    img.pixels[:] = rgba.ravel()
+    img.filepath_raw = path
+    img.file_format = 'OPEN_EXR'
+    img.save()
+    bpy.data.images.remove(img)
+
+
+def _falcon_lt_publish(context, scene, stem, comp, w, h, report):
+    """Composite array -> "Falcon LT合成" EXR datablock + color-managed 8-bit
+    display PNG pushed into every open image editor. Shared tail of the LT
+    render and the recomposite operator. Returns (exr_path, png_path|None)."""
+    out_path = stem + "_composite.exr"
+    name = "Falcon LT合成"
+    if name in bpy.data.images:
+        bpy.data.images.remove(bpy.data.images[name])
+    out = bpy.data.images.new(name, w, h, alpha=True, float_buffer=True)
+    out.pixels[:] = comp.ravel()
+    out.filepath_raw = out_path
+    out.file_format = 'OPEN_EXR'
+    out.save()
+
+    # Bake the scene's view transform + exposure + look into an 8-bit sRGB PNG
+    # via save_render (runs the render color management pipeline on the linear
+    # composite), then surface it as the front-and-center result image.
+    disp_path = stem + "_composite.png"
+    img_set = scene.render.image_settings
+    try:
+        _fmt = (img_set.file_format, img_set.color_mode, img_set.color_depth)
+        img_set.file_format = 'PNG'
+        img_set.color_mode = 'RGBA'
+        img_set.color_depth = '8'
+        try:
+            out.save_render(disp_path, scene=scene)
+        finally:
+            (img_set.file_format, img_set.color_mode, img_set.color_depth) = _fmt
+    except Exception as e:
+        report({'WARNING'}, "表示画像の書き出し失敗(EXRは保存済): %s" % e)
+        return out_path, None
+
+    dname = "Falcon LT合成 (表示)"
+    if dname in bpy.data.images:
+        bpy.data.images.remove(bpy.data.images[dname])
+    disp = bpy.data.images.load(disp_path)
+    disp.name = dname
+    wm = context.window_manager
+    for win in getattr(wm, "windows", []):
+        scr = getattr(win, "screen", None)
+        if scr is None:
+            continue
+        for area in scr.areas:
+            if area.type == 'IMAGE_EDITOR':
+                area.spaces.active.image = disp
+    return out_path, disp_path
+
+
 class CYCLES_OT_falcon_lighttrace_render(Operator):
     """ライトトレース合成レンダー(FQ静止画)。光源から光子を追いカメラへ直接つなぐ"""     """キャッシュ無しコースティクス: サンプル数で本当に収束する(点マップのドット無し)。"""     """各ライトのLTパス+通常レンダーを実行し、加算合成した画像を保存する。"""     """重い: サンプル数=シーンのサンプル数。まず低サンプルで試す。固定サンプリングで実行される"""
     bl_idname = "cycles.falcon_lighttrace_render"
@@ -802,6 +1374,94 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
     @classmethod
     def poll(cls, context):
         return context.scene is not None
+
+    def _guided_pass(self, scene, cscene, r, w, h, spp, n, stem, load_rgba):
+        """Guided emission: spend this light's photon budget where the light
+        tracer is still noisy instead of spreading it evenly over the emission
+        cone. Three stages, every one of them an unbiased estimate of the same
+        layer, so all three are kept and averaged by photon count:
+
+          1. probe   -- each of the n*n launch tiles at `probe` samples
+          2. control -- the whole cone twice at `probe` samples; the pair is the
+                        reference-free noise map (see _falcon_lt_guide_from_pair)
+          3. guided  -- what is left of the budget, split over the tiles by how
+                        much of the *noisy* transport each one carries
+
+        Measured on the luxcore-vs-CyclesF probe scene at an equal 32-sample
+        budget (2026-07-29): relative noise -17.9% against the plain cone-wide
+        render. Weighting by energy instead of by noise gives -8.9%, and simply
+        dropping the tiles that carry nothing gives -11.7%, so both halves --
+        skipping the void and steering the rest -- carry real weight."""
+        import os
+        import numpy as np
+        probe = max(1, spp // (4 * n * n))
+        fixed = n * n * probe + 2 * probe
+        if fixed >= spp:
+            self.report({'WARNING'},
+                        "誘導%dx%d はサンプル数%dでは足りません(最低%d)。通常のLTで焼きます"
+                        % (n, n, spp, fixed + 1))
+            os.environ.pop("FALCON_PHOTON_TILE", None)
+            r.filepath = "%s_guided_fallback.exr" % stem
+            bpy.ops.render.render(write_still=True)
+            return load_rgba(r.filepath)[:, :, :3].astype(np.float64)
+
+        saved = (cscene.samples, cscene.seed)
+        tmp = "%s_guidetmp.exr" % stem
+
+        def shoot(tile, samples, seed):
+            cscene.samples = samples
+            cscene.seed = seed
+            os.environ["FALCON_LIGHTTRACE_SAMPLES"] = str(samples)
+            os.environ["FALCON_PHOTON_N"] = str(w * h * samples)
+            if tile is None:
+                os.environ.pop("FALCON_PHOTON_TILE", None)
+            else:
+                os.environ["FALCON_PHOTON_TILE"] = "%d,%d,%d" % (tile[0], tile[1], n)
+            r.filepath = tmp
+            bpy.ops.render.render(write_still=True)
+            return load_rgba(tmp)[:, :, :3].astype(np.float64)
+
+        try:
+            base_seed = saved[1]
+            control_a = shoot(None, probe, base_seed)
+            control_b = shoot(None, probe, base_seed + 1)
+            tiles = [(i, j) for i in range(n) for j in range(n)]
+            layers = [shoot(t, probe, base_seed + 2) for t in tiles]
+
+            guide = _falcon_lt_guide_from_pair(control_a, control_b)
+            scores = _falcon_lt_tile_scores(layers, guide)
+            energies = [float(l.sum()) for l in layers]
+            budget = spp - fixed
+            alloc = _falcon_lt_allocate(scores, energies, budget)
+            print("Falcon LT guided: probe %d spp/tile, %d/%d tiles carry transport, "
+                  "%d spp to spend (probe_sum %.4e, control %.4e / %.4e)"
+                  % (probe, len(alloc), len(tiles), budget,
+                     float(sum(energies)), float(control_a.sum()), float(control_b.sum())))
+
+            probe_sum = layers[0]
+            for l in layers[1:]:
+                probe_sum = probe_sum + l
+            weighted = (n * n * probe) * probe_sum + probe * control_a + probe * control_b
+            total_w = n * n * probe + 2 * probe
+            if alloc:
+                guided_sum = None
+                for idx, samples in sorted(alloc.items()):
+                    got = shoot(tiles[idx], samples, base_seed + 3)
+                    guided_sum = got if guided_sum is None else guided_sum + got
+                spent = sum(alloc.values())
+                print("Falcon LT guided: guided stage %d spp over %d tiles, sum %.4e"
+                      % (spent, len(alloc), float(guided_sum.sum())))
+                weighted = weighted + spent * guided_sum
+                total_w += spent
+            return weighted / float(total_w)
+        finally:
+            os.environ.pop("FALCON_PHOTON_TILE", None)
+            cscene.samples, cscene.seed = saved
+            os.environ["FALCON_LIGHTTRACE_SAMPLES"] = str(saved[0])
+            os.environ["FALCON_PHOTON_N"] = str(w * h * saved[0])
+            for junk in (tmp,):
+                if os.path.exists(junk):
+                    os.remove(junk)
 
     def execute(self, context):
         import os
@@ -815,11 +1475,22 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
         if r.engine != 'CYCLES':
             self.report({'ERROR'}, "レンダーエンジンがCYCLESではありません")
             return {'CANCELLED'}
+        # POINT is here because the photon emitter grew a POINT branch
+        # (init_from_camera.h, 2026-08-15) and the flux for it is the generic
+        # watts/N this host already computes -- a point lamp radiates its whole
+        # power into 4 pi, which is exactly what that expression means. Leaving
+        # it out of this list was the only thing stopping bake-free caustics on
+        # a point-lit scene.
         lights = [o for o in scene.objects if o.type == 'LIGHT' and not o.hide_render
-                  and o.data.type in ('SUN', 'AREA', 'SPOT')]
+                  and o.data.type in ('SUN', 'AREA', 'SPOT', 'POINT')]
         if not lights:
-            self.report({'ERROR'}, "対応ライトがありません (SUN/AREA/SPOT)")
+            self.report({'ERROR'}, "対応ライトがありません (SUN/AREA/SPOT/POINT)")
             return {'CANCELLED'}
+        # Flood-risk heuristic: warn (do not block) when the geometry is the LT
+        # 'flood' failure mode (embedded base lamp over a big diffuse plane).
+        flood_msg = _falcon_lt_flood_risk(scene)
+        if flood_msg:
+            self.report({'WARNING'}, flood_msg)
         w = int(r.resolution_x * r.resolution_percentage / 100)
         h = int(r.resolution_y * r.resolution_percentage / 100)
         if max(w, h) > 4096:
@@ -832,10 +1503,26 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             tempfile.gettempdir(),
             "falcon_lt_%s" % (bpy.path.basename(bpy.data.filepath) or "scene"))
 
+        # FALCON_SHARC_CACHE is in this list because leaving it out DESTROYED the
+        # user's bake. The LT passes run with FALCON_PHOTON_MODE=bake, and the
+        # save hook (path_trace.cpp) writes the device buffer to whatever
+        # FALCON_SHARC_CACHE points at whenever the mode is "bake" -- while the
+        # LT branch never deposits, so that buffer is still the zeros it was
+        # allocated with. After a photon bake the variable is left pointing at
+        # the real cache file (see the end of _bake_impl), so running LT in the
+        # same session overwrote a good bake with 1 GB of zeros and every later
+        # render silently lost its caustics.
+        #
+        # Reproduced 2026-08-16 in one process (tools/repro_lt_wipes_cache.py in
+        # cyclesf-lab): after the bake the cache held 378848 non-zero floats in
+        # its first 20M, after the LT run it held 0. The measurement harness
+        # could never see this -- it runs one render per process, so the
+        # variable never survives to the next step. Only a GUI session (or that
+        # script) keeps one process alive across bake and LT.
         env_keys = ("FALCON_PHOTON_MODE", "FALCON_LIGHTTRACE", "FALCON_LIGHTTRACE_SAMPLES",
                     "FALCON_PHOTON_N", "FALCON_LIGHTTRACE_GAIN", "FALCON_LT_SPLAT_RADIUS",
                     "FALCON_LT_VISIBILITY", "FALCON_PHOTON_MAXPTS", "FALCON_PHOTON_TARGET",
-                    "FALCON_PHOTON_POINTS", "FALCON_PHOTON_WORLD")
+                    "FALCON_PHOTON_POINTS", "FALCON_PHOTON_WORLD", "FALCON_SHARC_CACHE")
         saved_env = {k: os.environ.get(k) for k in env_keys}
         saved_hide = {li.name: li.hide_render for li in lights}
         img_set = r.image_settings
@@ -845,6 +1532,21 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                  img_set.color_mode)
         saved_denoise = cscene.use_denoising
         saved_caustics = (cscene.caustics_reflective, cscene.caustics_refractive)
+        # The LT and world passes are intermediates: they are written to disk and
+        # then ADDED to beauty. bpy.ops.render.render() writes the scene's
+        # COMPOSITOR output, not the raw Combined pass, so every compositor node
+        # that adds a constant (vignette overlay, glare, gamma, curves) lands in
+        # the layer and is counted a SECOND time on top of beauty.
+        # Measured on pabellon 2026-08-25: with the shipped 37-node tree the
+        # layer covered 99.999 % of the frame at mean 0.11483 instead of a sparse
+        # caustic; with compositing off, 0.0998 % at 0.000584 (197x less energy).
+        # That pedestal is the whole of the +21 % sky and of the 10.9x "flood"
+        # that had been open and unexplained since 2026-08-02. The lab scenes all
+        # have ZERO compositor nodes, which is why only production scenes hit it.
+        # Beauty keeps the user's compositor -- it is restored just before it.
+        saved_comp = (r.use_compositing, r.use_sequencer)
+        r.use_compositing = False
+        r.use_sequencer = False
         # Glass bodies must not occlude the LT camera-connection ray: the
         # kernel passes SD_OBJECT_CAUSTICS_CASTER objects through (straight-
         # line-through-specular, LuxCore's own approximation). Tag every
@@ -864,6 +1566,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
 
         t0 = time.time()
         lt_sum = None
+        pass_files = []
         try:
             # --- LT pass, one render per light (integrator emits from the
             # first enabled light; layers add linearly) ---
@@ -871,13 +1574,25 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                 ob.cycles.is_caustics_caster = True
             os.environ["FALCON_PHOTON_MODE"] = "bake"
             os.environ["FALCON_LIGHTTRACE"] = "1"
+            # The save hook cannot be told "do not save" from here, so it is
+            # pointed at a scratch file that is deleted in the finally below.
+            # NOT under /tmp: that is tmpfs on this machine and the hook writes
+            # the full 1 GB table once per pass.
+            lt_scratch = os.path.join(
+                os.path.dirname(_falcon_photon_cache_paths(scene)[0]), "_lt_scratch.bin")
+            os.environ["FALCON_SHARC_CACHE"] = lt_scratch
             os.environ["FALCON_LIGHTTRACE_SAMPLES"] = str(spp)
             os.environ["FALCON_PHOTON_N"] = str(w * h * spp)
-            os.environ["FALCON_LIGHTTRACE_GAIN"] = "%.3f" % cscene.falcon_lt_gain
-            if cscene.falcon_lt_blur > 0.0:
-                os.environ["FALCON_LT_SPLAT_RADIUS"] = "%.2f" % cscene.falcon_lt_blur
-            else:
-                os.environ.pop("FALCON_LT_SPLAT_RADIUS", None)
+            # Raw physical baseline (gain 1, no splat blur): both knobs are
+            # linear over the LT layer -- gain is a pure multiply after the 4x
+            # flux clamp, the blur is one shared splat kernel -- so they moved
+            # to the composite stage (_falcon_lt_normconv below) where
+            # re-tuning them costs seconds, not a re-render.
+            # Both are forced here rather than cleared: with the knobs on scene
+            # properties now, an unset variable means "use the scene value", and
+            # the scene's gain/blur are exactly what this pass must not bake in.
+            os.environ["FALCON_LIGHTTRACE_GAIN"] = "1.000"
+            os.environ["FALCON_LT_SPLAT_RADIUS"] = "0.0"
             if cscene.falcon_lt_visibility:
                 os.environ["FALCON_LT_VISIBILITY"] = "1"
             else:
@@ -897,6 +1612,23 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             img_set.color_depth = '32'
             img_set.color_mode = 'RGB'
 
+            # ★発射窓(タイル)は SUN と SPOT にしか実装がない
+            #   (scene/integrator.cpp の sun 枝と is_spot 枝だけが
+            #    FALCON_PHOTON_TILE を読む)。POINT/AREA では無視されるので、
+            #   **各タイルのパスが全球を撒いたフル層になり、それを n^2 枚
+            #   足し込む**。2026-08-16 に cupgap64(POINT灯)で実測:
+            #     4x4  energy 1.2450 / 誤差 0.4305 / 描画 69.9秒(四角い塊が散る)
+            #     オフ energy 0.9855 / 誤差 0.0528 / 描画  4.5秒
+            #   出荷の既定はオフなので出荷には出ないが、ホスト側に光源種別の
+            #   チェックが無かったのが本体。窓を持てない灯が1つでも混ざる
+            #   なら、その灯だけ誘導を切る。
+            tiles = int(cscene.falcon_lt_guide_tiles)
+            unguided = [li.name for li in lights
+                        if li.data.type not in ('SUN', 'SPOT')]
+            if tiles > 1 and unguided:
+                self.report({'WARNING'},
+                            "発射窓は SUN/SPOT のみ対応のため、%s は誘導なしで焼きます"
+                            % "/".join(unguided))
             for i, light in enumerate(lights):
                 for other in lights:
                     other.hide_render = (other is not light)
@@ -905,9 +1637,20 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                     tgt = _falcon_sun_target(scene)
                     if tgt:
                         os.environ["FALCON_PHOTON_TARGET"] = tgt
-                r.filepath = "%s_pass%d.exr" % (stem, i)
-                bpy.ops.render.render(write_still=True)
-                layer = _load_rgba(r.filepath)[:, :, :3]
+                out_path = "%s_pass%d.exr" % (stem, i)
+                can_guide = light.data.type in ('SUN', 'SPOT')
+                if tiles > 1 and can_guide:
+                    # the guided pass renders to its own scratch file, so the
+                    # destination has to be remembered here rather than read
+                    # back off r.filepath afterwards
+                    layer = self._guided_pass(scene, cscene, r, w, h, spp, tiles,
+                                              stem, _load_rgba)
+                    _falcon_lt_write_exr(out_path, layer, w, h)
+                else:
+                    r.filepath = out_path
+                    bpy.ops.render.render(write_still=True)
+                    layer = _load_rgba(out_path)[:, :, :3]
+                pass_files.append(out_path)
                 lt_sum = layer if lt_sum is None else (lt_sum + layer)
 
             # --- world pass: uniform-environment photons (world->glass->
@@ -926,6 +1669,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                 r.filepath = stem + "_passworld.exr"
                 bpy.ops.render.render(write_still=True)
                 os.environ.pop("FALCON_PHOTON_WORLD", None)
+                pass_files.append(r.filepath)
                 lt_sum = lt_sum + _load_rgba(r.filepath)[:, :, :3]
 
             # --- beauty pass with the user's own settings/envs restored ---
@@ -937,6 +1681,11 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+            try:
+                os.remove(os.path.join(
+                    os.path.dirname(_falcon_photon_cache_paths(scene)[0]), "_lt_scratch.bin"))
+            except OSError:
+                pass
             (cscene.use_adaptive_sampling, cscene.max_bounces,
              cscene.transmission_bounces, cscene.glossy_bounces,
              _, _, _, _) = saved
@@ -949,23 +1698,42 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             img_set.file_format = 'OPEN_EXR'
             img_set.color_depth = '32'
             img_set.color_mode = 'RGBA'
+            # Beauty is what the user actually looks at, so it gets their own
+            # compositor back. Only the added LT layer had to stay raw.
+            (r.use_compositing, r.use_sequencer) = saved_comp
             r.filepath = stem + "_beauty.exr"
             bpy.ops.render.render(write_still=True)
             beauty = _load_rgba(r.filepath)
 
             # --- additive composite (LT carries only caustic paths the camera
-            # tracer cannot find, same no-double-count argument as photon add) ---
+            # tracer cannot find, same no-double-count argument as photon add).
+            # Gain and blur are applied HERE, on the raw LT layer -- exactly
+            # equivalent to the old in-kernel path (see _falcon_lt_normconv). ---
+            # Measured self-check on the layer we are about to add. A caustic
+            # layer is SPARSE: most pixels are exactly zero. If nearly every
+            # pixel is lit, the layer is carrying something that is not a
+            # caustic (a compositor pedestal, a background write, a leak).
+            # _falcon_lt_flood_risk above only predicts from scene properties --
+            # a counter that is always broken says nothing when it breaks.
+            lit_frac = float(np.count_nonzero(lt_sum[:, :, :3])) / lt_sum[:, :, :3].size
+            if lit_frac > 0.95:
+                self.report({'WARNING'},
+                            "LT層が画面の%.1f%%を覆っています(集光層は疎なはず)。"
+                            "コンポジター出力や背景が層に混ざっている可能性があります"
+                            % (100.0 * lit_frac))
             comp = beauty.copy()
-            comp[:, :, :3] += lt_sum
-            out_path = stem + "_composite.exr"
-            name = "Falcon LT合成"
-            if name in bpy.data.images:
-                bpy.data.images.remove(bpy.data.images[name])
-            out = bpy.data.images.new(name, w, h, alpha=True, float_buffer=True)
-            out.pixels[:] = comp.ravel()
-            out.filepath_raw = out_path
-            out.file_format = 'OPEN_EXR'
-            out.save()
+            comp[:, :, :3] += cscene.falcon_lt_gain * _falcon_lt_normconv(
+                lt_sum, cscene.falcon_lt_blur)
+            # Manifest so falcon_lt_recomposite can re-tune gain/blur from the
+            # raw passes without re-rendering. raw_gain/raw_blur document what
+            # is baked into the pass files (must stay 1.0/0.0).
+            import json
+            with open(stem + "_manifest.json", "w") as f:
+                json.dump({"w": w, "h": h, "spp": spp, "raw_gain": 1.0,
+                           "raw_blur": 0.0, "passes": pass_files,
+                           "beauty": stem + "_beauty.exr"}, f)
+            out_path, disp_path = _falcon_lt_publish(
+                context, scene, stem, comp, w, h, self.report)
         except Exception as e:
             self.report({'ERROR'}, "LTレンダー失敗: %s" % e)
             return {'CANCELLED'}
@@ -978,16 +1746,112 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+            try:
+                os.remove(os.path.join(
+                    os.path.dirname(_falcon_photon_cache_paths(scene)[0]), "_lt_scratch.bin"))
+            except OSError:
+                pass
             (cscene.use_adaptive_sampling, cscene.max_bounces,
              cscene.transmission_bounces, cscene.glossy_bounces,
              r.filepath, img_set.file_format, img_set.color_depth,
              img_set.color_mode) = saved
             cscene.use_denoising = saved_denoise
             (cscene.caustics_reflective, cscene.caustics_refractive) = saved_caustics
+            (r.use_compositing, r.use_sequencer) = saved_comp
 
-        self.report({'INFO'}, "LT合成完了 (%d灯%s, %dspp, %.0f秒) → 画像「Falcon LT合成」 %s"
+        self.report({'INFO'}, "LT合成完了 (%d灯%s, %dspp, %.0f秒)%s → 表示画像「Falcon LT合成 (表示)」 %s"
                     % (len(lights), "+ワールド" if world_l > 0.0 else "",
-                       spp, time.time() - t0, out_path))
+                       spp, time.time() - t0,
+                       " ⚠氾濫の危険あり" if flood_msg else "",
+                       disp_path if disp_path else out_path))
+        return {'FINISHED'}
+
+
+class CYCLES_OT_falcon_lt_clean_caustics(Operator):
+    """清書コースティクス(LT)。数分かかる最終静止画用の一本道。フォトンの点マップと違い、"""     """サンプル数で本当に収束した滑らかな集光(点々なし・段々のファセット構造まで)を出す。"""     """実行後はカラーマネジメント(露出/ビュー変換)適用済みの表示画像として画像エディタに開く。"""     """まず気軽な[コースティクスを出す](フォトン)で構図を決め、仕上げにこちらを使う想定。"""
+    bl_idname = "cycles.falcon_lt_clean_caustics"
+    bl_label = "清書コースティクス (LT)"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def execute(self, context):
+        scene = context.scene
+        cscene = scene.cycles
+        if not _falcon_scene_has_caustics(scene):
+            self.report({'ERROR'},
+                        "ガラス/屈折マテリアルとライト(SUN/AREA/SPOT)が要ります")
+            return {'CANCELLED'}
+        # 'Clean' floor so a single press converges even from a rough scene:
+        # fixed sampling handled by the LT op; here we lift very-low sample
+        # counts and give a small default blur. Temporary -- restored after.
+        saved = (cscene.samples, cscene.falcon_lt_blur)
+        if cscene.samples < 512:
+            cscene.samples = 512
+        if cscene.falcon_lt_blur <= 0.0:
+            cscene.falcon_lt_blur = 2.0
+        try:
+            return bpy.ops.cycles.falcon_lighttrace_render()
+        finally:
+            (cscene.samples, cscene.falcon_lt_blur) = saved
+
+
+class CYCLES_OT_falcon_lt_recomposite(Operator):
+    """LT再合成: 直前のLT合成レンダーが残した生パス(ゲイン1/ぼかし0)に、"""     """現在のゲイン/ぼかし値を適用し直して合成画像だけ作り直す。再レンダー無し・数秒。"""     """ゲインとぼかしはLT層に対して線形なので、レンダーし直した場合と結果は厳密に一致する。"""
+    bl_idname = "cycles.falcon_lt_recomposite"
+    bl_label = "LT再合成 (ゲイン/ぼかし変更・再レンダー無し)"
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def execute(self, context):
+        import os
+        import json
+        import time
+        import tempfile
+        import numpy as np
+
+        scene = context.scene
+        cscene = scene.cycles
+        stem = os.path.join(
+            tempfile.gettempdir(),
+            "falcon_lt_%s" % (bpy.path.basename(bpy.data.filepath) or "scene"))
+        mpath = stem + "_manifest.json"
+        if not os.path.exists(mpath):
+            self.report({'ERROR'},
+                        "生パスがありません。先に[ライトトレース合成レンダー]を実行してください")
+            return {'CANCELLED'}
+        try:
+            with open(mpath) as f:
+                m = json.load(f)
+            w, h = m["w"], m["h"]
+
+            def _load(path):
+                img = bpy.data.images.load(path)
+                px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+                bpy.data.images.remove(img)
+                return px
+
+            t0 = time.time()
+            lt_sum = None
+            for p in m["passes"]:
+                layer = _load(p)[:, :, :3]
+                lt_sum = layer if lt_sum is None else (lt_sum + layer)
+            comp = _load(m["beauty"])
+            comp[:, :, :3] += cscene.falcon_lt_gain * _falcon_lt_normconv(
+                lt_sum, cscene.falcon_lt_blur)
+            out_path, disp_path = _falcon_lt_publish(
+                context, scene, stem, comp, w, h, self.report)
+        except Exception as e:
+            self.report({'ERROR'}, "再合成失敗 (生パス欠損/破損?): %s" % e)
+            return {'CANCELLED'}
+        self.report({'INFO'},
+                    "LT再合成完了 (%dパス, ゲイン%.2f ぼかし%.1f, %.1f秒) → %s"
+                    % (len(m["passes"]), cscene.falcon_lt_gain,
+                       cscene.falcon_lt_blur, time.time() - t0,
+                       disp_path if disp_path else out_path))
         return {'FINISHED'}
 
 
@@ -1454,10 +2318,13 @@ classes = (
     CYCLES_OT_falcon_near_realtime,
     CYCLES_OT_falcon_final_quality,
     CYCLES_OT_falcon_still_quality,
+    CYCLES_OT_falcon_auto_caustics,
     CYCLES_OT_falcon_photon_bake,
     CYCLES_OT_falcon_photon_clear,
     CYCLES_OT_falcon_bake_and_render_range,
     CYCLES_OT_falcon_lighttrace_render,
+    CYCLES_OT_falcon_lt_clean_caustics,
+    CYCLES_OT_falcon_lt_recomposite,
     CYCLES_OT_falcon_temporal_setup,
     CYCLES_OT_falcon_warmup_render,
 )

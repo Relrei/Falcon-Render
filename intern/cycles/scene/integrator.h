@@ -36,6 +36,17 @@ struct HaltonSequence {
   int a3, b3;
 };
 
+#ifdef WITH_FALCON_SHARC
+/* Falcon SHARC cache mode, mirroring the FALCON_SHARC_MODE strings the
+ * environment bridge used ("warmup"/"blend"/"live"). */
+enum FalconSharcMode {
+  FALCON_SHARC_MODE_OFF = 0,
+  FALCON_SHARC_MODE_WARMUP = 1,
+  FALCON_SHARC_MODE_BLEND = 2,
+  FALCON_SHARC_MODE_LIVE = 3,
+};
+#endif
+
 class Integrator : public Node {
  public:
   NODE_DECLARE
@@ -150,6 +161,44 @@ class Integrator : public Node {
   NODE_SOCKET_API(DenoiserQuality, denoiser_quality);
   NODE_SOCKET_API(float, denoiser_upscale_factor);
   NODE_SOCKET_API(bool, denoiser_carry_history);
+  NODE_SOCKET_API(int, denoiser_preroll_passes);
+
+#ifdef WITH_FALCON_SHARC
+  /* Falcon knobs. These used to be read straight from the environment inside
+   * device_update(), which made them process-global: the viewport and the final
+   * render could not hold different values, and nothing survived a .blend save.
+   * They are sockets now, fed from the scene's Cycles properties in sync.cpp.
+   * The environment variables still win when set, so the A/B harnesses under
+   * obs2/claude_memo/ベンチマーク keep working unchanged; a GUI session sets no
+   * environment and therefore rides on these sockets.
+   *
+   * Per-pass state that an operator computes (FALCON_PHOTON_MODE/N/TARGET/WORLD/
+   * MAXPTS/POINTS, FALCON_LIGHTTRACE[_SAMPLES]) is deliberately NOT here -- it
+   * is not a user knob and still travels by environment. */
+  NODE_SOCKET_API(int, falcon_sharc_mode);
+  NODE_SOCKET_API(float, falcon_sharc_cell);
+  NODE_SOCKET_API(float, falcon_sharc_alpha);
+  NODE_SOCKET_API(float, falcon_sharc_keep);
+  NODE_SOCKET_API(ustring, falcon_sharc_cache);
+  NODE_SOCKET_API(bool, falcon_sharc_gate);
+  NODE_SOCKET_API(float, falcon_sharc_gate_low);
+  NODE_SOCKET_API(float, falcon_sharc_gate_high);
+  NODE_SOCKET_API(float, falcon_dispersion_b);
+  NODE_SOCKET_API(float, falcon_photon_radius);
+  NODE_SOCKET_API(float, falcon_photon_point_radius_m);
+  NODE_SOCKET_API(float, falcon_photon_point_normal_deg);
+  NODE_SOCKET_API(float, falcon_photon_point_gain);
+  NODE_SOCKET_API(float, falcon_lt_gain);
+  NODE_SOCKET_API(float, falcon_lt_splat_radius);
+  NODE_SOCKET_API(bool, falcon_lt_visibility);
+  NODE_SOCKET_API(bool, falcon_lt_direct);
+  NODE_SOCKET_API(ustring, falcon_das_map);
+  NODE_SOCKET_API(float, falcon_das_strength);
+  NODE_SOCKET_API(ustring, falcon_error_map);
+  NODE_SOCKET_API(float, falcon_error_cell);
+  NODE_SOCKET_API(float, falcon_error_threshold);
+  NODE_SOCKET_API(bool, falcon_error_raise_alpha);
+#endif
 
   enum : uint32_t {
     AO_PASS_MODIFIED = (1 << 0),
