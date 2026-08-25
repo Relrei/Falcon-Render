@@ -53,3 +53,14 @@ ninja -j6
 - If you have touched the CUDA kernel, you must `touch intern/cycles/kernel/device/cuda/kernel.cu`
   before building or it will not be recompiled
 - Keep the parallel job count to around 6 (any more and it uses up all the memory)
+
+## The source is also public on GitHub
+
+**https://github.com/Relrei/blender-cyclesf-falcon**
+
+The source corresponding to this build is available either from the bundled
+`falcon-render-v0.3-beta-src.tar.xz` or from the **`v0.3-beta` tag** on GitHub —
+they are the same tree.
+
+The source is public because it should be, not because GPL forces a minimum:
+GPL only requires source to be given **to the people who received the binary**.

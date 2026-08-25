@@ -30,6 +30,17 @@ tar xf falcon-render-v0.3-beta-src.tar.xz
 git submodule update --init --checkout lib/linux_x64
 ```
 
+## ソースは GitHub でも公開しています
+
+**https://github.com/Relrei/blender-cyclesf-falcon**
+
+このビルドに対応するソースは、同梱の `falcon-render-v0.3-beta-src.tar.xz` と
+**タグ `v0.3-beta`**(GitHub)のどちらでも同じものが取れます。
+
+ソースを公開しているのは、GPL が最低限そう求めているからではありません
+(GPL が求めるのは**バイナリを受け取った人へ渡すこと**だけです)。
+**公開しておくべきものだと考えているからです。**
+
 ## 仕組みの解説
 
 コードそのものより、**何をどう考えて作ったか**の解説を別に書いています。
