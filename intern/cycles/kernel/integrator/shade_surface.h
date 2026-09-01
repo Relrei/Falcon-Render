@@ -443,7 +443,7 @@ ccl_device
 #ifdef __RAY_DIFFERENTIALS__
     /* Widen ray differences, with same logic as forward sampling to ensure
      * both MIS strategies converge to the same result. */
-    ray.dD = bsdf_widen_dD(INTEGRATOR_STATE(state, ray, dD), avg_roughness_squared);
+    ray.dD = bsdf_widen_dD(kg, INTEGRATOR_STATE(state, ray, dD), avg_roughness_squared);
 #endif
   }
 
@@ -624,7 +624,8 @@ ccl_device_forceinline int integrate_surface_bsdf_bssrdf_bounce(
 
     /* Widen ray differences, with same logic as NEE sampling to ensure
      * both MIS strategies converge to the same result. */
-    const float dD = bsdf_widen_dD(INTEGRATOR_STATE(state, ray, dD), bsdf_avg_roughness_squared);
+    const float dD = bsdf_widen_dD(
+        kg, INTEGRATOR_STATE(state, ray, dD), bsdf_avg_roughness_squared);
     INTEGRATOR_STATE_WRITE(state, ray, dD) = dD;
 #endif
   }
@@ -1065,8 +1066,14 @@ ccl_device int integrate_surface(KernelGlobals kg,
            * beauty pass. It was a complete no-op -- pabellon stayed at 10.9085
            * and ocean moved 0.9717 -> 0.9719 -- so every splat LT makes is
            * already a first diffuse hit. Removed rather than left in: it costs
-           * a state read on a hot path and buys nothing. The 10.9x on pabellon
-           * remains unexplained (memory/issue_falcon_lt_flood_pabellon.md). */
+           * a state read on a hot path and buys nothing.
+           * ★2026-08-25: pabellon の 10.9倍は解明・修正済み。正体はカーネルでは
+           * なく受け渡しで、LT の層をファイル経由で読み戻していて、読んでいたのが
+           * Cycles の生の Combined ではなく**シーンのコンポジター出力**だった。
+           * ビューティも同経路なので二重計上していた(コンポジターOFFで層の
+           * エネルギー 197分の1・被覆 99.999%→0.0998%・空と屋根がちょうど 1.0000)。
+           * ★ここを疑って潰した仮説7つは全部「スプラット由来」の前提を共有していた
+           * = 独立していなかった(memory/issue_falcon_lt_flood_pabellon.md)。 */
           if (d_avg > 0.0f && world_frontface &&
               (bounce > 0 || kernel_data.integrator.falcon_lt_direct)) {
             /* Throughput is RELATIVE (init 1.0, see init_from_camera); the

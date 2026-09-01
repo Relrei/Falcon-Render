@@ -284,6 +284,11 @@ void VKTexture::read_sub(
                           0.2f,
                           false,
                           "VKTexture::read_sub");
+    if (!staging_buffer.is_allocated()) {
+      /* Out of device memory. The handle stays VK_NULL_HANDLE, which the resource tracker never
+       * registered, and Map::lookup is undefined behavior for an unknown key. */
+      return;
+    }
 
     render_graph::VKCopyImageToBufferNode::CreateInfo copy_image_to_buffer = {};
     render_graph::VKCopyImageToBufferNode::Data &node_data = copy_image_to_buffer.node_data;
@@ -475,6 +480,12 @@ void VKTexture::update_sub(int mip,
                           0.4f,
                           false,
                           "VKTexture::update_sub");
+    if (!staging_buffer.is_allocated()) {
+      /* Out of device memory. mapped_memory_get() below has nothing to write into, and the
+       * VK_NULL_HANDLE would reach the render graph, where the resource tracker looks up a handle
+       * it never registered (Map::lookup is undefined behavior for an unknown key). */
+      return;
+    }
     vk_buffer = staging_buffer.vk_handle();
     /* Rows are sequentially stored, when unpack row length is 0, or equal to the extent width. In
      * other cases we unpack the rows to reduce the size of the staging buffer and data transfer.
@@ -504,6 +515,10 @@ void VKTexture::update_sub(int mip,
   }
   else {
     BLI_assert(pixel_buffer);
+    if (!pixel_buffer->buffer_get().is_allocated()) {
+      /* Same as above: the pixel buffer lost its allocation, so there is no registered handle. */
+      return;
+    }
     vk_buffer = pixel_buffer->buffer_get().vk_handle();
   }
 

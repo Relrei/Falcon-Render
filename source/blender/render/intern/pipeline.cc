@@ -12,8 +12,11 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <forward_list>
 #include <memory>
+#include <string>
+#include <thread>
 
 #include "DNA_anim_types.h"
 #include "DNA_defs.h"
@@ -75,6 +78,8 @@
 #include "IMB_imbuf_types.hh"
 #include "IMB_metadata.hh"
 
+#include "SEQ_fastpath.hh"
+#include "MOV_fastpath.hh"
 #include "MOV_write.hh"
 
 #include "RE_compositor.hh"
@@ -173,6 +178,334 @@ static void render_callback_exec_id(Render *re, Main *bmain, ID *id, eCbEvent ev
 /* -------------------------------------------------------------------- */
 /** \name Allocation & Free
  * \{ */
+
+
+/* --- 区間の計測(環境変数 FALCON_VSE_TIMING=1 の時だけ)--- */
+static bool falcon_vse_timing()
+{
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("FALCON_VSE_TIMING");
+    on = (e && e[0] == '1') ? 1 : 0;
+  }
+  return on == 1;
+}
+static void falcon_vse_log(const char *name, double t0)
+{
+  if (falcon_vse_timing()) {
+    printf("FVSE %s %.3f\n", name, (BLI_time_now_seconds() - t0) * 1000.0);
+    fflush(stdout);
+  }
+}
+
+/* --- コマの保存を、次のコマの経路追跡に重ねる(戻す口 FALCON_RENDER_ASYNC_SAVE=0)---
+ *
+ * フレーム N の画像書き出し(圧縮とディスク I/O)を作業スレッド1本へ逃がし、
+ * 本体はすぐ次のフレームのレンダーへ進む。走っている保存は常に**1本だけ**で、
+ * 次を投入する前に必ず前を回収するので、書かれる順番はこれまでと同じ。
+ *
+ * ・渡す ImBuf は暗黙共有(implicit sharing)で画素を持っているだけなので複写は起きない。
+ *   レンダー結果はコマごとに作り直される(render_result_free → 新規確保)ので、
+ *   作業スレッドが読んでいる間に中身が書き換わることはない。
+ *   ImBuf の所有権は作業スレッド側へ移る(こちらでは触らない・解放しない)。
+ * ・成否は次の回収時(falcon_async_save_wait)に本体スレッドで報告する。
+ * ・render_write ハンドラは「書き終わった後」に呼ぶ約束なので、非同期にしたコマでは
+ *   実際に書き終わる次の回収まで呼び出しを持ち越す(RE_RenderAnim 側)。
+ */
+static bool falcon_async_save_enabled()
+{
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("FALCON_RENDER_ASYNC_SAVE");
+    on = (e && e[0] == '0') ? 0 : 1;
+  }
+  return on == 1;
+}
+
+struct FalconPendingSave {
+  std::thread thread;
+  std::atomic<bool> ok{true};
+  std::string filepath;
+  bool active = false;
+  /* EXR 経路かどうか(報告の文面と、回収時に出す保存メッセージが違う)。 */
+  bool is_exr = false;
+};
+static FalconPendingSave g_falcon_pending_save;
+
+static bool falcon_async_save_pending()
+{
+  return g_falcon_pending_save.active;
+}
+
+/* 走っている保存を待つ。成功なら true。失敗していれば reports へ流す。 */
+static bool falcon_async_save_wait(ReportList *reports)
+{
+  if (!g_falcon_pending_save.active) {
+    return true;
+  }
+  const double t0 = BLI_time_now_seconds();
+  g_falcon_pending_save.thread.join();
+  falcon_vse_log("async_save_join", t0);
+  g_falcon_pending_save.active = false;
+
+  const bool ok = g_falcon_pending_save.ok.load();
+  if (g_falcon_pending_save.is_exr) {
+    /* EXR は書き手へ reports を渡していない(作業スレッドから触らせない)ので、
+     * 成否の報告はここ=本体スレッドで出す。 */
+    if (ok) {
+      CLOG_INFO_NOCHECK(&LOG, "Saved: '%s'", g_falcon_pending_save.filepath.c_str());
+    }
+    else {
+      BKE_reportf(reports,
+                  RPT_ERROR,
+                  "Render error: cannot save image, path \"%s\"",
+                  g_falcon_pending_save.filepath.c_str());
+    }
+  }
+  else if (!ok) {
+    BKE_reportf(reports,
+                RPT_ERROR,
+                "Render error: cannot save image, path \"%s\"",
+                g_falcon_pending_save.filepath.c_str());
+  }
+  return ok;
+}
+
+/* ibuf の所有権を作業スレッドへ渡す。呼び出し側は以後 ibuf を触らない。 */
+static void falcon_async_save_submit(ImBuf *ibuf,
+                                     const char *filepath,
+                                     const ImageFormatData *imf)
+{
+  /* 走っているものがあれば必ず先に回収する(std::thread は二重代入で terminate する)。 */
+  BLI_assert(!g_falcon_pending_save.active);
+  falcon_async_save_wait(nullptr);
+
+  ImageFormatData *format = MEM_new<ImageFormatData>(__func__);
+  BKE_image_format_copy(format, imf);
+
+  std::string path = filepath;
+  g_falcon_pending_save.filepath = path;
+  g_falcon_pending_save.ok.store(true);
+  g_falcon_pending_save.active = true;
+  g_falcon_pending_save.is_exr = false;
+  g_falcon_pending_save.thread = std::thread([ibuf, path, format]() {
+    const double t0 = BLI_time_now_seconds();
+    const bool ok = BKE_imbuf_write(ibuf, path.c_str(), format);
+    falcon_vse_log("async_save_worker", t0);
+    g_falcon_pending_save.ok.store(ok);
+    IMB_freeImBuf(ibuf);
+    BKE_image_format_free(format);
+    MEM_delete(format);
+  });
+}
+
+/* この経路へ回してよいコマかどうか。
+ * ・動画でない(連番画像)・単一ビュー
+ * ・EXR は RenderResult のパスを直接読むので対象外(手前で ImBuf に落ちない)
+ */
+static bool falcon_async_save_eligible(RenderResult *rr, const ImageFormatData *imf)
+{
+  const char *why = nullptr;
+  if (!falcon_async_save_enabled()) {
+    why = "disabled";
+  }
+  else if (BKE_imtype_is_movie(imf->imtype)) {
+    why = "movie";
+  }
+  else if (RE_ResultIsMultiView(rr)) {
+    why = "multiview";
+  }
+  else if (ELEM(imf->imtype, R_IMF_IMTYPE_OPENEXR, R_IMF_IMTYPE_MULTILAYER) &&
+           RE_HasFloatPixels(rr))
+  {
+    why = "exr";
+  }
+  if (falcon_vse_timing()) {
+    static const char *reported = nullptr;
+    const char *now = why ? why : "yes";
+    if (reported != now) {
+      reported = now;
+      printf("FVSE_ASYNC_SAVE %s\n", now);
+      fflush(stdout);
+    }
+  }
+  return why == nullptr;
+}
+
+/* --- EXR(マルチレイヤー含む)の非同期保存 ---
+ *
+ * EXR は ImBuf に落とさず RenderResult のパスを直接読むので、ImBuf を1枚渡す形では
+ * 逃がせない。そこで **RenderResult の控え**を作って作業スレッドへ渡す。
+ *
+ * ・控えは節(RenderLayer / RenderPass / RenderView)だけを作り直し、画素は
+ *   IMB_dupImBuf(暗黙共有)で持つ。**画素の複写はゼロ**。
+ * ・書き手 BKE_image_render_write_exr は Scene を一切見ない。必要な設定値は
+ *   呼び出し側で作った ImageFormatData に既に写っている(BKE_image_format_init_for_write)。
+ *   reports も渡さない(成否は回収時に本体スレッドで出す)。
+ */
+static void falcon_render_result_snapshot_free(RenderResult *rr)
+{
+  if (rr == nullptr) {
+    return;
+  }
+  while (rr->layers.first) {
+    RenderLayer *rl = static_cast<RenderLayer *>(rr->layers.first);
+    while (rl->passes.first) {
+      RenderPass *rpass = static_cast<RenderPass *>(rl->passes.first);
+      IMB_freeImBuf(rpass->ibuf);
+      BLI_freelinkN(&rl->passes, rpass);
+    }
+    BLI_remlink(&rr->layers, rl);
+    MEM_delete(rl);
+  }
+  while (rr->views.first) {
+    RenderView *rv = static_cast<RenderView *>(rr->views.first);
+    BLI_remlink(&rr->views, rv);
+    IMB_freeImBuf(rv->ibuf);
+    MEM_delete(rv);
+  }
+  if (rr->stamp_data) {
+    BKE_stamp_data_free(rr->stamp_data);
+  }
+  MEM_delete(rr);
+}
+
+static RenderResult *falcon_render_result_snapshot(const RenderResult *src)
+{
+  RenderResult *dst = MEM_new<RenderResult>(__func__);
+
+  dst->rectx = src->rectx;
+  dst->recty = src->recty;
+  dst->tilerect = src->tilerect;
+  copy_v2_v2_db(dst->ppm, src->ppm);
+  dst->framenr = src->framenr;
+  dst->have_combined = src->have_combined;
+  dst->passes_allocated = src->passes_allocated;
+
+  for (const RenderView &rview : src->views) {
+    RenderView *rv = MEM_new<RenderView>(__func__);
+    BLI_addtail(&dst->views, rv);
+    STRNCPY_UTF8(rv->name, rview.name);
+    rv->ibuf = IMB_dupImBuf(rview.ibuf);
+  }
+
+  for (const RenderLayer &rlayer : src->layers) {
+    RenderLayer *rl = MEM_new<RenderLayer>(__func__);
+    BLI_addtail(&dst->layers, rl);
+    STRNCPY_UTF8(rl->name, rlayer.name);
+    rl->layflag = rlayer.layflag;
+    rl->passflag = rlayer.passflag;
+    rl->pass_xor = rlayer.pass_xor;
+    rl->rectx = rlayer.rectx;
+    rl->recty = rlayer.recty;
+
+    for (const RenderPass &rpass : rlayer.passes) {
+      RenderPass *rp = MEM_new<RenderPass>(__func__);
+      BLI_addtail(&rl->passes, rp);
+      rp->channels = rpass.channels;
+      STRNCPY(rp->name, rpass.name);
+      STRNCPY(rp->chan_id, rpass.chan_id);
+      STRNCPY(rp->fullname, rpass.fullname);
+      STRNCPY(rp->view, rpass.view);
+      rp->view_id = rpass.view_id;
+      rp->rectx = rpass.rectx;
+      rp->recty = rpass.recty;
+      rp->ibuf = IMB_dupImBuf(rpass.ibuf);
+    }
+  }
+
+  dst->stamp_data = BKE_stamp_data_copy(src->stamp_data);
+
+  return dst;
+}
+
+/* rr の控えの所有権を作業スレッドへ渡す。呼び出し側は以後 rr_copy を触らない。 */
+static void falcon_async_save_submit_exr(RenderResult *rr_copy,
+                                         const char *filepath,
+                                         const ImageFormatData *imf,
+                                         const char *view,
+                                         const bool save_as_render)
+{
+  BLI_assert(!g_falcon_pending_save.active);
+  falcon_async_save_wait(nullptr);
+
+  ImageFormatData *format = MEM_new<ImageFormatData>(__func__);
+  BKE_image_format_copy(format, imf);
+
+  std::string path = filepath;
+  std::string view_name = view ? view : "";
+  g_falcon_pending_save.filepath = path;
+  g_falcon_pending_save.ok.store(true);
+  g_falcon_pending_save.active = true;
+  g_falcon_pending_save.is_exr = true;
+  g_falcon_pending_save.thread = std::thread(
+      [rr_copy, path, format, view_name, save_as_render]() {
+        const double t0 = BLI_time_now_seconds();
+        const bool ok = BKE_image_render_write_exr(
+            nullptr, rr_copy, path.c_str(), format, save_as_render, view_name.c_str(), -1);
+        falcon_vse_log("async_save_worker_exr", t0);
+        g_falcon_pending_save.ok.store(ok);
+        falcon_render_result_snapshot_free(rr_copy);
+        BKE_image_format_free(format);
+        MEM_delete(format);
+      });
+}
+
+/* EXR をこの経路へ回してよいか。
+ * ・単一ビュー・マルチビュー出力でない・EXR のプレビュー JPG を出さない
+ * ・すべてのパスに CPU 側の float 画素がある(GPU 常駐だと控えで落ちる)
+ */
+static bool falcon_async_save_exr_eligible(RenderResult *rr, const ImageFormatData *imf)
+{
+  const char *why = nullptr;
+  if (!falcon_async_save_enabled()) {
+    why = "disabled";
+  }
+  else if (!(ELEM(imf->imtype, R_IMF_IMTYPE_OPENEXR, R_IMF_IMTYPE_MULTILAYER) &&
+             RE_HasFloatPixels(rr)))
+  {
+    why = "not-exr";
+  }
+  else if (RE_ResultIsMultiView(rr) || imf->views_format == R_IMF_VIEWS_MULTIVIEW ||
+           BLI_listbase_count_at_most(&rr->views, 2) != 1)
+  {
+    why = "multiview";
+  }
+  else if (imf->flag & R_IMF_FLAG_PREVIEW_JPG) {
+    why = "preview-jpg";
+  }
+  else {
+    for (const RenderLayer &rl : rr->layers) {
+      for (const RenderPass &rpass : rl.passes) {
+        if (rpass.ibuf == nullptr || rpass.ibuf->float_data() == nullptr) {
+          why = "no-float-pass";
+          break;
+        }
+      }
+      if (why) {
+        break;
+      }
+    }
+    if (!why && rr->have_combined) {
+      for (const RenderView &rview : rr->views) {
+        if (rview.ibuf == nullptr || rview.ibuf->float_data() == nullptr) {
+          why = "no-float-view";
+          break;
+        }
+      }
+    }
+  }
+  if (falcon_vse_timing()) {
+    static const char *reported = nullptr;
+    const char *now = why ? why : "yes";
+    if (reported != now) {
+      reported = now;
+      printf("FVSE_ASYNC_SAVE_EXR %s\n", now);
+      fflush(stdout);
+    }
+  }
+  return why == nullptr;
+}
 
 static bool do_write_image_or_movie(Render *re,
                                     Main *bmain,
@@ -545,6 +878,9 @@ Render *RE_NewInteractiveCompositorRender(const Scene *scene)
 
 void RE_FreeRender(Render *re)
 {
+  /* 走っている非同期保存を回収してから壊す。 */
+  falcon_async_save_wait(nullptr);
+
   RenderGlobal.render_list.remove(re);
 
   MEM_delete(re);
@@ -1410,11 +1746,15 @@ static void do_render_sequencer(Render *re)
 
   for (view_id = 0; view_id < tot_views; view_id++) {
     context.view_id = view_id;
+    const double falcon_t_seq = BLI_time_now_seconds();
     ImBuf *out = render_give_ibuf(&context, cfra, 0);
+    falcon_vse_log("seq_give_ibuf", falcon_t_seq);
     if (out != nullptr) {
       bool make_float = seq_result_needs_float(re->r.im_format);
+      const double falcon_t_lin = BLI_time_now_seconds();
       out = IMB_makeSingleUser(out);
       seq::ensure_ibuf_is_linear_space(out, make_float);
+      falcon_vse_log("seq_to_linear", falcon_t_lin);
     }
     ibuf_arr[view_id] = out;
   }
@@ -1431,7 +1771,9 @@ static void do_render_sequencer(Render *re)
 
     if (ibuf_arr[view_id]) {
       /* copy ibuf into combined pixel rect */
+      const double falcon_t_rfi = BLI_time_now_seconds();
       RE_render_result_rect_from_ibuf(rr, ibuf_arr[view_id], view_id);
+      falcon_vse_log("rect_from_ibuf", falcon_t_rfi);
 
       if (ibuf_arr[view_id]->metadata && (re->scene->r.stamp & R_STAMP_STRIPMETA)) {
         /* ensure render stamp info first */
@@ -1983,6 +2325,7 @@ void RE_RenderFrame(Render *re,
 
         if (errors.is_empty()) {
           do_write_image_or_movie(re, bmain, scene, 0, filepath_override, write_still);
+          falcon_async_save_wait(re->reports);
         }
         else {
           BKE_report_path_template_errors(re->reports, RPT_ERROR, rd.pic, errors);
@@ -2103,11 +2446,16 @@ bool RE_WriteRenderViewsMovie(ReportList *reports,
     int view_id;
     for (view_id = 0; view_id < totvideos; view_id++) {
       const char *suffix = BKE_scene_multiview_view_id_suffix_get(&scene->r, view_id);
+      const double falcon_t_ibuf = BLI_time_now_seconds();
       ImBuf *ibuf = RE_render_result_rect_to_ibuf(rr, &rd->im_format, dither, view_id);
+      falcon_vse_log("rect_to_ibuf", falcon_t_ibuf);
 
-      IMB_colormanagement_imbuf_for_write(ibuf, true, false, &image_format);
+      const double falcon_t_cm = BLI_time_now_seconds();
+      IMB_colormanagement_imbuf_for_write(ibuf, true, false, &image_format, true);
+      falcon_vse_log("colormanage_for_write", falcon_t_cm);
 
       BLI_assert(movie_writers[view_id] != nullptr);
+      const double falcon_t_app = BLI_time_now_seconds();
       if (!MOV_write_append(movie_writers[view_id],
                             scene,
                             rd,
@@ -2120,6 +2468,7 @@ bool RE_WriteRenderViewsMovie(ReportList *reports,
       {
         ok = false;
       }
+      falcon_vse_log("mov_write_append", falcon_t_app);
 
       /* imbuf knows which rects are not part of ibuf */
       IMB_freeImBuf(ibuf);
@@ -2229,7 +2578,49 @@ static bool do_write_image_or_movie(Render *re,
 
       /* write images as individual images or stereo */
       if (ok) {
-        ok = BKE_image_render_write(re->reports, &rres, scene, true, filepath);
+        ImageFormatData image_format;
+        BKE_image_format_init_for_write(&image_format, scene, nullptr);
+
+        if (falcon_async_save_eligible(&rres, &image_format)) {
+          /* 前のコマの保存を回収してから、このコマを投入する(順序はここで保たれる)。 */
+          ok = falcon_async_save_wait(re->reports);
+
+          ImBuf *ibuf = RE_render_result_rect_to_ibuf(
+              &rres, &image_format, scene->r.dither_intensity, 0);
+          ibuf = IMB_colormanagement_imbuf_for_write(ibuf, true, false, &image_format);
+          if (scene->r.stamp & R_STAMP_ALL) {
+            BKE_imbuf_stamp_info(&rres, ibuf);
+          }
+          falcon_async_save_submit(ibuf, filepath, &image_format);
+        }
+        else if (falcon_async_save_exr_eligible(&rres, &image_format)) {
+          /* EXR: RenderResult の控え(画素は暗黙共有)を作業スレッドへ渡す。 */
+          ok = falcon_async_save_wait(re->reports);
+
+          const RenderView *rv = static_cast<const RenderView *>(rres.views.first);
+
+          /* 控えが元と同じ物を書くことを確かめる口(FALCON_RENDER_ASYNC_VERIFY=1)。
+           * レンダーは実行ごとにビット一致しないので、**同じ RenderResult** を
+           * 同期(元)と非同期(控え)の両方で書き、ファイルを突き合わせる。 */
+          if (getenv("FALCON_RENDER_ASYNC_VERIFY")) {
+            char verify_path[FILE_MAX];
+            SNPRINTF(verify_path, "%s.sync", filepath);
+            BKE_image_render_write_exr(
+                nullptr, &rres, verify_path, &image_format, true, rv ? rv->name : "", -1);
+            printf("FALCON_ASYNC_VERIFY_SYNC %s\n", verify_path);
+            fflush(stdout);
+          }
+
+          RenderResult *rr_copy = falcon_render_result_snapshot(&rres);
+          falcon_async_save_submit_exr(
+              rr_copy, filepath, &image_format, rv ? rv->name : "", true);
+        }
+        else {
+          ok = falcon_async_save_wait(re->reports) && ok;
+          ok = BKE_image_render_write(re->reports, &rres, scene, true, filepath) && ok;
+        }
+
+        BKE_image_format_free(&image_format);
       }
     }
 
@@ -2363,7 +2754,50 @@ void RE_RenderAnim(Render *re,
                               (re_type->flag & RE_USE_POSTPROCESS)) &&
                              write_anim;
 
+  /* 非同期保存にしたコマの render_write を持ち越しているか。 */
+  bool falcon_write_cb_pending = false;
+
   render_init_depsgraph(re);
+
+  /* ★切っただけの編集なら、復号も符号化もせずに素材のパケットを流す。
+   * 入れない条件は山ほどあるが、外れた時は黙って下の通常の経路へ落ちる
+   * (絵を勝手に変えないため)。理由はログに1行残す。 */
+  if (is_movie && do_write_file) {
+    Vector<seq::FastPathCut> cuts;
+    char reason[512];
+    MovieFastPathReport fp_report;
+    if (seq::fastpath_cuts_get(scene, &rd, cuts, reason, sizeof(reason))) {
+      Vector<MovieFastPathCut> mov_cuts;
+      for (const seq::FastPathCut &cut : cuts) {
+        mov_cuts.append({cut.path, cut.in_frame, cut.n_frames});
+      }
+      /* ★音のミックスダウンは**評価済みのシーン**でないと落ちる
+       * (`BKE_sound_mixdown` が中で参照する。通常の書き出しも
+       * `MOV_write_begin` に `pipeline_scene_eval` を渡している)。 */
+      if (MOV_fastpath_write(re->pipeline_scene_eval,
+                             &rd,
+                             &image_format,
+                             mov_cuts,
+                             re->reports,
+                             &fp_report,
+                             reason,
+                             sizeof(reason)))
+      {
+        BKE_reportf(re->reports,
+                    RPT_INFO,
+                    "Cut-only export: %d frames, %d copied, %d re-encoded",
+                    fp_report.total_frames,
+                    fp_report.copied_frames,
+                    fp_report.reencoded_frames);
+        BKE_image_format_free(&image_format);
+        render_pipeline_free(re);
+        scene->r.cfra = cfra_old;
+        scene->r.subframe = subframe_old;
+        return;
+      }
+    }
+    CLOG_INFO(&LOG, "Fast path not used: %s", reason);
+  }
 
   if (is_movie && do_write_file) {
     size_t width, height;
@@ -2529,15 +2963,29 @@ void RE_RenderAnim(Render *re,
     /* run callbacks before rendering, before the scene is updated */
     render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_PRE);
 
+    const double falcon_t_pipe = BLI_time_now_seconds();
     do_render_full_pipeline(re);
+    falcon_vse_log("render_pipeline", falcon_t_pipe);
     totrendered++;
 
     const bool should_write = !(re->flag & R_SKIP_WRITE);
     if (re->display->test_break() == 0) {
       if (!G.is_break && should_write) {
+        /* 前のコマの保存をここで回収する。レンダーと重ねられるのはここまで。
+         * 持ち越していた render_write は、実際に書き終わったこの時点で呼ぶ。 */
+        if (!falcon_async_save_wait(re->reports)) {
+          G.is_break = true;
+        }
+        if (falcon_write_cb_pending) {
+          falcon_write_cb_pending = false;
+          render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_WRITE);
+        }
+
+        const double falcon_t_write = BLI_time_now_seconds();
         if (!do_write_image_or_movie(re, bmain, scene, totvideos, nullptr, write_anim)) {
           G.is_break = true;
         }
+        falcon_vse_log("write_total", falcon_t_write);
       }
     }
     else {
@@ -2580,9 +3028,24 @@ void RE_RenderAnim(Render *re,
       /* keep after file save */
       render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_POST);
       if (should_write) {
-        render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_WRITE);
+        if (falcon_async_save_pending()) {
+          /* まだ書き終わっていない。次の回収まで持ち越す。 */
+          falcon_write_cb_pending = true;
+        }
+        else {
+          render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_WRITE);
+        }
       }
     }
+  }
+
+  /* 走っている非同期保存を回収してから締める。 */
+  if (!falcon_async_save_wait(re->reports)) {
+    G.is_break = true;
+  }
+  if (falcon_write_cb_pending) {
+    falcon_write_cb_pending = false;
+    render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_WRITE);
   }
 
   /* end movie */

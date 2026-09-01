@@ -27,6 +27,7 @@ set(SRC
   SEQ_connect.hh
   SEQ_edit.hh
   SEQ_effects.hh
+  SEQ_fastpath.hh
   SEQ_iterator.hh
   SEQ_modifier.hh
   SEQ_modifiertypes.hh
@@ -101,6 +102,7 @@ set(SRC
   intern/sequencer.cc
   intern/sequencer.hh
   intern/sound.cc
+  intern/strip_fastpath.cc
   intern/strip_add.cc
   intern/strip_connect.cc
   intern/strip_edit.cc
@@ -148,6 +150,22 @@ endif()
 
 blender_add_lib(bf_sequencer "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
 add_library(bf::sequencer ALIAS bf_sequencer)
+
+# Experimental SIMD probe flags for the color-correction modifiers (see modifier.hh
+# inline load/store). Mutually exclusive tiers, default OFF (see top-level CMakeLists.txt).
+if(WITH_VSE_AVX512 AND NOT MSVC)
+  target_compile_options(bf_sequencer PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma;-ffp-contract=off>
+  )
+elseif(WITH_VSE_AVX2 AND CXX_HAS_AVX2 AND NOT MSVC)
+  target_compile_options(bf_sequencer PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-mavx2;-mfma;-ffp-contract=off>
+  )
+elseif(WITH_VSE_O3 AND NOT MSVC)
+  target_compile_options(bf_sequencer PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3>
+  )
+endif()
 
 # RNA_prototypes.hh
 add_dependencies(bf_sequencer bf_rna)

@@ -259,6 +259,21 @@ void IMB_cache_init()
   MEM_CacheLimiter_ItemDestroyable_Func_set(limitor, get_item_destroyable);
 }
 
+size_t IMB_cache_memory_in_use()
+{
+  if (limitor == nullptr) {
+    return 0;
+  }
+  /* Same lock the put path takes around this query. */
+  std::lock_guard lock(limitor_lock);
+  return MEM_CacheLimiter_get_memory_in_use(limitor);
+}
+
+bool IMB_cache_is_active()
+{
+  return limitor != nullptr;
+}
+
 void IMB_cache_destruct()
 {
   if (limitor) {

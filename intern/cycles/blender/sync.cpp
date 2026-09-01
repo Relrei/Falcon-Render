@@ -590,6 +590,7 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
     integrator->set_denoiser_upscale_factor(denoise_params.upscale_factor);
     integrator->set_denoiser_carry_history(denoise_params.carry_history);
     integrator->set_denoiser_preroll_passes(denoise_params.preroll_passes);
+    integrator->set_denoiser_preroll_passes_cut(denoise_params.preroll_passes_cut);
   }
 
 #ifdef WITH_FALCON_SHARC
@@ -723,8 +724,22 @@ void BlenderSync::sync_film(blender::ViewLayer &b_view_layer,
     follow_reflections = false;
   }
   film->set_denoising_pass_follow_reflections(follow_reflections);
-  film->set_denoising_pass_use_albedo_roughness_weighting(
-      get_boolean(crl, "denoising_pass_use_albedo_roughness_weighting"));
+
+  /* Albedo split. Cycles sorts a closure's albedo into the diffuse or the specular guide by its
+   * roughness (smoothstep over 0..0.15), which exists so OIDN's single albedo guide stays useful.
+   * DLSS-RR is handed both albedos *and* the roughness, so it can weight the two itself; sorting
+   * by roughness on our side means every surface rougher than 0.15 reports zero specular albedo.
+   * Measured on the tree scene (2026-08-31): SpecularAlbedo is min=max=mean=0 over the whole
+   * frame, because nothing in it is smoother than 0.15. Splitting by closure type instead is the
+   * other branch that is already implemented in film_write_denoising_features_surface.
+   *
+   * Off by default until the A/B is measured; FALCON_DLSS_ALBEDO_LOBE_SPLIT=1 turns it on. */
+  bool albedo_roughness_weighting = get_boolean(crl,
+                                                "denoising_pass_use_albedo_roughness_weighting");
+  if (active_dlss && getenv("FALCON_DLSS_ALBEDO_LOBE_SPLIT") != nullptr) {
+    albedo_roughness_weighting = false;
+  }
+  film->set_denoising_pass_use_albedo_roughness_weighting(albedo_roughness_weighting);
 
   /* Primary surface replacement: give DLSS-RR the virtual image behind a delta mirror instead of
    * the mirror itself, which is the hole NVIDIA left open in their own Cycles integration
@@ -1155,6 +1170,32 @@ bool BlenderSync::get_session_pause(blender::Scene &b_scene, bool background)
   return (background) ? false : get_boolean(cscene, "preview_pause");
 }
 
+bool BlenderSync::is_dlss_viewport_denoise(blender::Scene &b_scene,
+                                           const DeviceInfo &denoise_device_info)
+{
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene.id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+
+  if (!get_boolean(cscene, "use_preview_denoising")) {
+    return false;
+  }
+
+  DenoiserType type = (DenoiserType)get_enum(
+      cscene, "preview_denoiser", DENOISER_NUM, DENOISER_NONE);
+  if (type == DENOISER_NONE) {
+    /* Automatic: resolve through the same call get_denoise_params uses. */
+    type = Denoiser::automatic_viewport_denoiser_type(denoise_device_info);
+  }
+
+  return type == DENOISER_DLSS;
+}
+
+bool BlenderSync::is_dlss_denoise_active(const Scene *scene)
+{
+  return scene != nullptr && scene->integrator->get_use_denoise() &&
+         scene->integrator->get_denoiser_type() == DENOISER_DLSS;
+}
+
 SessionParams BlenderSync::get_session_params(blender::RenderEngine &b_engine,
                                               blender::UserDef &b_preferences,
                                               blender::Scene &b_scene,
@@ -1282,11 +1323,12 @@ SessionParams BlenderSync::get_session_params(blender::RenderEngine &b_engine,
   else {
     params.use_auto_tile = false;
 
-    if (get_boolean(cscene, "use_preview_denoising") &&
-        get_enum(cscene, "preview_denoiser", DENOISER_NUM, DENOISER_NONE) == DENOISER_DLSS)
-    {
+    if (is_dlss_viewport_denoise(b_scene, params.denoise_device)) {
       /* Disable resolution divider with DLSS */
       params.use_resolution_divider = false;
+      if (getenv("FALCON_DLSS_DEBUG")) {
+        fprintf(stderr, "[dlss] resolution divider disabled (viewport denoiser resolves to DLSS)\n");
+      }
     }
   }
 
@@ -1355,6 +1397,8 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
       /* Extra re-renders of the first animation frame that only fill the RR
        * history; the kept pass is the last one. */
       denoising.preroll_passes = get_int(cscene, "denoising_preroll_passes");
+      /* The same count for the frame that opens each cut; 0 = reuse the above. */
+      denoising.preroll_passes_cut = get_int(cscene, "denoising_preroll_passes_cut");
 
       switch ((DenoiserDLSSQuality)get_enum(
           cscene, "denoising_upscale_quality", DENOISER_DLSS_MODE_NUM, DENOISER_DLSS_MODE_DLAA))
@@ -1394,6 +1438,20 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
        * reflections move with what they reflect instead of with the surface. */
       if (getenv("FALCON_DLSS_NO_SPECULAR_HIT_DISTANCE") == nullptr) {
         denoising.passes |= DENOISER_PASS_SPECULAR_HIT_DISTANCE;
+      }
+      /* FALCON_DLSS_EMISSIVE_GUIDE=1: hand RR GBuffer_Emissive. An emitter's own
+       * colour is material, not noisy lighting; without it RR has to guess. */
+      if (const char *eg = getenv("FALCON_DLSS_EMISSIVE_GUIDE")) {
+        if (atoi(eg) != 0) {
+          denoising.passes |= DENOISER_PASS_EMISSION;
+        }
+      }
+      /* FALCON_DLSS_LAYER_GUIDES=1: also hand RR ColorBeforeParticles and
+       * ColorBeforeFog (the latter = colour minus the volume passes). */
+      if (const char *lg = getenv("FALCON_DLSS_LAYER_GUIDES")) {
+        if (atoi(lg) != 0) {
+          denoising.passes |= DENOISER_PASS_VOLUME;
+        }
       }
       return denoising;
     }
@@ -1461,6 +1519,17 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
           break;
       }
 
+      if (getenv("FALCON_DLSS_DEBUG")) {
+        fprintf(stderr,
+                "[sync/viewport] upscale_quality=%d -> upscale=%.3f carry=%d\n",
+                get_enum(cscene,
+                         "preview_denoising_upscale_quality",
+                         DENOISER_DLSS_MODE_NUM,
+                         DENOISER_DLSS_MODE_BALANCED),
+                denoising.upscale_factor,
+                int(denoising.carry_history));
+      }
+
       denoising.passes = DENOISER_PASS_ALBEDO | DENOISER_PASS_SPECULAR_ALBEDO |
                          DENOISER_PASS_NORMAL | DENOISER_PASS_ROUGHNESS | DENOISER_PASS_DEPTH |
                          DENOISER_PASS_MOTION | DENOISER_PASS_SPECULAR_MOTION;
@@ -1473,6 +1542,20 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
        * reflections move with what they reflect instead of with the surface. */
       if (getenv("FALCON_DLSS_NO_SPECULAR_HIT_DISTANCE") == nullptr) {
         denoising.passes |= DENOISER_PASS_SPECULAR_HIT_DISTANCE;
+      }
+      /* FALCON_DLSS_EMISSIVE_GUIDE=1: hand RR GBuffer_Emissive. An emitter's own
+       * colour is material, not noisy lighting; without it RR has to guess. */
+      if (const char *eg = getenv("FALCON_DLSS_EMISSIVE_GUIDE")) {
+        if (atoi(eg) != 0) {
+          denoising.passes |= DENOISER_PASS_EMISSION;
+        }
+      }
+      /* FALCON_DLSS_LAYER_GUIDES=1: also hand RR ColorBeforeParticles and
+       * ColorBeforeFog (the latter = colour minus the volume passes). */
+      if (const char *lg = getenv("FALCON_DLSS_LAYER_GUIDES")) {
+        if (atoi(lg) != 0) {
+          denoising.passes |= DENOISER_PASS_VOLUME;
+        }
       }
       return denoising;
     }

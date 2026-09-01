@@ -2,6 +2,12 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+# Falcon: 表示名を flavor から決める (blender.cc)
+add_definitions(-DFALCON_BUILD_FLAVOR="${FALCON_BUILD_FLAVOR}")
+if(FALCON_DIST)
+  add_definitions(-DFALCON_DIST_BUILD=1)
+endif()
+
 set(INC
   PUBLIC .
   ../ikplugin

@@ -694,6 +694,15 @@ void Session::set_navigating(bool navigating)
   eviction_manager_.set_navigating(navigating);
 }
 
+void Session::set_playback(bool playback)
+{
+  playback_ = playback;
+  /* The scheduler renders playback frames smaller: at 24 fps a timeline frame
+   * does not last long enough for one sampling pass at the navigation
+   * resolution. See RenderScheduler::playback_upscale_factor. */
+  render_scheduler_.set_playback(playback);
+}
+
 void Session::set_output_driver(unique_ptr<OutputDriver> driver)
 {
   path_trace_->set_output_driver(std::move(driver));
@@ -737,11 +746,24 @@ void Session::wait()
   }
 }
 
+void Session::set_denoiser_frame(const int frame)
+{
+  if (path_trace_) {
+    path_trace_->set_denoiser_frame(frame);
+  }
+}
+
 void Session::clear_denoiser_temporal_history()
 {
   if (path_trace_) {
     path_trace_->clear_denoiser_temporal_history();
   }
+
+  /* The pre-roll exists because a cold history makes the frame visibly noisier,
+   * and a cut leaves exactly that: an empty history. It only ever ran on the
+   * first frame of the render, so every shot after the first opened noisy.
+   * Arm it again here so each shot gets the same start as the first one. */
+  render_scheduler_.set_dlss_history_cold();
 }
 
 bool Session::update_scene(const bool reset_samples)
@@ -815,7 +837,29 @@ bool Session::update_scene(const bool reset_samples)
                                     scene->shader_manager->need_update() ||
                                     scene->image_manager->need_update() ||
                                     scene->background->is_modified();
-    if (appearance_changed) {
+    /* Playback re-syncs every shader that carries an animated value (classroom:
+     * one animated material node tree tagged light, shader and image managers on
+     * every frame), so this check dropped the history on every single frame of
+     * the very playback it was meant to smooth -- 197 of 210 evaluations came
+     * out with Reset=1. Animated appearance is continuous and the motion pass
+     * still aligns the history, so playback carries it; an appearance edit made
+     * while playing is then treated like one made mid-navigation. Restore the
+     * old behaviour with FALCON_DLSS_CLEAR_ON_PLAYBACK=1. */
+    static const bool clear_on_playback = getenv("FALCON_DLSS_CLEAR_ON_PLAYBACK") != nullptr;
+    if (appearance_changed && playback_ && !clear_on_playback) {
+      if (getenv("FALCON_DLSS_DEBUG")) {
+        fprintf(stderr, "[appearance] changed during playback -> history kept\n");
+      }
+    }
+    else if (appearance_changed) {
+      if (getenv("FALCON_DLSS_DEBUG")) {
+        fprintf(stderr,
+                "[appearance] light=%d shader=%d image=%d background=%d -> clear history\n",
+                int(scene->light_manager->need_update()),
+                int(scene->shader_manager->need_update()),
+                int(scene->image_manager->need_update()),
+                int(scene->background->is_modified()));
+      }
       path_trace_->clear_denoiser_temporal_history();
     }
   }

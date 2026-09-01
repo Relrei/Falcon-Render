@@ -31,9 +31,29 @@ static int node_shader_gpu_fresnel(GPUMaterial *mat,
 NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
-  /* TODO: some outputs expected be implemented within the next iteration
-   * (see node-definition `<artistic_ior>`). */
-  return get_input_value("IOR", NodeItem::Type::Float);
+  /* ★2026-08-30: これまで IOR をそのまま素通ししていた（= 係数が 1.5 などの定数になっていた）。
+   *   `gpu_shader_material_fresnel.glsl` の `fresnel_dielectric_cos()` と同じ式をノードで組む。
+   *   視線は MaterialX の `viewdirection`（視点から面へ向かう）。
+   *   Blender 側は面から視点へ向かう向きだが、式が `abs(cos)` を取るので符号は効かない。
+   *   ⚠裏向きの面で eta を逆数にする分岐は MaterialX に口が無いので表向き固定。 */
+  NodeItem ior = get_input_value("IOR", NodeItem::Type::Float);
+  NodeItem normal = get_input_link("Normal", NodeItem::Type::Vector3);
+  if (!normal) {
+    normal = create_node(
+        "normal", NodeItem::Type::Vector3, {{"space", val(std::string("world"))}});
+  }
+  NodeItem view = create_node(
+      "viewdirection", NodeItem::Type::Vector3, {{"space", val(std::string("world"))}});
+
+  NodeItem c = normal.normalize().dotproduct(view).abs();
+  NodeItem eta = ior.max(val(0.00001f));
+  NodeItem g2 = eta * eta - val(1.0f) + c * c;
+  NodeItem g = g2.max(val(0.0f)).sqrt();
+  NodeItem a = (g - c) / (g + c);
+  NodeItem b = (c * (g + c) - val(1.0f)) / (c * (g - c) + val(1.0f));
+  NodeItem fac = (val(0.5f) * a * a * (val(1.0f) + b * b)).clamp();
+  /* g2 <= 0 は全反射。 */
+  return g2.if_else(NodeItem::CompareOp::Greater, val(0.0f), fac, val(1.0f));
 }
 #endif
 NODE_SHADER_MATERIALX_END

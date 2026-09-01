@@ -568,6 +568,7 @@ set(GLSL_SRC
   shaders/gpu_shader_keyframe_shape_frag.glsl
 
   shaders/falcon_sculpt_factors_comp.glsl
+  shaders/falcon_sculpt_offset_comp.glsl
   shaders/gpu_shader_sequencer_scope_comp.glsl
   shaders/gpu_shader_sequencer_scope_frag.glsl
   shaders/gpu_shader_sequencer_strips_vert.glsl

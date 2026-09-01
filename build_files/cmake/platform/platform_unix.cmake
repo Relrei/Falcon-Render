@@ -300,7 +300,21 @@ if(WITH_CODEC_SNDFILE)
 endif()
 
 if(WITH_CODEC_FFMPEG)
-  if(DEFINED LIBDIR)
+  if(DEFINED FFMPEG_ROOT_DIR AND NOT FFMPEG_ROOT_DIR STREQUAL "")
+    # A locally built FFmpeg was pointed at (this is how the NVENC-enabled build
+    # is used: the precompiled one is configured with --disable-nvenc, so the
+    # hardware encoders are not in it). Only FFmpeg itself comes from there; the
+    # codec libraries come from the system, because the precompiled set pins
+    # versions the local build cannot be compiled against (x264 build 164 vs 165).
+    set(FFMPEG_FIND_COMPONENTS
+      avformat avdevice avfilter avcodec avutil swresample swscale
+      x264 x265 aom vpx opus vorbis vorbisenc ogg
+      theora theoradec theoraenc mp3lame openjp2
+      sndfile FLAC
+      # 自前ビルドの FFmpeg が DRM の hwcontext を拾うため
+      drm
+    )
+  elseif(DEFINED LIBDIR)
     set(FFMPEG_ROOT_DIR ${LIBDIR}/ffmpeg)
     # Override FFMPEG components to also include static library dependencies
     # included with precompiled libraries, and to ensure correct link order.
@@ -521,6 +535,7 @@ if(WITH_XR_OPENXR)
   find_package(XR_OpenXR_SDK)
   set_and_warn_library_found("OpenXR-SDK" XR_OPENXR_SDK_FOUND WITH_XR_OPENXR)
 endif()
+add_bundled_libraries(xr_openxr_sdk/lib)
 
 if(WITH_GMP)
   find_package_wrapper(GMP)

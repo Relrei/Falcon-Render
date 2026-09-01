@@ -328,10 +328,17 @@ void IMB_colormanagement_pixel_to_display_space_v4(
  * in image format write callback and if float_colorspace is not NULL, no color
  * space transformation should be applied on this buffer.
  */
+/**
+ * \param byte_result_only: 呼び出し側が結果の byte バッファしか読まない場合に true。
+ * このとき float 側の表示バッファ書き戻し(1920x1080 で 33MB/コマの複写)を省く。
+ * float バッファは線形のまま残り、色空間の札もそのまま(嘘をつかない)。
+ * 動画の書き出し(8bit)だけが使う。環境変数 FALCON_MOVIE_SKIP_FLOAT_DISPLAY=0 で無効化。
+ */
 ImBuf *IMB_colormanagement_imbuf_for_write(ImBuf *ibuf,
                                            bool save_as_render,
                                            bool allocate_result,
-                                           const ImageFormatData *image_format);
+                                           const ImageFormatData *image_format,
+                                           bool byte_result_only = false);
 
 void IMB_colormanagement_display_settings_from_ctx(
     const bContext *C,

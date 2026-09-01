@@ -100,6 +100,13 @@ bool VKBuffer::create(size_t size_in_bytes,
   VkResult result = vmaCreateBuffer(
       allocator, &create_info, &vma_create_info, &vk_buffer_, &allocation_, nullptr);
   if (result != VK_SUCCESS) {
+    /* Without this the failure is completely silent: callers only see a null handle, and the user
+     * sees a viewport that stops updating with no reason given. */
+    CLOG_WARN(&LOG,
+              "Couldn't allocate buffer '%s' of %zu bytes (VkResult %d). Out of GPU memory?",
+              debug_name ? debug_name : "?",
+              size_t(alloc_size_in_bytes_),
+              int(result));
     allocation_failed_ = true;
     size_in_bytes_ = 0;
     alloc_size_in_bytes_ = 0;

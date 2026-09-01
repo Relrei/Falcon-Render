@@ -179,7 +179,7 @@ static TransData *SeqToTransData(Scene *scene,
       break;
   }
 
-  td2d->loc[1] = strip->channel; /* Channel - Y location. */
+  td2d->loc[1] = seq::channel_to_y(strip->channel); /* Channel - Y location. */
   td2d->loc[2] = 0.0f;
   td2d->loc2d = nullptr;
 
@@ -265,7 +265,7 @@ static void seq_transform_cancel(TransInfo *t, Span<Strip *> transformed_strips)
 
   if (t->remove_on_cancel) {
     for (Strip *strip : transformed_strips) {
-      seq::edit_flag_for_removal(scene, seqbase, strip);
+      seq::edit_flag_for_removal(scene, strip);
     }
     seq::edit_remove_flagged_strips(scene, seqbase);
     vse::sync_active_scene_and_time_with_scene_strip(*t->context);
@@ -524,8 +524,20 @@ static void create_trans_seq_clamp_data(TransInfo *t, const Scene *scene)
     }
     /* No handles are selected. Update y-axis channel clamping data. */
     else {
-      ts->offset_clamp.ymin = max_ii(ts->offset_clamp.ymin, 1 - strip->channel);
-      ts->offset_clamp.ymax = min_ii(ts->offset_clamp.ymax, seq::MAX_CHANNELS - strip->channel);
+      /* `offset_clamp` bounds the raw Y-space offset added to `td->iloc[1]` (see
+       * #transform_convert_sequencer_clamp / the `new_channel` computation below), not the
+       * channel number directly. When #seq::channel_flip_enabled, Y decreases as the channel
+       * number increases (`channel_to_y(c) == MAX_CHANNELS + 1 - c`), so the offset that keeps
+       * the resulting channel within `[1, MAX_CHANNELS]` is the negated, min/max-swapped form
+       * of the non-flipped bound. */
+      if (seq::channel_flip_enabled()) {
+        ts->offset_clamp.ymin = max_ii(ts->offset_clamp.ymin, strip->channel - seq::MAX_CHANNELS);
+        ts->offset_clamp.ymax = min_ii(ts->offset_clamp.ymax, strip->channel - 1);
+      }
+      else {
+        ts->offset_clamp.ymin = max_ii(ts->offset_clamp.ymin, 1 - strip->channel);
+        ts->offset_clamp.ymax = min_ii(ts->offset_clamp.ymax, seq::MAX_CHANNELS - strip->channel);
+      }
       only_handles_selected = false;
     }
   }
@@ -677,7 +689,11 @@ static void flushTransSeq(TransInfo *t)
       transform_convert_sequencer_clamp(t, offset_clamped);
     }
     const int new_frame = round_fl_to_int(td->iloc[0] + offset_clamped[0]);
-    const int new_channel = round_fl_to_int(td->iloc[1] + offset_clamped[1]);
+    /* `td->iloc[1]` is a Y coordinate (`seq::channel_to_y(strip->channel)`), not the channel
+     * number itself -- go through #seq::y_to_channel_round (rather than plain
+     * `round_fl_to_int`) so this still resolves to the correct channel when
+     * #seq::channel_flip_enabled inverts the Y<->channel mapping. */
+    const int new_channel = seq::y_to_channel_round(td->iloc[1] + offset_clamped[1]);
 
     /* Compute handle clamping state to be drawn. */
     if (tdsq->sel_flag & SEQ_LEFTSEL) {

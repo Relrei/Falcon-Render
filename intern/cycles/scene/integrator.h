@@ -162,6 +162,7 @@ class Integrator : public Node {
   NODE_SOCKET_API(float, denoiser_upscale_factor);
   NODE_SOCKET_API(bool, denoiser_carry_history);
   NODE_SOCKET_API(int, denoiser_preroll_passes);
+  NODE_SOCKET_API(int, denoiser_preroll_passes_cut);
 
 #ifdef WITH_FALCON_SHARC
   /* Falcon knobs. These used to be read straight from the environment inside

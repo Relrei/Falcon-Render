@@ -14,7 +14,9 @@
 
 #include "BLI_listbase.h"
 #include "BLI_math_bits.h"
+#include "BLI_path_utils.hh"
 #include "BLI_string.h"
+#include "BLI_time.h"
 #include "BLI_utildefines.h"
 
 #include "DNA_layer_types.h"
@@ -1442,6 +1444,55 @@ void RE_engine_gpu_context_unlock(RenderEngine *engine)
       BLI_mutex_unlock(&engine->blender_gpu_context_mutex);
     }
   }
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Falcon: viewport render engine eviction
+ *
+ * See the comment on `RE_falcon_evict_viewport_enabled()` in `RE_engine.h`.
+ * All state here is main thread only: it is written by the render operator and
+ * read by the external draw engine, both of which run on the main thread.
+ * \{ */
+
+static bool falcon_evict_viewport_active = false;
+static double falcon_evict_viewport_finish_time = 0.0;
+
+bool RE_falcon_evict_viewport_enabled()
+{
+  static const bool enabled = []() {
+    const char *env = BLI_getenv("FALCON_CYCLES_EVICT_VIEWPORT");
+    /* On unless it is switched off explicitly. */
+    return env == nullptr || !STREQ(env, "0");
+  }();
+  return enabled;
+}
+
+bool RE_falcon_evict_viewport_is_active()
+{
+  return falcon_evict_viewport_active;
+}
+
+void RE_falcon_evict_viewport_set_active(const bool active)
+{
+  if (active == falcon_evict_viewport_active) {
+    /* Nothing was evicted for this render, so there is no rebuild to time. */
+    return;
+  }
+  falcon_evict_viewport_active = active;
+  /* Start the stopwatch for the rebuild when the render lets the viewports go. */
+  falcon_evict_viewport_finish_time = active ? 0.0 : BLI_time_now_seconds();
+}
+
+double RE_falcon_evict_viewport_take_rebuild_time()
+{
+  if (falcon_evict_viewport_finish_time == 0.0) {
+    return -1.0;
+  }
+  const double elapsed = BLI_time_now_seconds() - falcon_evict_viewport_finish_time;
+  falcon_evict_viewport_finish_time = 0.0;
+  return elapsed;
 }
 
 /** \} */

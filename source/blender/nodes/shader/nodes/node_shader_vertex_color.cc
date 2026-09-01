@@ -82,8 +82,22 @@ static int node_shader_gpu_vertex_color(GPUMaterial *mat,
 NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
-  /* TODO: some output expected be implemented within the next iteration
-   * (see node-definition `<geomcolor>`). */
+  /* ★2026-08-30: 頂点色を `geompropvalue` で引く。
+   *   これまでは既定値を返していたので、頂点色を使う材質が黒く落ちていた。
+   *   形は `node_shader_attribute.cc`（属性ノード）と同じ。
+   *   層の名前が空の時（= レンダー用の既定層）はこちらからは名前を決められないので従来どおり。
+   *   Alpha は primvar に載せていない（色は color3 で出している）ので既定のまま。 */
+  const NodeShaderVertexColor *vertex_color = static_cast<const NodeShaderVertexColor *>(
+      node_->storage);
+  if (vertex_color == nullptr || vertex_color->layer_name[0] == '\0') {
+    return get_output_default(socket_out_->identifier, NodeItem::Type::Any);
+  }
+
+  if (STREQ(socket_out_->identifier, "Color")) {
+    return create_node("geompropvalue",
+                       NodeItem::Type::Color3,
+                       {{"geomprop", val(std::string(vertex_color->layer_name))}});
+  }
   return get_output_default(socket_out_->identifier, NodeItem::Type::Any);
 }
 #endif

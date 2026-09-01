@@ -13,6 +13,7 @@ set(SRC
   MOV_enums.hh
   MOV_read.hh
   MOV_util.hh
+  MOV_fastpath.hh
   MOV_write.hh
 
   intern/ffmpeg_compat.h
@@ -22,6 +23,7 @@ set(SRC
   intern/movie_read.hh
   intern/movie_util.cc
   intern/movie_util.hh
+  intern/movie_fastpath.cc
   intern/movie_write.cc
   intern/movie_write.hh
   intern/movie_write_audio.cc

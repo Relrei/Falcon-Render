@@ -2,12 +2,16 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
+#include <algorithm>
+
 #include "node_shader_util.hh"
 #include "node_util.hh"
 
 #include "BKE_image.hh"
 #include "BKE_node_runtime.hh"
 #include "BKE_texture.h"
+
+#include "BLI_math_constants.h"
 
 #include "IMB_colormanagement.hh"
 
@@ -203,12 +207,6 @@ NODE_SHADER_MATERIALX_BEGIN
         image_path = graph_.export_params.image_fn(bmain, scene, image, &tex_image->iuser);
       }
 
-      NodeItem vector = get_input_link("Vector", NodeItem::Type::Vector2);
-      if (!vector) {
-        vector = texcoord_node();
-      }
-      /* TODO: add math to vector depending of tex_image->projection */
-
       std::string filtertype;
       switch (tex_image->interpolation) {
         case SHD_INTERP_LINEAR:
@@ -256,16 +254,130 @@ NODE_SHADER_MATERIALX_BEGIN
         node_colorspace = "srgb_texture";
       }
 
-      res = create_node("image",
-                        node_type,
-                        {{"texcoord", vector},
-                         {"filtertype", val(filtertype)},
-                         {"uaddressmode", val(addressmode)},
-                         {"vaddressmode", val(addressmode)}});
-      res.set_input("file", image_path, NodeItem::Type::Filename);
-      res.node->setName(image_node_name);
-      if (node_colorspace) {
-        res.node->setAttribute("colorspace", node_colorspace);
+      auto make_image = [&](const NodeItem &texcoord, const std::string &name) -> NodeItem {
+        NodeItem img = create_node("image",
+                                   node_type,
+                                   {{"texcoord", texcoord},
+                                    {"filtertype", val(filtertype)},
+                                    {"uaddressmode", val(addressmode)},
+                                    {"vaddressmode", val(addressmode)}});
+        img.set_input("file", image_path, NodeItem::Type::Filename);
+        img.node->setName(name);
+        if (node_colorspace) {
+          img.node->setAttribute("colorspace", node_colorspace);
+        }
+        return img;
+      };
+
+      /* ★2026-08-30: 投影（FLAT/BOX/SPHERE/TUBE）を見ていなかったので、
+       *   どれも FLAT として書き出していた。GPU 経路
+       *   (`gpu_shader_material_tex_image.glsl`) と同じ式をノードで組む。 */
+      const NodeItem one = val(1.0f);
+      switch (tex_image->projection) {
+        case SHD_PROJ_BOX: {
+          /* 3面ぶん焼いて、物体空間の法線で混ぜる（`tex_box_sample_*` + `tex_box_blend`）。 */
+          NodeItem co = get_input_link("Vector", NodeItem::Type::Vector3);
+          if (!co) {
+            co = texcoord_node(NodeItem::Type::Vector3);
+          }
+          NodeItem cx = co[0], cy = co[1], cz = co[2];
+
+          NodeItem nrm = create_node("normal",
+                                     NodeItem::Type::Vector3,
+                                     {{"space", val(std::string("object"))}})
+                             .normalize();
+          NodeItem rx = nrm[0], ry = nrm[1], rz = nrm[2];
+          NodeItem an = nrm.abs();
+          NodeItem sum = (an[0] + an[1] + an[2]).max(val(1e-8f));
+          NodeItem nx = an[0] / sum, ny = an[1] / sum, nz = an[2] / sum;
+
+          const float blend = tex_image->projection_blend;
+          const float limit = 0.5f + 0.5f * blend;
+          const float inv_limit = 1.0f - limit;
+          const float bden = std::max(1e-8f, blend);
+          const float half_span = 0.5f * (1.0f - blend);
+
+          auto plane_weight = [&](const NodeItem &a, const NodeItem &b) {
+            return ((a / (a + b).max(val(1e-8f)) - val(half_span)) / val(bden)).clamp();
+          };
+          NodeItem wx = plane_weight(nx, ny);
+          NodeItem wy = plane_weight(ny, nz);
+          NodeItem wz = plane_weight(nz, nx);
+
+          /* 3枚が混ざる中央の帯。 */
+          auto weight3 = [&](const NodeItem &n) {
+            return (val(2.0f - limit) * n + val(limit - 1.0f)) / val(bden);
+          };
+
+          NodeItem cond1 = val(inv_limit) * (nx + ny);
+          NodeItem cond2 = val(inv_limit) * (ny + nz);
+          NodeItem cond3 = val(inv_limit) * (nx + nz);
+          auto pick = [&](const NodeItem &case1,
+                          const NodeItem &case2,
+                          const NodeItem &case3,
+                          const NodeItem &case_mid) {
+            NodeItem inner = ny.if_else(NodeItem::CompareOp::Less, cond3, case3, case_mid);
+            inner = nx.if_else(NodeItem::CompareOp::Less, cond2, case2, inner);
+            return nz.if_else(NodeItem::CompareOp::Less, cond1, case1, inner);
+          };
+          NodeItem bx = pick(wx, val(0.0f), one - wz, weight3(nx));
+          NodeItem by = pick(one - wx, wy, val(0.0f), weight3(ny));
+          NodeItem bz = pick(val(0.0f), one - wy, wz, weight3(nz));
+
+          /* 各面の UV。裏を向いている面は u を反転する。 */
+          NodeItem ux = rx.if_else(NodeItem::CompareOp::Less, val(0.0f), one - cy, cy);
+          NodeItem uy = ry.if_else(NodeItem::CompareOp::Greater, val(0.0f), one - cx, cx);
+          NodeItem uz = rz.if_else(NodeItem::CompareOp::Greater, val(0.0f), one - cy, cy);
+
+          NodeItem img_x = make_image(
+              create_node("combine2", NodeItem::Type::Vector2, {{"in1", ux}, {"in2", cz}}),
+              image_node_name + "_box_x");
+          NodeItem img_y = make_image(
+              create_node("combine2", NodeItem::Type::Vector2, {{"in1", uy}, {"in2", cz}}),
+              image_node_name + "_box_y");
+          NodeItem img_z = make_image(
+              create_node("combine2", NodeItem::Type::Vector2, {{"in1", uz}, {"in2", cx}}),
+              image_node_name + "_box_z");
+
+          res = img_x * bx + img_y * by + img_z * bz;
+          if (res.node) {
+            res.node->setName(image_node_name);
+          }
+          break;
+        }
+        case SHD_PROJ_SPHERE:
+        case SHD_PROJ_TUBE: {
+          NodeItem co = get_input_link("Vector", NodeItem::Type::Vector3);
+          if (!co) {
+            co = texcoord_node(NodeItem::Type::Vector3);
+          }
+          /* `point_texco_remap_square()`。 */
+          co = co * val(2.0f) - one;
+          NodeItem cx = co[0], cy = co[1], cz = co[2];
+          NodeItem u = empty(), v = empty();
+          if (tex_image->projection == SHD_PROJ_SPHERE) {
+            NodeItem len = co.length().max(val(1e-8f));
+            u = (one - cx.atan2(cy) / val(float(M_PI))) / val(2.0f);
+            v = one - (cz / len).clamp(-1.0f, 1.0f).acos() / val(float(M_PI));
+          }
+          else {
+            NodeItem len = (cx * cx + cy * cy).sqrt().max(val(1e-8f));
+            u = (one - (cx / len).atan2(cy / len) / val(float(M_PI))) * val(0.5f);
+            v = (cz + one) * val(0.5f);
+          }
+          res = make_image(
+              create_node("combine2", NodeItem::Type::Vector2, {{"in1", u}, {"in2", v}}),
+              image_node_name);
+          break;
+        }
+        default: {
+          NodeItem vector = get_input_link("Vector", NodeItem::Type::Vector2);
+          if (!vector) {
+            vector = texcoord_node();
+          }
+          res = make_image(vector, image_node_name);
+          break;
+        }
       }
     }
   }

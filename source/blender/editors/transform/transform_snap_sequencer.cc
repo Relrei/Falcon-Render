@@ -80,9 +80,11 @@ static int snap_distance_frame_threshold_get(const TransInfo *t)
 static VectorSet<Strip *> query_strip_sources_timeline(const Scene *scene)
 {
   const Editing *ed = seq::editing_get(scene);
-  ListBaseT<Strip> *seqbase = seq::active_seqbase_get(seq::editing_get(scene));
+  const ListBaseT<SeqTimelineChannel> *channels = seq::channels_displayed_get(ed);
+  ListBaseT<Strip> *seqbase = seq::active_seqbase_get(ed);
 
   VectorSet<Strip *> strip_sources = seq::query_selected_strips(seqbase);
+  strip_sources.remove_if([&](Strip *strip) { return seq::transform_is_locked(channels, strip); });
 
   const Map retiming_selection = seq::retiming_selection_get(ed);
   /* Strips owned by retiming keys are technically not selected,
@@ -150,8 +152,9 @@ static VectorSet<Strip *> query_strip_targets_timeline(Scene *scene,
 
   VectorSet<Strip *> strip_targets;
   for (Strip &strip : *seqbase) {
-    if (!drag_and_drop && strip.flag & SEQ_SELECT) {
-      continue; /* Selected strips are being transformed, they shouldn't be a target. */
+    if (!drag_and_drop && strip.flag & SEQ_SELECT && !seq::transform_is_locked(channels, &strip)) {
+      /* Selected (and unlocked) strips are being transformed, they shouldn't be a target. */
+      continue;
     }
     if (seq::render_is_muted(channels, &strip) && (snap_flag & SEQ_SNAP_IGNORE_MUTED)) {
       continue;
@@ -212,7 +215,7 @@ static void build_sources_timeline(const Scene *scene,
                                    const Span<Strip *> strip_sources)
 {
   for (Strip *strip : strip_sources) {
-    const int channel = strip->channel;
+    const float channel = seq::channel_to_y(strip->channel);
     const int left = strip->left_handle();
     const int right = strip->right_handle(scene);
 
@@ -237,7 +240,7 @@ static void build_sources_timeline_retiming(const Scene *scene, TransSeqSnapData
   const Map retiming_selection = seq::retiming_selection_get(ed);
 
   for (auto item : retiming_selection.items()) {
-    const int channel = item.value->channel;
+    const float channel = seq::channel_to_y(item.value->channel);
     const int key_frame = seq::retiming_key_frame_get(scene, item.value, item.key);
     snap_data->sources.append(float2(key_frame, channel));
   }
@@ -297,7 +300,7 @@ static void build_targets_timeline(const Scene *scene,
   }
 
   for (Strip *strip : strip_targets) {
-    const int channel = strip->channel;
+    const float channel = seq::channel_to_y(strip->channel);
     /* Snap to left and right handles by default. */
     snap_data->targets.append(float2(strip->left_handle(), channel));
     snap_data->targets.append(float2(strip->right_handle(scene), channel));
@@ -590,8 +593,8 @@ static int snap_sequencer_calc_drag_drop_impl(TransInfo *t,
 
   BLI_assert(left_frame <= right_frame);
 
-  snap_data->sources.append(float2(left_frame, channel));
-  snap_data->sources.append(float2(right_frame, channel));
+  snap_data->sources.append(float2(left_frame, seq::channel_to_y(channel)));
+  snap_data->sources.append(float2(right_frame, seq::channel_to_y(channel)));
 
   /* Build arrays of snap target frames. */
   const short snap_mode = t->tsnap.mode;

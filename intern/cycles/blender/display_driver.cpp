@@ -445,8 +445,14 @@ bool BlenderDisplayDriver::update_begin(const Params &params,
    * sending too much data to blender::GPU when resolution divider is not 1. */
   /* TODO(sergey): Investigate whether keeping the PBO exact size of the texture makes non-interop
    * mode faster. */
-  const int buffer_width = params.size.x;
-  const int buffer_height = params.size.y;
+  /* The PBO has to hold the texture, not the rectangle on screen. Upstream those are the same
+   * thing or the texture is the smaller of the two (the resolution divider only ever shrinks it),
+   * so taking params.size was enough; the viewport camera view with a fixed render size hands
+   * over a texture that is bigger than the rectangle it is drawn into, and the film convert then
+   * writes past the end of the buffer ("Illegal address in CUDA queue synchronize
+   * (film_convert_combined_half_rgba)", measured 2026-08-31). */
+  const int buffer_width = max(params.size.x, texture_width);
+  const int buffer_height = max(params.size.y, texture_height);
   bool interop_recreated = false;
 
   if (!current_tile_buffer_object.gpu_resources_ensure(
@@ -700,7 +706,14 @@ static void draw_tile(const float2 &zoom,
    * the zoom level 1. The MAG filter is always NEAREST. */
   const float zoomed_width = draw_tile.params.size.x * zoom.x;
   const float zoomed_height = draw_tile.params.size.y * zoom.y;
-  if (texture.width != draw_tile.params.size.x || texture.height != draw_tile.params.size.y) {
+  if (texture.width > draw_tile.params.size.x || texture.height > draw_tile.params.size.y) {
+    /* The texture is bigger than the rectangle it is drawn into, so it is being shrunk rather
+     * than stretched and nearest sampling would just throw pixels away. Upstream never gets here
+     * (the resolution divider only ever makes the texture smaller); the viewport camera view with
+     * a fixed render size does, when the camera frame is smaller than what it renders. */
+    blender::GPU_texture_bind_ex(texture.gpu_texture, {blender::GPU_SAMPLER_FILTERING_LINEAR}, 0);
+  }
+  else if (texture.width != draw_tile.params.size.x || texture.height != draw_tile.params.size.y) {
     /* Resolution divider is different from 1, force nearest interpolation. */
     blender::GPU_texture_bind_ex(
         texture.gpu_texture, blender::GPUSamplerState::default_sampler(), 0);

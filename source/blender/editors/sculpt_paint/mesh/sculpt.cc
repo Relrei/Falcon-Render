@@ -35,6 +35,7 @@
 #include "GPU_context.hh"
 
 #include "falcon_sculpt_gpu.hh"
+#include "falcon_sculpt_resident.hh"
 #include "BLI_span.hh"
 #include "BLI_task.h"
 #include "BLI_task.hh"
@@ -3496,6 +3497,28 @@ static void report_and_reset()
          cpd,
          vpd > 0.0 ? cpd / vpd : 0.0,
          cpd * 12.0 / 1024.0 / 1024.0);
+
+  /* ★undo の粒度(2026-08-25)。GPU常駐にした時、undo のために毎ダブ読み戻す必要が
+   * あるのか、それとも「新しく触れたノードの初回だけ」で済むのかを数字で出す。
+   * 位置と法線の2本を控えるので 1頂点 24 バイト。 */
+  const undo::falcon_stats::UndoCounters uc = undo::falcon_stats::get_counters();
+  if (uc.push_calls > 0) {
+    printf("FALCON_SCULPT   -- undo の粒度 --\n");
+    printf("FALCON_SCULPT     控えを取ったダブ %lld / %lld 回 (%.1f%%)\n",
+           (long long)uc.calls_with_new,
+           (long long)uc.push_calls,
+           100.0 * double(uc.calls_with_new) / double(uc.push_calls));
+    printf("FALCON_SCULPT     控えたノード %lld / 頂点 %lld (%.1fMB・位置+法線)\n",
+           (long long)uc.new_nodes,
+           (long long)uc.new_verts,
+           double(uc.new_verts) * 24.0 / 1024.0 / 1024.0);
+    printf("FALCON_SCULPT     控えの時間 合計%.1fms = %.3fms/ダブ (undo積みの %.0f%%)\n",
+           1000.0 * uc.fill_seconds,
+           1000.0 * uc.fill_seconds / double(uc.push_calls),
+           g_totals.undo_push > 0.0 ? 100.0 * uc.fill_seconds / g_totals.undo_push : 0.0);
+  }
+  undo::falcon_stats::reset_counters();
+
   fflush(stdout);
   g_totals = Totals();
 }
@@ -5220,8 +5243,7 @@ struct SculptPaintStroke final : public PaintStroke {
   /* Needed to tag other viewports */
   wmWindowManager *wm_;
 
-  SculptPaintStroke(bContext *C, wmOperator *op, const int event_type)
-      : PaintStroke(C, op, event_type)
+  SculptPaintStroke(bContext *C, wmOperator *op, const wmEvent *event) : PaintStroke(C, op, event)
   {
     bmain_ = CTX_data_main(C);
 
@@ -6172,6 +6194,10 @@ void SculptPaintStroke::done(bool is_cancel, bool stroke_started)
   falcon_sculpt_timing::report_and_reset();
   falcon_gpu::report_verify();
   falcon_gpu::report_gpu_breakdown();
+  /* ★常駐しているGPU側の位置は、ここで「古い」印にする。次のストロークの初めに送り直す。
+   * ストロークの外(undo・モディファイア・別の編集)で位置が変わっていても追随できる。 */
+  falcon_resident::report_breakdown();
+  falcon_resident::invalidate();
 
   Object &ob = *this->object;
   SculptSession &ss = *ob.runtime->sculpt_session;
@@ -6257,7 +6283,10 @@ static wmOperatorStatus sculpt_brush_stroke_invoke(bContext *C,
     return OPERATOR_CANCELLED;
   }
 
-  stroke = MEM_new<SculptPaintStroke>(__func__, C, op, event->type);
+  bool pen_flip;
+  WM_event_tablet_data(event, &pen_flip, nullptr);
+
+  stroke = MEM_new<SculptPaintStroke>(__func__, C, op, event);
   brush_stroke_init(C, op);
 
   Sculpt &sd = *CTX_data_tool_settings(C)->sculpt;
@@ -6338,7 +6367,7 @@ static wmOperatorStatus sculpt_brush_stroke_exec(bContext *C, wmOperator *op)
 {
   brush_stroke_init(C, op);
 
-  SculptPaintStroke *stroke = MEM_new<SculptPaintStroke>(__func__, C, op, 0);
+  SculptPaintStroke *stroke = MEM_new<SculptPaintStroke>(__func__, C, op, nullptr);
   op->customdata = stroke;
 
   stroke->exec(C, op);

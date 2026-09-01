@@ -91,8 +91,29 @@ static int node_shader_gpu_attribute(GPUMaterial *mat,
 NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
-  /* TODO: some outputs expected be implemented within the next iteration
-   * (see node-definition `<geompropvalue>`). */
+  /* ★2026-08-29: 幾何の属性(頂点色など)を `geompropvalue` で引く。
+   *   名前は Blender 側の属性名そのまま ── Hydra の書き出し
+   *   (`io/usd/hydra/mesh.cc`)が同じ名前で primvar を出している。
+   *   オブジェクト/インスタンサ/ビューレイヤの属性は幾何に載っていないので
+   *   今までどおり既定値のまま。 */
+  NodeShaderAttribute *attr = static_cast<NodeShaderAttribute *>(node_->storage);
+  if (attr == nullptr || attr->type != SHD_ATTRIBUTE_GEOMETRY || attr->name[0] == '\0') {
+    return get_output_default(socket_out_->identifier, NodeItem::Type::Any);
+  }
+  const std::string geomprop(attr->name);
+
+  if (STREQ(socket_out_->identifier, "Color")) {
+    return create_node("geompropvalue", NodeItem::Type::Color3, {{"geomprop", val(geomprop)}});
+  }
+  if (STREQ(socket_out_->identifier, "Vector")) {
+    return create_node("geompropvalue", NodeItem::Type::Vector3, {{"geomprop", val(geomprop)}});
+  }
+  if (STREQ(socket_out_->identifier, "Fac")) {
+    NodeItem color = create_node(
+        "geompropvalue", NodeItem::Type::Color3, {{"geomprop", val(geomprop)}});
+    return (color[0] + color[1] + color[2]) / val(3.0f);
+  }
+  /* Alpha は primvar に載せていない(色は color3 で出している)。 */
   return get_output_default(socket_out_->identifier, NodeItem::Type::Any);
 }
 #endif

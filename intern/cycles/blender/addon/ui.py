@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import bpy
 from bpy.app.translations import contexts as i18n_contexts
 from bl_ui.utils import PresetPanel
@@ -177,11 +179,19 @@ def show_denoise_active(context):
 
 
 def get_effective_preview_denoiser(context, has_oidn_gpu):
+    # Mirrors Denoiser::automatic_viewport_denoiser_type: Automatic prefers DLSS-RR when the
+    # device can run it. Without this the panel resolved Automatic to OIDN and hid every
+    # DLSS-only option, so the settings for the denoiser that was actually running could only
+    # be reached by picking DLSS by hand.
     scene = context.scene
     cscene = scene.cycles
 
     if cscene.preview_denoiser != "AUTO":
         return cscene.preview_denoiser
+
+    prefer_dlss = os.environ.get("FALCON_DLSS_VIEWPORT_AUTO", "1") != "0"
+    if prefer_dlss and has_dlss_gpu_devices(context):
+        return 'DLSS'
 
     if has_oidn_gpu:
         return 'OPENIMAGEDENOISE'
@@ -238,7 +248,9 @@ class CYCLES_RENDER_PT_sampling_viewport(CyclesButtonsPanel, Panel):
         # DLSS renders a fresh sample per update (continuous stream), so the
         # adaptive-sampling controls have no effect there. Max Samples does:
         # it caps the stream length (the scheduler stops once reached).
-        is_dlss = (cscene.use_preview_denoising and cscene.preview_denoiser == 'DLSS')
+        is_dlss = (cscene.use_preview_denoising and
+                   get_effective_preview_denoiser(
+                       context, has_oidn_gpu_devices(context)) == 'DLSS')
 
         layout.use_property_split = True
         layout.use_property_decorate = False
@@ -400,6 +412,8 @@ class CYCLES_RENDER_PT_sampling_render_denoise(CyclesButtonsPanel, Panel):
                 sub.active = cscene.denoising_carry_history
                 sub.prop(cscene, "denoising_preroll_passes",
                          text="初回蓄積レンダリング回数")
+                sub.prop(cscene, "denoising_preroll_passes_cut",
+                         text="カット時(0=初回と同じ)")
             else:
                 col.label(text="DLSS対応GPUが見つからない", icon='INFO')
 
@@ -2470,6 +2484,16 @@ class CYCLES_RENDER_PT_simplify_culling(CyclesButtonsPanel, Panel):
         sub.active = cscene.use_camera_cull
         sub.prop(cscene, "camera_cull_margin", text="")
 
+        # ★Falcon: レンダー領域が有効な時だけ意味を持つので、そうでない時は灰色にする
+        sub = layout.column()
+        sub.active = cscene.use_camera_cull and rd.use_border
+        sub.prop(cscene, "use_camera_cull_border")
+        if cscene.use_camera_cull and rd.use_border and cscene.use_camera_cull_border:
+            if cscene.camera_cull_margin >= 1.0:
+                sub.label(text="余白が広いので、まだ領域の外は残ります", icon='INFO')
+            else:
+                sub.label(text="領域の外の光源・映り込みも消えます", icon='ERROR')
+
         row = layout.row(heading="Distance Culling")
         row.prop(cscene, "use_distance_cull", text="")
         sub = row.column()
@@ -2902,6 +2926,64 @@ class CYCLES_RENDER_PT_falcon_sharc(CyclesButtonsPanel, Panel):
                 layout.label(text="「ビューポート高速化」併用で効果大", icon='ERROR')
 
 
+# --- CyclesF をビューポートのサイドバー(N パネル)にも出す ------------------
+#
+# 本人の要望(2026-08-28): 「CyclesF の機能がどうしても扱いづらい。
+# コースティクス、パネルからの方が操作しやすいかもしれない。場所的にこっちの方が」
+# = 3Dビューポートの N パネルの「Falcon」タブ(falcon_dropmovie アドオンが作っている)。
+#
+# ★**移すのでなく、両方に出す。**レンダープロパティ側は Blender の作法どおりの置き場で、
+#   消すと他の記述や手の記憶と食い違う。描く中身は下の各クラスの draw() をそのまま
+#   使い回すので、二重管理にはならない(片方だけ直る事故が起きない)。
+class FalconSidebarPanel:
+    """N パネルの Falcon タブへ出すための土台。描画は親クラスのものを使う。"""
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Falcon"
+    bl_context = ""          # VIEW_3D では context を持たない(持つと出ない)
+    bl_parent_id = ""        # 親子はサイドバー側で組み直す
+    COMPAT_ENGINES = {'CYCLES'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine in cls.COMPAT_ENGINES
+
+
+class VIEW3D_PT_falcon_cyclesf(FalconSidebarPanel, CYCLES_RENDER_PT_falcon, Panel):
+    bl_label = "CyclesF"
+    bl_order = 100
+
+
+class VIEW3D_PT_falcon_cyclesf_photon(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_photon, Panel):
+    bl_label = "コースティクス (Photon)"
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+
+
+class VIEW3D_PT_falcon_cyclesf_lt(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_lt, Panel):
+    bl_label = "ライトトレース (LT・FQ静止画)"
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+
+
+class VIEW3D_PT_falcon_cyclesf_presets(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_presets, Panel):
+    bl_label = "用途プリセット"
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+
+
+class VIEW3D_PT_falcon_cyclesf_culling(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_culling, Panel):
+    bl_label = "自動カリング (シーン痩身)"
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+
+
+class VIEW3D_PT_falcon_cyclesf_temporal(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_temporal, Panel):
+    bl_label = "アニメのちらつき除去 (Temporal)"
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+
+
+class VIEW3D_PT_falcon_cyclesf_sharc(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_sharc, Panel):
+    bl_label = "SHARC キャッシュ (実験的)"
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+
+
 classes = (
     CYCLES_PT_sampling_presets,
     CYCLES_PT_viewport_sampling_presets,
@@ -2914,6 +2996,13 @@ classes = (
     CYCLES_RENDER_PT_falcon_culling,
     CYCLES_RENDER_PT_falcon_temporal,
     CYCLES_RENDER_PT_falcon_sharc,
+    VIEW3D_PT_falcon_cyclesf,
+    VIEW3D_PT_falcon_cyclesf_presets,
+    VIEW3D_PT_falcon_cyclesf_photon,
+    VIEW3D_PT_falcon_cyclesf_lt,
+    VIEW3D_PT_falcon_cyclesf_culling,
+    VIEW3D_PT_falcon_cyclesf_temporal,
+    VIEW3D_PT_falcon_cyclesf_sharc,
     CYCLES_RENDER_PT_sampling,
     CYCLES_RENDER_PT_sampling_viewport,
     CYCLES_RENDER_PT_sampling_viewport_denoise,

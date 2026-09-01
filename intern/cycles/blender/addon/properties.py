@@ -301,7 +301,7 @@ def enum_preview_denoiser(self, context):
             ('AUTO',
              "Automatic",
              n_("Use GPU accelerated denoising if supported, for the best performance. "
-                "Prefer OpenImageDenoise over OptiX"),
+                "Prefer DLSS Ray Reconstruction, then OpenImageDenoise, then OptiX"),
              0)]
     else:
         items = [('AUTO', "None", n_("Blender was compiled without a viewport denoiser"), 0)]
@@ -421,7 +421,11 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         name="Device",
         description="Device to use for rendering",
         items=enum_devices,
-        default='CPU',
+        # CyclesF: default GPU (stock: CPU). The device is scene data, so a file
+        # saved without touching it keeps rendering on the CPU forever -- 5 of 24
+        # of the local .blend files were in that state. Falls back to the CPU on
+        # its own when no compatible GPU is configured.
+        default='GPU',
         update=update_render_passes,
     )
     shading_system: BoolProperty(
@@ -542,12 +546,14 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
     preview_denoising_carry_history: BoolProperty(
         name="ナビ履歴持ち越し",
         description="ビューポートのナビゲーションをまたいでDLSSの時間履歴を"
-        "モーションベクタで整列して持ち越し、停止時はサンプルを蓄積する(実験的)。"
+        "モーションベクタで整列して持ち越し、停止時はサンプルを蓄積する。"
         "リセット毎の再収束のブレが消え、静止画像が最大サンプルまで収束する。"
+        "OFFにすると更新のたびに1サンプルの絵を描き直すので、"
+        "輪郭は鮮明なまま粒が残る。"
         "ナビ中の低解像度プレビューは無効になるため操作は重くなる。"
         "ボリュームはモーションベクタを持たないため移動中に尾を引く"
         "(ボリューム入りシーンはOFF推奨)",
-        default=False,
+        default=True,
     )
     denoising_preroll_passes: IntProperty(
         name="初回蓄積レンダリング回数",
@@ -555,7 +561,15 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         "DLSSの時間履歴に独立した推定を溜めてから本番の1枚を出す。"
         "2枚目以降は履歴を引き継ぐので1回で済む。"
         "0で無効(1枚目だけノイズが多いまま出る)",
-        min=0, max=16, default=4,
+        min=0, max=16, default=2,
+    )
+    denoising_preroll_passes_cut: IntProperty(
+        name="カット時の蓄積レンダリング回数",
+        description="カットが切り替わったフレームだけ、同じフレームをこの回数だけ焼き直す。"
+        "カットでも履歴は捨てられるので1枚目と同じ問題が起きるが、"
+        "カットの方がずっと多いため回数を別に決められる。"
+        "0で「初回と同じ回数」",
+        min=0, max=16, default=0,
     )
     denoising_warmup_frames: IntProperty(
         name="ウォームアップ枚数",
@@ -760,8 +774,9 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
 
     blur_glossy: FloatProperty(
         name="Filter Glossy",
-        description="Adaptively blur glossy shaders after blurry bounces, "
-        "to reduce noise at the cost of accuracy",
+        description="Adaptively blur glossy shaders and image textures after blurry bounces, "
+        "to reduce noise and improve texture cache efficiency at the cost of accuracy. Lower "
+        "this value to render caustics",
         min=0.0, max=10.0,
         default=1.0,
     )
@@ -1080,6 +1095,19 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         name="Use Camera Cull",
         description="Allow objects to be culled based on the camera frustum",
         default=False,
+    )
+
+    # ★2026-09-01 Falcon: カメラカリングの枠を「フル画面」でなく
+    #   「レンダー領域(Render Region)」にする。レンダー領域が無効な時は効果が無い
+    #   (Camera::border が [0,1] のままなので、判定が従来と同じ式になる)。
+    use_camera_cull_border: BoolProperty(
+        name="レンダー領域で絞る",
+        description=(
+            "レンダー領域が有効な時、カメラの画面全体ではなく"
+            "レンダー領域の外にある物をカリングする。"
+            "領域の外に光源や映り込む物があると、それも消える"
+        ),
+        default=True,
     )
 
     camera_cull_margin: FloatProperty(
@@ -2282,7 +2310,7 @@ class CyclesPreferences(bpy.types.AddonPreferences):
                           icon='BLANK1', translate=False)
             elif device_type == 'OPTIX':
                 compute_capability = "5.0"
-                driver_version = "535"
+                driver_version = "575"
                 col.label(text=rpt_("Requires NVIDIA GPU with compute capability %s") % compute_capability,
                           icon='BLANK1', translate=False)
                 col.label(text=rpt_("and NVIDIA driver version %s or newer") % driver_version,

@@ -142,11 +142,19 @@ class Session {
    * jumps -- which motion vectors cannot explain. */
   void clear_denoiser_temporal_history();
 
+  /* Frame number the following renders belong to (DLSS-RR frame transitions). */
+  void set_denoiser_frame(int frame);
+
   bool ready_to_reset();
   void reset(const SessionParams &session_params, const BufferParams &buffer_params);
 
   void set_pause(bool pause);
   void set_navigating(bool navigating);
+
+  /* The viewport is playing the timeline. Appearance edits during playback are
+   * animation (an animated material re-syncs its shader every frame), not the
+   * user changing the look, so the DLSS-RR history is carried across them. */
+  void set_playback(bool playback);
 
   void set_samples(const int samples);
   void set_time_limit(const double time_limit);
@@ -259,6 +267,9 @@ class Session {
 
   /* Manages when image cache eviction happens. */
   CacheEvictionManager eviction_manager_;
+
+  /* See set_playback(). */
+  bool playback_ = false;
 
   /* Render scheduler is used to get work to be rendered with the current big tile. */
   RenderScheduler render_scheduler_;

@@ -59,6 +59,11 @@ static Cache &get_cache()
   return cache;
 }
 
+int64_t approximate_used_size()
+{
+  return get_cache().size_in_bytes.load(std::memory_order_relaxed);
+}
+
 static void try_enforce_limit();
 
 static void set_new_logical_time(const StoredValue &stored_value, const int64_t new_time)

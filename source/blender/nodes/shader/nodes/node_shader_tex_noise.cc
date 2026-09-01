@@ -472,16 +472,51 @@ NODE_SHADER_MATERIALX_BEGIN
   NodeItem scale = get_input_value("Scale", NodeItem::Type::Float);
   NodeItem detail = get_input_default("Detail", NodeItem::Type::Float);
   NodeItem lacunarity = get_input_value("Lacunarity", NodeItem::Type::Float);
-  /* Empirically, higher octaves lead to NaNs on e.g. Metal and NVIDIA. */
-  const int octaves = int(math::clamp(detail.value->asA<float>(), 1.0f, 13.0f));
+  NodeItem roughness_item = get_input_default("Roughness", NodeItem::Type::Float);
 
-  NodeItem position = create_node("position", NodeItem::Type::Vector3);
+  /* ★値域を合わせる。
+   *   Blender の Noise Texture は `perlin_fbm()`(`blenlib/intern/noise.cc`)で
+   *     0.5 * sum / maxamp + 0.5
+   *   を返す = **0.5 を中心にした [0,1]**。
+   *   MaterialX の `fractal3d` は `mx_fractal3d_noise_float()` が sum をそのまま返す
+   *   = **0 を中心にした符号付き**。maxamp で割ってもいない。
+   *   そのまま渡すと、後ろに ColorRamp のような 0..1 を前提にしたノードが居る時、
+   *   半分が左端に張り付いて色が丸ごと変わる(classroom の schoolDesk_plastic)。
+   *
+   *   octaves も1つずれていた。Blender の繰り返しは `i = 0..int(detail)` の
+   *   **int(detail)+1 回**。Roughness は `diminish` に当たるが渡していなかった。 */
+  const float roughness = roughness_item.value ? roughness_item.value->asA<float>() : 0.5f;
+  /* Empirically, higher octaves lead to NaNs on e.g. Metal and NVIDIA. */
+  const int octaves = int(math::clamp(detail.value->asA<float>() + 1.0f, 1.0f, 13.0f));
+  float maxamp = 0.0f;
+  {
+    float amp = 1.0f;
+    for (int i = 0; i < octaves; i++) {
+      maxamp += amp;
+      amp *= roughness;
+    }
+  }
+  if (!(maxamp > 0.0f)) {
+    maxamp = 1.0f;
+  }
+
+  /* ★Vector 入力を繋いでいなかった。繋がっている時はそちらを使う
+   *   (classroom の whitePaintedWindow は Mapping 経由の UV を入れている)。
+   *   繋がっていない時だけ従来どおり位置を使う。 */
+  NodeItem position = get_input_link("Vector", NodeItem::Type::Vector3);
+  if (!position) {
+    position = create_node("position", NodeItem::Type::Vector3);
+  }
   position = position * scale;
 
-  return create_node(
+  NodeItem res = create_node(
       "fractal3d",
       STREQ(socket_out_->identifier, "Fac") ? NodeItem::Type::Float : NodeItem::Type::Color3,
-      {{"position", position}, {"octaves", val(octaves)}, {"lacunarity", lacunarity}});
+      {{"position", position},
+       {"octaves", val(octaves)},
+       {"lacunarity", lacunarity},
+       {"diminish", val(roughness)}});
+  return res * val(0.5f / maxamp) + val(0.5f);
 }
 #endif
 NODE_SHADER_MATERIALX_END

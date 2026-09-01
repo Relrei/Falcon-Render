@@ -51,6 +51,13 @@ std::shared_ptr<CachedValue> get_base(const GenericKey &key,
 void set_approximate_size_limit(int64_t limit_in_bytes);
 
 /**
+ * Bytes currently held by the cache (the same approximation that #set_approximate_size_limit
+ * is compared against). See the note on #IMB_cache_memory_in_use: this budget and the ImBuf
+ * one and the sequencer's are all handed the same number and enforce it separately.
+ */
+int64_t approximate_used_size();
+
+/**
  * Remove all elements from the cache. Note that this does not guarantee that no elements are in
  * the cache after the function returned. This is because another thread may have added a new
  * element right after the clearing.

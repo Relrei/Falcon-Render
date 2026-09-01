@@ -291,4 +291,33 @@ void RE_engine_tile_highlight_set(
     struct RenderEngine *engine, int x, int y, int width, int height, bool highlight);
 void RE_engine_tile_highlight_clear_all(struct RenderEngine *engine);
 
+/* Falcon: evict the viewport render engines while a final render runs.
+ *
+ * A 3D viewport in Rendered shading and a final render are two separate render
+ * engine instances. With Cycles they each hold their own full copy of the scene
+ * on the render device (geometry, textures, BVH, kernels), so a scene that fits
+ * on the GPU once may not fit twice and the final render fails.
+ *
+ * The final render operator therefore frees the render engine of every 3D
+ * viewport that is in Rendered shading before the render starts, and blocks it
+ * from being rebuilt until the render is done. The viewport rebuilds itself on
+ * the next redraw afterwards.
+ *
+ * On by default. `FALCON_CYCLES_EVICT_VIEWPORT=0` switches it off and restores
+ * the previous behaviour exactly: nothing guarded by
+ * `RE_falcon_evict_viewport_enabled()` is then ever reached.
+ *
+ * NOTE: nothing happens at all unless a viewport was actually evicted. With no
+ * 3D viewport in Rendered shading -- the "render in the background while I work"
+ * case -- this is a no-op, including for Persistent Data. */
+bool RE_falcon_evict_viewport_enabled();
+/** True between the eviction and the end of the final render that caused it. */
+bool RE_falcon_evict_viewport_is_active();
+void RE_falcon_evict_viewport_set_active(bool active);
+/**
+ * Seconds elapsed since the final render released the viewports, or -1 when
+ * there is no pending rebuild. Resets the timer, so it reports once per render.
+ */
+double RE_falcon_evict_viewport_take_rebuild_time();
+
 }  // namespace blender

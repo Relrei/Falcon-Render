@@ -2758,6 +2758,23 @@ static void rna_Stereo3dFormat_update(Main *bmain, Scene * /*scene*/, PointerRNA
     }
     BKE_image_release_ibuf(ima, ibuf, lock);
   }
+  else if (id && GS(id->name) == ID_SCE) {
+    Scene *scene = id_cast<Scene *>(id);
+    Editing *ed = seq::editing_get(scene);
+
+    if (ed == nullptr) {
+      return;
+    }
+
+    seq::foreach_strip(&ed->seqbase, [&](Strip *strip) {
+      /* Compare pointers until we find the strip that just changed. */
+      if (strip->stereo3d_format != ptr->data) {
+        return true;
+      }
+      seq::relations_invalidate_cache_raw(scene, strip);
+      return false;
+    });
+  }
 }
 
 static ViewLayer *rna_ViewLayer_new(ID *id, Scene * /*sce*/, Main *bmain, const char *name)
@@ -6874,6 +6891,15 @@ static void rna_def_scene_ffmpeg_settings(BlenderRNA *brna)
   RNA_def_property_boolean_funcs(prop, nullptr, "rna_FFmpegSettings_lossless_output_set");
   RNA_def_property_ui_text(prop, "Lossless Output", "Use lossless output for video streams");
   RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
+
+  prop = RNA_def_property(srna, "use_hardware_encoder", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_negative_sdna(prop, nullptr, "flags", FFMPEG_NO_HARDWARE_ENCODER);
+  RNA_def_property_ui_text(prop,
+                           "GPU Encoding",
+                           "Encode H.264 and HEVC on the GPU (NVIDIA NVENC). Much faster than the "
+                           "CPU encoder; falls back to the CPU when no supported GPU is present");
+  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
+
 
   /* FFMPEG Audio. */
   prop = RNA_def_property(srna, "audio_codec", PROP_ENUM, PROP_NONE);

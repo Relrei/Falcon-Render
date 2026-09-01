@@ -417,17 +417,25 @@ static void seq_view_collection_rect_timeline(const bContext *C, Span<Strip *> s
   const Scene *scene = CTX_data_sequencer_scene(C);
   int xmin = MAXFRAME * 2;
   int xmax = -MAXFRAME * 2;
-  int ymin = seq::MAX_CHANNELS + 1;
-  int ymax = 0;
+  /* Sentinel bounds for the min_ff/max_ff below: the Y coordinate space (regardless of
+   * #seq::channel_flip_enabled) always stays within `[1, MAX_CHANNELS + 1]`, so start `ymin` at
+   * the top of that range and `ymax` at the bottom, guaranteeing the first real strip updates
+   * both. This must NOT be computed via #seq::channel_to_y: that function's whole point is to
+   * map a *channel number* to a Y coordinate, and `MAX_CHANNELS + 1` isn't a channel number
+   * here, just the numeric upper bound of the Y range itself. Passing it through
+   * `channel_to_y()` used to work only by coincidence, back when that function was the
+   * identity; under the flip it maps to 0 instead, breaking the sentinel. */
+  float ymin = float(seq::MAX_CHANNELS + 1);
+  float ymax = 0.0f;
   int xmargin = scene->frames_per_second();
 
   for (Strip *strip : strips) {
     xmin = min_ii(xmin, strip->left_handle());
     xmax = max_ii(xmax, strip->right_handle(scene));
 
-    ymin = min_ii(ymin, strip->channel);
+    ymin = min_ff(ymin, seq::channel_to_y(strip->channel));
     /* "+1" because each channel has a thickness of 1. */
-    ymax = max_ii(ymax, strip->channel + 1);
+    ymax = max_ff(ymax, seq::channel_to_y(strip->channel) + 1);
   }
 
   xmax += xmargin;

@@ -913,6 +913,18 @@ void blo_do_versions_520(FileData * /*fd*/, Library * /*lib*/, Main *bmain)
     FOREACH_NODETREE_END;
   }
 
+  /* CyclesF: the GPU-encoding flag changed meaning from "use NVENC" to "do NOT use
+   * NVENC", so that GPU encoding becomes the default without every file having to
+   * store the choice. The bit itself is reused, so a file saved with GPU encoding
+   * switched on would silently read back as switched off. Clear it: a file that
+   * asked for the GPU keeps the GPU, and a file that never stored a choice gets the
+   * new default, which is also the GPU. Only a tick made from now on is remembered. */
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 502, 45)) {
+    for (Scene &scene : bmain->scenes) {
+      scene.r.ffcodecdata.flags &= ~FFMPEG_NO_HARDWARE_ENCODER;
+    }
+  }
+
   /**
    * Always bump subversion in BKE_blender_version.h when adding versioning
    * code here, and wrap it inside a MAIN_VERSION_FILE_ATLEAST check.

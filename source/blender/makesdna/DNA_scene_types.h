@@ -168,6 +168,11 @@ enum eFFMpegCodec_Flag : int {
   FFMPEG_AUTOSPLIT_OUTPUT = (1 << 1),
   FFMPEG_LOSSLESS_OUTPUT = (1 << 2),
   FFMPEG_USE_MAX_B_FRAMES = (1 << 3),
+  /* CyclesF: GPU のエンコーダ(NVENC)を「使わない」。既定(0)は使う側。
+   * 意味を反転させてあるのは、既定 ON をサブバージョンを上げずに全ファイルへ
+   * 届けるため。旗を持たない既存の .blend も startup.blend もそのまま GPU を使う。
+   * 無い時は自動でソフトウェアへ落ちるので、旗を立てるのは意図して切る時だけ。 */
+  FFMPEG_NO_HARDWARE_ENCODER = (1 << 4),
 };
 ENUM_OPERATORS(eFFMpegCodec_Flag)
 

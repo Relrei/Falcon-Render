@@ -41,6 +41,20 @@ size_t BLI_system_memory_max_in_megabytes();
 int BLI_system_memory_max_in_megabytes_int();
 
 /**
+ * Physical memory that can still be handed out right now, in bytes; 0 when unknown.
+ *
+ * NOTE: this is a different question from #BLI_system_memory_max_in_megabytes, which reports
+ * the maximum *addressable* memory (a huge, constant, platform-derived number that has nothing
+ * to do with how much RAM is actually free). Use this one to decide whether holding on to more
+ * cached data would push the machine into swapping.
+ *
+ * Linux reports `MemAvailable` (an estimate of what can be allocated without swapping, already
+ * accounting for reclaimable page cache); Windows reports `ullAvailPhys`. Other platforms
+ * return 0, meaning "unknown" -- callers must treat 0 as "no information", never as "no memory".
+ */
+size_t BLI_system_memory_available_in_bytes();
+
+/**
  * Ensure the process can open many files simultaneously.
  * This should be called once on application startup, as it is not thread safe.
  */

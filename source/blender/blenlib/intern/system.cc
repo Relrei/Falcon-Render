@@ -222,6 +222,40 @@ int BLI_system_memory_max_in_megabytes_int()
   return int(min_zz(limit_megabytes, size_t(INT_MAX)));
 }
 
+size_t BLI_system_memory_available_in_bytes()
+{
+#if defined(WIN32)
+  MEMORYSTATUSEX status;
+  status.dwLength = sizeof(status);
+  if (!GlobalMemoryStatusEx(&status)) {
+    return 0;
+  }
+  return size_t(status.ullAvailPhys);
+#elif defined(__linux__)
+  /* `MemAvailable` is the kernel's own estimate of what a new allocation can get without
+   * pushing the system into swap. It already accounts for reclaimable page cache, which is why
+   * it is the right number here and `MemFree` is not. */
+  FILE *f = fopen("/proc/meminfo", "r");
+  if (f == nullptr) {
+    return 0;
+  }
+  char line[256];
+  size_t bytes = 0;
+  while (fgets(line, sizeof(line), f)) {
+    unsigned long long kb = 0;
+    if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+      bytes = size_t(kb) * 1024;
+      break;
+    }
+  }
+  fclose(f);
+  return bytes;
+#else
+  /* Unknown: callers must not read this as "no memory available". */
+  return 0;
+#endif
+}
+
 void BLI_system_max_open_files_ensure()
 {
   /* The Windows maximum is documented as 8192. */

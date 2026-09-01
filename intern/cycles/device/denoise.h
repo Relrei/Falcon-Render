@@ -35,6 +35,10 @@ enum DenoiserPass {
   DENOISER_PASS_SPECULAR_MOTION = 1 << 7,
   DENOISER_PASS_TRANSMISSION = 1 << 8,
   DENOISER_PASS_SPECULAR_HIT_DISTANCE = 1 << 9,
+  /* Volume passes feed the ColorBeforeFog guide (FALCON_DLSS_LAYER_GUIDES). */
+  DENOISER_PASS_VOLUME = 1 << 10,
+  /* Emission pass feeds RR's GBuffer_Emissive (FALCON_DLSS_EMISSIVE_GUIDE). */
+  DENOISER_PASS_EMISSION = 1 << 11,
 };
 
 using DenoiserPassMask = int;
@@ -101,6 +105,11 @@ class DenoiseParams : public Node {
    * the same history before the kept pass. Only independent estimates of the
    * frame grow the history, so the opening frame needs them made on purpose. */
   int preroll_passes = 4;
+
+  /* DLSS-RR: the same, for the first frame after a cut (the history was thrown
+   * away there too, but the scene is already loaded and the shot is usually
+   * shorter, so it may want a different count). 0 = use preroll_passes. */
+  int preroll_passes_cut = 0;
 
   static const NodeEnum *get_type_enum();
   static const NodeEnum *get_prefilter_enum();

@@ -17,6 +17,10 @@
 
 #include "NOD_multi_function.hh"
 
+#ifdef WITH_MATERIALX
+#  include "materialx/node_ramp_blend.h"
+#endif
+
 namespace blender {
 
 namespace nodes::node_shader_mix_rgb_cc {
@@ -157,6 +161,25 @@ static void sh_node_mix_rgb_build_multi_function(NodeMultiFunctionBuilder &build
   builder.construct_and_set_matching_fn<MixRGBFunction>(clamp, mix_type);
 }
 
+NODE_SHADER_MATERIALX_BEGIN
+#ifdef WITH_MATERIALX
+{
+  NodeItem factor = get_input_value("Fac", NodeItem::Type::Float);
+  NodeItem color1 = get_input_value("Color1", NodeItem::Type::Color3);
+  NodeItem color2 = get_input_value("Color2", NodeItem::Type::Color3);
+
+  /* The legacy node always clamps the factor. */
+  factor = factor.clamp();
+
+  NodeItem res = materialx::ramp_blend(node_->custom1, color1, color2, factor);
+  if (node_->custom2 & SHD_MIXRGB_CLAMP) {
+    res = res.clamp();
+  }
+  return res;
+}
+#endif
+NODE_SHADER_MATERIALX_END
+
 }  // namespace nodes::node_shader_mix_rgb_cc
 
 void register_node_type_sh_mix_rgb()
@@ -175,6 +198,7 @@ void register_node_type_sh_mix_rgb()
   ntype.gpu_fn = file_ns::gpu_shader_mix_rgb;
   ntype.build_multi_function = file_ns::sh_node_mix_rgb_build_multi_function;
   ntype.gather_link_search_ops = nullptr;
+  ntype.materialx_fn = file_ns::node_shader_materialx;
   bke::node_register_type(ntype);
 }
 

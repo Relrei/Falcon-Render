@@ -146,11 +146,27 @@ static void blender_version_init()
    * ⚠ ここは文字列リテラルで、BLENDER_VERSION からは自動生成していない。
    *   土台の Blender を別の版へ上げた時は、この1行も合わせて書き換えること。
    * --------------------------------------------------------------------------- */
-  const char *kFalconBaseSuffix = " (5.2LTS)";
+  /* ★2026-09-01 本人指示: 画面に出る名前は**2つだけ**。
+   *
+   *   「Falcon Render」       = リアルタイムで進む最新。**版を名乗らない**
+   *   「Falcon Render v0.4」  = 切り離しなどを行って配布向けに調整したもの
+   *
+   * ★分ける鍵は FALCON_DIST(配布向けに切り出したか)であって、
+   *   FALCON_BUILD_FLAVOR(GPU の実験機能を入れるか)ではない。
+   *   2026-08-29〜08-31 は flavor が「配布用」と「GPU実験を外す」を兼ねていたため、
+   *   **配布物でない正本まで v0.4 を名乗っていた**。それを直した。
+   *
+   * 配布の版を上げる時は、下の1行だけ書き換える。ここ以外に文言を増やさないこと。
+   * 土台の Blender の版は表示に出さない(.desktop と README に書く)。 */
+#ifdef FALCON_DIST_BUILD
+  const char *kFalconName = "Falcon Render v0.4";
+#else
+  const char *kFalconName = "Falcon Render";
+#endif
 
-  SNPRINTF_UTF8(blender_version_string, "Falcon Render%s", kFalconBaseSuffix);
+  SNPRINTF_UTF8(blender_version_string, "%s", kFalconName);
 
-  SNPRINTF_UTF8(blender_version_string_compact, "Falcon Render%s", kFalconBaseSuffix);
+  SNPRINTF_UTF8(blender_version_string_compact, "%s", kFalconName);
 
   /* 表示から版数を外したので、これらは現在どこにも出ない。
    * 上の cycle 判定(不正な値の BLI_assert)は残したいので、変数だけ黙らせる。 */

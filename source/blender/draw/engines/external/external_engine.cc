@@ -9,6 +9,7 @@
  * We use it for depth and non-mesh objects.
  */
 
+#include "BKE_global.hh"
 #include "BKE_paint.hh"
 #include "DRW_engine.hh"
 #include "DRW_render.hh"
@@ -242,6 +243,19 @@ class Instance : public DrawEngine {
     /* Create render engine. */
     RenderEngine *render_engine = nullptr;
     if (!rv3d->view_render) {
+      /* Falcon: a final render freed this viewport's engine to get its device
+       * memory back. Do not build a second copy of the scene underneath it --
+       * the render operator tags a redraw when it is done.
+       *
+       * `G.is_rendering` is the recovery net. The flag is cleared by the render
+       * operator, and there is no path that evicts and then fails to reach it,
+       * but a blank viewport that never comes back would be a bad way to find
+       * out otherwise. With this, the worst case is blank until the render ends
+       * rather than blank forever. */
+      if (RE_falcon_evict_viewport_is_active() && G.is_rendering) {
+        return;
+      }
+
       RenderEngineType *engine_type = ED_view3d_engine_type(draw_ctx->scene,
                                                             draw_ctx->v3d->shading.type);
 
@@ -252,6 +266,15 @@ class Instance : public DrawEngine {
       rv3d->view_render = RE_NewViewRender(engine_type);
       render_engine = RE_view_engine_get(rv3d->view_render);
       engine_type->view_update(render_engine, draw_ctx->evil_C, draw_ctx->depsgraph);
+
+      if (RE_falcon_evict_viewport_enabled()) {
+        const double rebuild_time = RE_falcon_evict_viewport_take_rebuild_time();
+        if (rebuild_time >= 0.0) {
+          printf("[falcon-evict] viewport engine rebuilt %.3f s after the final render\n",
+                 rebuild_time);
+          fflush(stdout);
+        }
+      }
     }
     else {
       render_engine = RE_view_engine_get(rv3d->view_render);

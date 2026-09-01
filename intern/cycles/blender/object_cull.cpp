@@ -19,8 +19,19 @@ BlenderObjectCulling::BlenderObjectCulling(Scene *scene, blender::Scene &b_scene
       camera_cull_margin_(0.0f),
       use_scene_distance_cull_(false),
       use_distance_cull_(false),
-      distance_cull_margin_(0.0f)
+      distance_cull_margin_(0.0f),
+      use_render_region_(true)
 {
+  /* ★2026-09-01: パネルの「レンダー領域で絞る」で切れるようにした。
+   *   レンダー領域が無効な時は Camera::border が [0,1] のままなので、
+   *   真のままでも判定は従来と同じ式になる(= 効果が無い)。
+   *   戻す口(headless など): FALCON_CULL_USE_BORDER=0 で強制的に切る。 */
+  {
+    const char *env = getenv("FALCON_CULL_USE_BORDER");
+    if (env != nullptr && env[0] != '\0' && atoi(env) == 0) {
+      use_render_region_ = false;
+    }
+  }
   if ((b_scene.r.mode & blender::R_SIMPLIFY) != 0) {
     blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene.id);
     blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
@@ -36,6 +47,11 @@ BlenderObjectCulling::BlenderObjectCulling(Scene *scene, blender::Scene &b_scene
 
     camera_cull_margin_ = get_float(cscene, "camera_cull_margin");
     distance_cull_margin_ = get_float(cscene, "distance_cull_margin");
+
+    /* ★パネルの「レンダー領域で絞る」。既定は真だが、レンダー領域が無効なら効果は無い。 */
+    if (!get_boolean(cscene, "use_camera_cull_border")) {
+      use_render_region_ = false;
+    }
 
     if (distance_cull_margin_ == 0.0f) {
       use_scene_distance_cull_ = false;
@@ -119,8 +135,29 @@ bool BlenderObjectCulling::test_camera(Scene *scene, const float3 bb[8])
   if (all_behind) {
     return true;
   }
-  return (bb_min.x >= 1.0f + camera_cull_margin_ || bb_min.y >= 1.0f + camera_cull_margin_ ||
-          bb_max.x <= -camera_cull_margin_ || bb_max.y <= -camera_cull_margin_);
+  /* ★2026-09-01 Falcon: レンダー領域(Render Region)に従う。
+   *
+   * それまではここが常に NDC の [0,1] = **カメラのフル画面**と比べていたので、
+   * レンダー領域を小さく切っても、領域の外にあるだけの物は読み込まれていた。
+   * Camera::border は R_BORDER の時だけ領域が入り、それ以外は [0,1] のままなので、
+   * ここで border を使えば「領域が無い時は今までどおり」が自動的に成り立つ。
+   *
+   * カリングの余白(camera_cull_margin)は今までどおり **NDC の絶対量**として扱う
+   * (領域の幅に対する相対にすると、領域を小さくした時に余白まで縮んで意味が変わる)。
+   *
+   * 戻す口: FALCON_CULL_USE_BORDER=0 で従来どおりフル画面と比べる。 */
+  float left = 0.0f;
+  float right = 1.0f;
+  float bottom = 0.0f;
+  float top = 1.0f;
+  if (use_render_region_) {
+    left = cam->get_border_left();
+    right = cam->get_border_right();
+    bottom = cam->get_border_bottom();
+    top = cam->get_border_top();
+  }
+  return (bb_min.x >= right + camera_cull_margin_ || bb_min.y >= top + camera_cull_margin_ ||
+          bb_max.x <= left - camera_cull_margin_ || bb_max.y <= bottom - camera_cull_margin_);
 }
 
 bool BlenderObjectCulling::test_distance(Scene *scene, const float3 bb[8])

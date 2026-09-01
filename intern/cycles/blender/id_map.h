@@ -49,6 +49,11 @@ template<typename K, typename T, typename Flags = uint> class id_map {
     return nullptr;
   }
 
+  bool is_recalc_debug(const void *id_ptr) const
+  {
+    return b_recalc.find(id_ptr) != b_recalc.end();
+  }
+
   void set_recalc(void *id_ptr)
   {
     b_recalc.insert(id_ptr);

@@ -24,6 +24,7 @@
  */
 #include "sculpt_undo.hh"
 
+#include <atomic>
 #include <mutex>
 #include <zstd.h>
 
@@ -38,6 +39,7 @@
 #include "BLI_memory_counter.hh"
 #include "BLI_string_utf8.h"
 #include "BLI_task.h"
+#include "BLI_time.h"
 #include "BLI_utildefines.h"
 #include "BLI_vector.hh"
 
@@ -1878,6 +1880,37 @@ void push_node(const Depsgraph &depsgraph,
   }
 }
 
+/* ★2026-08-25: undo の粒度を数字で確かめる(宣言は sculpt_undo.hh)。 */
+namespace falcon_stats {
+
+static std::atomic<int64_t> g_push_calls{0};
+static std::atomic<int64_t> g_calls_with_new{0};
+static std::atomic<int64_t> g_new_nodes{0};
+static std::atomic<int64_t> g_new_verts{0};
+static std::atomic<int64_t> g_fill_ns{0};
+
+UndoCounters get_counters()
+{
+  UndoCounters c;
+  c.push_calls = g_push_calls.load();
+  c.calls_with_new = g_calls_with_new.load();
+  c.new_nodes = g_new_nodes.load();
+  c.new_verts = g_new_verts.load();
+  c.fill_seconds = double(g_fill_ns.load()) * 1e-9;
+  return c;
+}
+
+void reset_counters()
+{
+  g_push_calls = 0;
+  g_calls_with_new = 0;
+  g_new_nodes = 0;
+  g_new_verts = 0;
+  g_fill_ns = 0;
+}
+
+}  // namespace falcon_stats
+
 void push_nodes(const Depsgraph &depsgraph,
                 Object &object,
                 const IndexMask &node_mask,
@@ -1910,11 +1943,25 @@ void push_nodes(const Depsgraph &depsgraph,
           nodes_to_fill.append({&nodes[i], unode});
         }
       });
+      /* ★計数(2026-08-25)。控えを取るのは「新しく触れたノード」だけのはず、を確かめる。 */
+      falcon_stats::g_push_calls.fetch_add(1, std::memory_order_relaxed);
+      if (!nodes_to_fill.is_empty()) {
+        falcon_stats::g_calls_with_new.fetch_add(1, std::memory_order_relaxed);
+        falcon_stats::g_new_nodes.fetch_add(nodes_to_fill.size(), std::memory_order_relaxed);
+        int64_t verts = 0;
+        for (const auto &[node, unode] : nodes_to_fill) {
+          verts += node->all_verts().size();
+        }
+        falcon_stats::g_new_verts.fetch_add(verts, std::memory_order_relaxed);
+      }
+      const double fill_t0 = BLI_time_now_seconds();
       threading::parallel_for(nodes_to_fill.index_range(), 1, [&](const IndexRange range) {
         for (const auto &[node, unode] : nodes_to_fill.as_span().slice(range)) {
           fill_node_data_mesh(depsgraph, object, *node, type, *unode);
         }
       });
+      falcon_stats::g_fill_ns.fetch_add(
+          int64_t((BLI_time_now_seconds() - fill_t0) * 1e9), std::memory_order_relaxed);
       break;
     }
     case bke::pbvh::Type::Grids: {

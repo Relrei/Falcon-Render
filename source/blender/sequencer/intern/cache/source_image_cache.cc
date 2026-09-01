@@ -22,6 +22,7 @@
 #include "SEQ_time.hh"
 
 #include "prefetch.hh"
+#include "render.hh"
 #include "source_image_cache.hh"
 
 namespace blender::seq {
@@ -217,6 +218,22 @@ void source_image_cache_put(const RenderData *context,
 
 void source_image_cache_invalidate_strip(Scene *scene, const Strip *strip)
 {
+  /* Called from seq_strip_free_ex() before the Strip itself is freed
+   * (relations_invalidate_cache_raw() -> here), among other places (e.g.
+   * plain trims that do not free anything). Drain any in-flight
+   * BL_VSE_PREFETCH_N read-ahead task still holding `strip` first: such
+   * a task's vse_prefetch_task_run() calls source_image_cache_put(strip,
+   * ...), which reads `strip->start` -- a use-after-free if that
+   * happened after the caller frees `strip`. Must happen *before* the
+   * lock below (same reasoning as vse_prefetch_wait_all() in
+   * source_image_cache_destroy()): taking source_image_cache_mutex here
+   * does not help if the in-flight task has already been handed a
+   * dangling `strip` pointer by the time this function returns and the
+   * caller proceeds to free it. No-op, past a single cheap lookup, when
+   * no read-ahead task is currently in flight for this strip (the common
+   * case for ordinary edits that do not delete anything). */
+  vse_prefetch_wait_for_strip(strip);
+
   std::lock_guard lock(source_image_cache_mutex);
   SourceImageCache *cache = query_source_image_cache(scene);
   if (cache != nullptr) {
@@ -235,6 +252,15 @@ void source_image_cache_clear(Scene *scene)
 
 void source_image_cache_destroy(Scene *scene)
 {
+  /* Must happen before the lock below (and before the cache/Scene are
+   * freed): a BL_VSE_PREFETCH_N background decode task still in flight
+   * calls source_image_cache_put() on this same scene, and taking
+   * source_image_cache_mutex there does not save us if the Scene it
+   * dereferences has already been freed underneath it. Waiting here
+   * drains every such task first, so by the time we take the lock below
+   * nothing else can touch this scene's cache. */
+  vse_prefetch_wait_all();
+
   std::lock_guard lock(source_image_cache_mutex);
   SourceImageCache *cache = query_source_image_cache(scene);
   if (cache != nullptr) {

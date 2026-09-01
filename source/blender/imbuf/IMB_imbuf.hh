@@ -479,6 +479,11 @@ void IMB_buffer_float_rgba_srgb_to_linear(float *buffer, int width, int height);
 
 void IMB_alpha_under_color_float(float *rect_float, int x, int y, float backcol[3]);
 void IMB_alpha_under_color_byte(unsigned char *rect, int x, int y, const float backcol[3]);
+/**
+ * 全画素のアルファが 255 か(= #IMB_alpha_under_color_byte が恒等になるか)を調べる。
+ * 読むだけで書かないので、恒等の時は 8bit バッファを汚さずに済む。
+ */
+bool IMB_alpha_is_opaque_byte(const unsigned char *rect, int x, int y);
 
 void IMB_flipx(ImBuf *ibuf);
 void IMB_flipy(ImBuf *ibuf);

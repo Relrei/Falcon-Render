@@ -2,6 +2,11 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+# Falcon: 描画側の溶接は debug 版だけに入れる (FALCON_BUILD_FLAVOR)
+if(WITH_FALCON_DRAW_WELD)
+  add_definitions(-DWITH_FALCON_DRAW_WELD)
+endif()
+
 set(INC
   PUBLIC .
   intern

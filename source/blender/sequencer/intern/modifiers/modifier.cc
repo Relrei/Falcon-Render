@@ -302,50 +302,6 @@ PanelType *modifier_panel_register(ARegionType *region_type,
 
 /* -------------------------------------------------------------------- */
 
-float4 load_pixel_premul(const uchar *ptr)
-{
-  float4 res;
-  straight_uchar_to_premul_float(res, ptr);
-  return res;
-}
-
-float4 load_pixel_premul(const float *ptr)
-{
-  return float4(ptr);
-}
-
-void store_pixel_premul(float4 pix, uchar *ptr)
-{
-  premul_float_to_straight_uchar(ptr, pix);
-}
-
-void store_pixel_premul(float4 pix, float *ptr)
-{
-  *reinterpret_cast<float4 *>(ptr) = pix;
-}
-
-float4 load_pixel_raw(const uchar *ptr)
-{
-  float4 res;
-  rgba_uchar_to_float(res, ptr);
-  return res;
-}
-
-float4 load_pixel_raw(const float *ptr)
-{
-  return float4(ptr);
-}
-
-void store_pixel_raw(float4 pix, uchar *ptr)
-{
-  rgba_float_to_uchar(ptr, pix);
-}
-
-void store_pixel_raw(float4 pix, float *ptr)
-{
-  *reinterpret_cast<float4 *>(ptr) = pix;
-}
-
 ImBuf *modifier_render_mask_input(const ModifierApplyContext &context,
                                   const StripModifierData &smd)
 {

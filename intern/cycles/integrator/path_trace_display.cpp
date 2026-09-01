@@ -19,10 +19,20 @@ void PathTraceDisplay::reset(const BufferParams &buffer_params, const bool reset
 {
   const thread_scoped_lock lock(mutex_);
 
-  params_.full_offset = make_int2(buffer_params.full_x + buffer_params.window_x,
-                                  buffer_params.full_y + buffer_params.window_y);
-  params_.full_size = make_int2(buffer_params.full_width, buffer_params.full_height);
-  params_.size = make_int2(buffer_params.window_width, buffer_params.window_height);
+  if (buffer_params.display_width > 0 && buffer_params.display_height > 0) {
+    /* The render is not the screen: draw the rectangle the buffer stands for and let the driver
+     * stretch the texture over it. See BufferParams::display_x. */
+    params_.full_offset = make_int2(buffer_params.display_x, buffer_params.display_y);
+    params_.full_size = make_int2(buffer_params.display_full_width,
+                                  buffer_params.display_full_height);
+    params_.size = make_int2(buffer_params.display_width, buffer_params.display_height);
+  }
+  else {
+    params_.full_offset = make_int2(buffer_params.full_x + buffer_params.window_x,
+                                    buffer_params.full_y + buffer_params.window_y);
+    params_.full_size = make_int2(buffer_params.full_width, buffer_params.full_height);
+    params_.size = make_int2(buffer_params.window_width, buffer_params.window_height);
+  }
 
   texture_state_.is_outdated = true;
 

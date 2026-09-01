@@ -316,6 +316,116 @@ option(WITH_OPENIMAGEDENOISE "Enable the OpenImageDenoise compositing node" ON)
 
 option(WITH_DLSS "Enable NVIDIA DLSS Ray Reconstruction support" OFF)
 
+# -----------------------------------------------------------------------------
+# Falcon Render のビルド版 (FALCON_BUILD_FLAVOR・2026-08-29 本人決定)
+#
+#   release : 配布用。GPU化(実験中)の機能はビルドに入れない。表示は「Falcon Render v0.3」
+#   debug   : 自分用。GPU化の機能をビルドに入れる。      表示は「Falcon Render debug」
+#
+# ★flavor は「個別オプションの既定値を引く親スイッチ」でしかない。
+#   個別オプション(WITH_FALCON_SCULPT_GPU 等)を明示すれば、そちらが必ず優先される。
+#   flavor を後から切り替えた時は、**手で変えていない個別オプションだけ**が追従する
+#   (手で変えた物は据え置き)。仕組みは falcon_flavor_option() を見ること。
+#
+# ⚠ここに載せていない物:
+#   - WITH_DLSS       : 受け取り口は両方の版に入れる。同梱するかは pack.sh の
+#                       INCLUDE_DLSS_SNIPPET で決まる(ビルドの話ではない)
+#   - WITH_FALCON_SHARC: v0.3 の出荷機能。flavor では切らない
+#   - 28-engine (order engine) : 木の外の別リポジトリ。ここからはビルドしない
+# -----------------------------------------------------------------------------
+# ★2026-09-01 本人指示: 画面に出る名前は2つだけ。
+#     「Falcon Render」      = リアルタイムで進む最新(版を名乗らない)
+#     「Falcon Render v0.4」 = 切り離しなどを行って配布向けに調整したもの
+#
+#   ⚠これまで FALCON_BUILD_FLAVOR=release が「配布用」と「GPU実験を外す」を兼ねていたため、
+#     **配布物でない正本(release)まで版を名乗っていた**。2つを分ける:
+#       FALCON_BUILD_FLAVOR : GPU の実験機能を入れるか(ビルドの中身)
+#       FALCON_DIST         : 配布向けに切り出したものか(名乗り)
+#   配布は pack.sh が -DFALCON_DIST=ON を要求する。
+set(FALCON_DIST OFF CACHE BOOL
+  "配布向けに切り出したビルドか。ON なら版を名乗る(Falcon Render v0.4)")
+
+set(FALCON_BUILD_FLAVOR "release" CACHE STRING
+  "GPU の実験機能を入れるか: release (入れない) or debug (入れる)。配布かどうかは FALCON_DIST")
+set_property(CACHE FALCON_BUILD_FLAVOR PROPERTY STRINGS release debug)
+
+if(NOT FALCON_BUILD_FLAVOR STREQUAL "release" AND NOT FALCON_BUILD_FLAVOR STREQUAL "debug")
+  message(FATAL_ERROR
+    "FALCON_BUILD_FLAVOR は release か debug のどちらか。今の値: '${FALCON_BUILD_FLAVOR}'")
+endif()
+
+if(FALCON_BUILD_FLAVOR STREQUAL "debug")
+  set(_FALCON_GPU_DEFAULT ON)
+else()
+  set(_FALCON_GPU_DEFAULT OFF)
+endif()
+
+# flavor から既定を引く BOOL オプション。
+# 影の変数 _FALCON_FLAVOR_WAS_<name> に「前回 flavor が与えた既定」を覚えておき、
+# 今の値がそれと同じ = 本人は手で変えていない、と判断して新しい既定へ追従させる。
+# 値が違っていれば手で変えた物なので触らない(= 明示指定が優先)。
+function(falcon_flavor_option name docstring)
+  set(_shadow "_FALCON_FLAVOR_WAS_${name}")
+  if(NOT DEFINED ${name})
+    set(${name} ${_FALCON_GPU_DEFAULT} CACHE BOOL "${docstring}")
+  elseif(DEFINED ${_shadow} AND "${${name}}" STREQUAL "${${_shadow}}")
+    set(${name} ${_FALCON_GPU_DEFAULT} CACHE BOOL "${docstring}" FORCE)
+  endif()
+  # -D で外から渡すと型が UNINITIALIZED のまま残るので、BOOL に直しておく。
+  set_property(CACHE ${name} PROPERTY TYPE BOOL)
+  set_property(CACHE ${name} PROPERTY HELPSTRING "${docstring}")
+  set(${_shadow} ${_FALCON_GPU_DEFAULT} CACHE INTERNAL "flavor が与えた既定")
+endfunction()
+
+falcon_flavor_option(WITH_FALCON_SCULPT_GPU
+  "スカルプトのブラシをGPUで回す口を入れる (FALCON_SCULPT_GPU 環境変数で選ぶ)")
+falcon_flavor_option(WITH_FALCON_DRAW_WELD
+  "スカルプト描画で頂点添字の並べ方(溶接)を使う口を入れる (FALCON_DRAW_WELD=1)")
+
+# order engine の「専用モード」の席 (2026-08-29 本人決定)。
+# order engine はオブジェクト単位の切替ではなく、Blender の**専用モード**として入る。
+# ★今は席だけで、中身の実装も UI の言葉も無い。
+falcon_flavor_option(WITH_FALCON_ORDER_ENGINE_MODE
+  "order engine の専用モードを入れる (debug 版のみ・現時点は席だけで実装なし)")
+
+# ★★release 版には GPU 処理を1つも入れない (2026-08-29 本人決定)。
+#   GPU 処理は販売版(debug 系統の先)の機能。無料の release v0.3 には入れない。
+#   ここは「既定」ではなく**強制**。-D で明示的に ON にされても落とす。
+#   下の一覧に足すだけで、新しい GPU 機能も同じ扱いになる。
+set(FALCON_GPU_FEATURE_OPTIONS
+  WITH_FALCON_SCULPT_GPU
+  WITH_FALCON_DRAW_WELD
+  WITH_FALCON_ORDER_ENGINE_MODE
+)
+set(FALCON_GPU_FEATURES_ON "")
+foreach(_opt ${FALCON_GPU_FEATURE_OPTIONS})
+  if(FALCON_BUILD_FLAVOR STREQUAL "release" AND ${_opt})
+    message(STATUS "Falcon: ${_opt} は release 版には入れない。強制的に OFF にした")
+    get_property(_help CACHE ${_opt} PROPERTY HELPSTRING)
+    set(${_opt} OFF CACHE BOOL "${_help}" FORCE)
+  endif()
+  if(${_opt})
+    list(APPEND FALCON_GPU_FEATURES_ON ${_opt})
+  endif()
+endforeach()
+unset(_opt)
+unset(_help)
+
+# ⚠ここで add_definitions() を呼ばないこと。木の一番上で定義を足すと、
+#   全ての .o のコマンド行が変わって**木ごと焼き直しになる**(1〜2時間)。
+#   定義は要る所だけに置いてある:
+#     WITH_FALCON_SCULPT_GPU -> source/blender/editors/sculpt_paint/CMakeLists.txt
+#     WITH_FALCON_DRAW_WELD  -> source/blender/draw/CMakeLists.txt
+#     FALCON_BUILD_FLAVOR    -> source/blender/blenkernel/CMakeLists.txt
+#   (ユニティビルドが有効なので、ソース単位の定義は使えない。ディレクトリ単位で置く)
+
+message(STATUS "Falcon Render flavor: ${FALCON_BUILD_FLAVOR} "
+  "(sculpt-gpu=${WITH_FALCON_SCULPT_GPU} draw-weld=${WITH_FALCON_DRAW_WELD} "
+  "order-engine-mode=${WITH_FALCON_ORDER_ENGINE_MODE})")
+
+# ★札(FALCON_FLAVOR ファイル)は木の一番下で書く。ここではまだ
+#   CMAKE_INSTALL_PREFIX が決まっていない(Blender は後段で決める)。
+
 option(WITH_OPENSUBDIV "Enable OpenSubdiv for surface subdivision" ON)
 
 option(WITH_POTRACE "Enable features relying on Potrace" ON)
@@ -597,6 +707,22 @@ endif()
 
 option(WITH_COMPILER_SIMD "Add the recommended Blender default SIMD flags to the compiler's C_FLAGS/CXX_FLAGS" ON)
 mark_as_advanced(WITH_COMPILER_SIMD)
+
+# VSE color-correction modifiers (bf_sequencer): compile-flag tiers, mutually
+# exclusive (AVX512 > AVX2 > O3).
+#
+# WITH_VSE_O3 is ON by default: measured 2026-08-31, BRIGHT_CONTRAST costs
+# 15.82 -> 4.14 ms/frame at 1080p (3.82x) with pixel-identical output (10 pairs
+# of 30 frames, maxdiff 0), and -O3 carries no CPU requirement at all.
+#
+# The AVX2/AVX512 tiers stay OFF: they add nothing measurable over plain -O3
+# (4.39 / 3.58 ms, i.e. within noise of it, and AVX512's median was the worst
+# of every configuration) while requiring a CPU with those ISAs, which would
+# make the binary crash on machines that lack them. Local measurement only.
+option(WITH_VSE_O3 "Build sequencer color modifiers with -O3 auto-vectorization" ON)
+option(WITH_VSE_AVX2 "Build sequencer color modifiers with AVX2+FMA baseline, requires AVX2 CPU (experimental, local builds only)" OFF)
+option(WITH_VSE_AVX512 "Build sequencer color modifiers with AVX-512 baseline, requires AVX-512F/BW/DQ/VL CPU (experimental, local builds only)" OFF)
+mark_as_advanced(WITH_VSE_O3 WITH_VSE_AVX2 WITH_VSE_AVX512)
 
 # Cycles
 option(WITH_CYCLES "Enable Cycles Render Engine" ON)
@@ -2653,3 +2779,15 @@ endif()
 if(POSTCONFIGURE_SCRIPT)
   include(${POSTCONFIGURE_SCRIPT})
 endif()
+
+# ---------------------------------------------------------------------------
+# Falcon: ビルド名の札。pack.sh はこれと `blender --version` の両方を見て、
+# debug 版のビルド物が配布物に混ざるのを止める。
+# CMAKE_INSTALL_PREFIX が確定した後でないと書けないので、木の一番下に置く。
+# ---------------------------------------------------------------------------
+# 2行目の gpu-features は「このビルドに入っている GPU 処理の一覧」。
+# release 版では**必ず空**になる。pack.sh がそこを見て門にする。
+string(REPLACE ";" " " _falcon_gpu_list "${FALCON_GPU_FEATURES_ON}")
+file(WRITE "${CMAKE_INSTALL_PREFIX}/FALCON_FLAVOR"
+  "${FALCON_BUILD_FLAVOR}\ngpu-features: ${_falcon_gpu_list}\n")
+unset(_falcon_gpu_list)

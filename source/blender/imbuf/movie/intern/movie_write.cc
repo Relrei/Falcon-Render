@@ -10,6 +10,7 @@
 #include "movie_write.hh"
 
 #include "BLI_string_ref.hh"
+#include "BLI_time.h"
 
 #include "DNA_camera_types.h"
 #include "DNA_object_types.h"
@@ -56,6 +57,26 @@ namespace blender {
 
 #ifdef WITH_FFMPEG
 static CLG_LogRef LOG = {"video.write"};
+
+/* --- 区間の計測(環境変数 FALCON_VSE_TIMING=1 の時だけ)--- */
+static bool falcon_vse_timing()
+{
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("FALCON_VSE_TIMING");
+    on = (e && e[0] == '1') ? 1 : 0;
+  }
+  return on == 1;
+}
+static void falcon_vse_log(const char *name, double t0)
+{
+  if (falcon_vse_timing()) {
+    printf("FVSE %s %.3f\n", name, (BLI_time_now_seconds() - t0) * 1000.0);
+    fflush(stdout);
+  }
+}
+
+
 static constexpr int64_t ffmpeg_autosplit_size = 2'000'000'000;
 
 static void ffmpeg_dict_set_int(AVDictionary **dict, const char *key, int value)
@@ -478,6 +499,8 @@ static AVFrame *generate_video_frame(MovieWriter *context, const ImBuf *input_ib
    * shared (i.e. not writable). */
   av_frame_make_writable(rgb_frame);
 
+  const double falcon_t_flip = BLI_time_now_seconds();
+
   const size_t linesize_dst = rgb_frame->linesize[0];
   if (use_float) {
     /* Float image: need to split up the image into a planar format,
@@ -532,13 +555,17 @@ static AVFrame *generate_video_frame(MovieWriter *context, const ImBuf *input_ib
     }
   }
 
+  falcon_vse_log("flip_or_split", falcon_t_flip);
+
   /* Convert to the output pixel format, if it's different that Blender's internal one. */
+  const double falcon_t_sws = BLI_time_now_seconds();
   if (context->img_convert_frame != nullptr) {
     BLI_assert(context->img_convert_ctx != nullptr);
     /* Ensure the frame we are scaling to is writable as well. */
     av_frame_make_writable(context->current_frame);
     ffmpeg_sws_scale_frame(context->img_convert_ctx, context->current_frame, rgb_frame);
   }
+  falcon_vse_log("sws_scale", falcon_t_sws);
 
   if (image != input_ibuf) {
     IMB_freeImBuf(const_cast<ImBuf *>(image));
@@ -929,6 +956,110 @@ static void set_colorspace_options(AVCodecContext *c, const ColorSpace *colorspa
   }
 }
 
+/* The GPU encoder for H.264 / HEVC (NVIDIA NVENC).
+ *
+ * The encoder itself is 4.6x faster than x264 medium (240 frames of 1080p:
+ * 2.5 s against 0.54 s). How much of that reaches the wall clock depends on
+ * what else the write path pays: the VSE export of a PNG-sequence strip spends
+ * ~54 ms/frame on loading and colour management, so there the whole export
+ * only gets 1.0-1.2x faster; a source without that overhead sees most of the
+ * 4.6x.
+ *
+ * Returns nullptr when the machine has no encoder for the codec, and the caller
+ * then takes the CPU one -- a file without a supported GPU still renders. */
+/** その符号化器が、この寸法・この画素形式で**実際に開けるか**を先に試す。
+ *
+ * ★NVENC は「対応形式の一覧」や codec の素性からは分からない理由で開けないことが
+ * ある。実測した3つ: **寸法が小さすぎる**(32x18 で
+ * `Frame Dimension less than the minimum supported value`)/ **深さ**(H.264 の
+ * 10bit は `No capable devices found`)/ **12bit**(`cuda`)。
+ * どれも開いてみるまで分からず、失敗すると**書き出しが1コマも出ない**。
+ * ⇒ 使う前に捨てる文脈で1回開いて、駄目なら CPU の符号化器へ落ちる。
+ */
+static bool encoder_opens(const AVCodec *codec,
+                          const AVDictionary *opts,
+                          int width,
+                          int height,
+                          AVPixelFormat pix_fmt,
+                          AVRational time_base)
+{
+  AVCodecContext *c = avcodec_alloc_context3(codec);
+  if (c == nullptr) {
+    return false;
+  }
+  c->width = width;
+  c->height = height;
+  c->pix_fmt = pix_fmt;
+  c->time_base = time_base;
+  AVDictionary *probe_opts = nullptr;
+  av_dict_copy(&probe_opts, opts, 0);
+  const int rc = avcodec_open2(c, codec, &probe_opts);
+  av_dict_free(&probe_opts);
+  avcodec_free_context(&c);
+  return rc >= 0;
+}
+
+static const AVCodec *get_hardware_encoder(AVCodecID codec_id, AVDictionary **opts, int crf)
+{
+  const char *name = nullptr;
+  /* Offset from the codec's own CRF scale to NVENC's cq. Per codec: the two
+   * encoders do not drift apart at the same rate. See the note below. */
+  int cq_offset = 0;
+  switch (codec_id) {
+    case AV_CODEC_ID_H264:
+      name = "h264_nvenc";
+      cq_offset = 4;
+      break;
+    case AV_CODEC_ID_H265:
+      name = "hevc_nvenc";
+      cq_offset = 5;
+      break;
+    default:
+      return nullptr;
+  }
+
+  const AVCodec *codec = avcodec_find_encoder_by_name(name);
+  if (codec == nullptr) {
+    return nullptr;
+  }
+
+  /* NVENC's cq shares the 0-51 range with the CPU encoders' crf but not the
+   * meaning: at the same number NVENC spends 3-5x the bytes for a fraction of
+   * a dB, so the value has to be shifted up to land on the same quality.
+   *
+   * The first calibration (2026-08-28) measured ONE clip -- 240 frames of
+   * 1080p -- and read a steady +6 off it. A four-clip sweep (2026-08-31:
+   * a classroom render, a render image sequence, a 3440x1440 screen capture
+   * and a foliage render; each encoded against a lossless yuv420p reference so
+   * only the encoder difference remains) shows that number is not a constant.
+   * The offset that matches PSNR ranges +0.3..+6.5 for H.264 and +0.9..+7.6
+   * for H.265 depending on the content, and +6 sits at the top of that range,
+   * which is why GPU output measured worse than the CPU one on clips other
+   * than the original. The medians are +4.3 (H.264) and +5.2 (H.265), so those
+   * are what we use, rounded toward the lower value: erring low costs bytes,
+   * erring high costs visible quality.
+   *
+   * "crf" here must already be on the codec's own scale -- the caller applies
+   * the same H.265/10-bpp remapping the CPU path does. Passing the raw UI
+   * value made H.265 come out at an effective +1 instead of +5.
+   *
+   * p5 is the middle of the seven presets; p7 measured no better here and is
+   * slower. "b:v 0" is required for cq to apply at all -- without it NVENC
+   * silently encodes to a default bitrate instead.
+   *
+   * Known ceiling (not addressed here): with rc=vbr the two highest quality
+   * settings are unreachable -- cq below ~18 stops changing the output at all
+   * (H.264 tops out at 37.8 dB, H.265 at 35.9 dB on the classroom clip, while
+   * rc=constqp qp=0 reaches 58.5/62.6 dB). Raising that ceiling means changing
+   * "rc", which changes the shipped defaults, so it is left alone. */
+  av_dict_set(opts, "preset", "p5", 0);
+  av_dict_set(opts, "rc", "vbr", 0);
+  av_dict_set_int(opts, "cq", std::min(crf + cq_offset, 51), 0);
+  av_dict_set(opts, "b:v", "0", 0);
+
+  return codec;
+}
+
 static AVStream *alloc_video_stream(MovieWriter *context,
                                     const Scene &scene,
                                     const ImageFormatData *imf,
@@ -954,7 +1085,58 @@ static AVStream *alloc_video_stream(MovieWriter *context,
 
   /* Set up the codec context */
 
-  if (codec_id == AV_CODEC_ID_AV1) {
+  codec = nullptr;
+  if ((rd->ffcodecdata.flags & FFMPEG_NO_HARDWARE_ENCODER) == 0) {
+    /* Put the CRF on the codec's own scale first, exactly the way the CPU path
+     * does further down. Without this H.265 handed the GPU the raw UI value
+     * while the CPU got the remapped one, so the two encoders were asked for
+     * different qualities from the same setting. */
+    const bool is_10_bpp = imf->depth == R_IMF_CHAN_DEPTH_10;
+    const bool is_12_bpp = imf->depth == R_IMF_CHAN_DEPTH_12;
+    int hw_crf = context->ffmpeg_crf;
+    if (codec_id == AV_CODEC_ID_H264 && is_10_bpp) {
+      hw_crf = remap_crf_to_h264_10bpp_crf(hw_crf);
+    }
+    else if (codec_id == AV_CODEC_ID_H265 && !context->custom_crf) {
+      hw_crf = remap_crf_to_h265_crf(hw_crf, is_10_bpp || is_12_bpp);
+    }
+    /* ★GPU が本当に符号化できる深さだけ渡す。
+     *
+     *   H.264 -- 8bit のみ(10bit の High10 は NVENC に無い)
+     *   H.265 -- 8bit と 10bit(Main / Main10)
+     *
+     * NVENC は p012le/p016le を「対応形式」として挙げるので**形式の一覧を見ても
+     * 分からない**。渡すと `avcodec_open2` が落ち、**書き出しが丸ごと失敗する**
+     * (H.264 10bit は "No capable devices found"、12bit は "cuda")。
+     * どちらも GPU 符号化を既定 ON にして初めて表に出た。 */
+    const bool depth_ok = (codec_id == AV_CODEC_ID_H264) ?
+                              (imf->depth == R_IMF_CHAN_DEPTH_8) :
+                              ELEM(imf->depth, R_IMF_CHAN_DEPTH_8, R_IMF_CHAN_DEPTH_10);
+    if (!depth_ok) {
+      CLOG_INFO(&LOG, "GPU encoder cannot do this bit depth, using the CPU one");
+    }
+    else {
+      codec = get_hardware_encoder(codec_id, &opts, hw_crf);
+      if (codec == nullptr) {
+        CLOG_INFO(&LOG, "No GPU encoder for this codec, using the CPU one");
+      }
+      else {
+        /* ★本当に開けるかを先に試す(理由は encoder_opens のところ)。 */
+        const AVPixelFormat hw_pix_fmt = is_10_bpp ? AV_PIX_FMT_P010LE : AV_PIX_FMT_YUV420P;
+        if (!encoder_opens(codec, opts, rectx, recty, hw_pix_fmt, AVRational{1, 25})) {
+          CLOG_INFO(&LOG, "GPU encoder will not open for this setup, using the CPU one");
+          codec = nullptr;
+          av_dict_free(&opts);
+          opts = nullptr;
+        }
+      }
+    }
+  }
+
+  if (codec != nullptr) {
+    /* Picked above. */
+  }
+  else if (codec_id == AV_CODEC_ID_AV1) {
     /* Use get_av1_encoder() to get the ideal (hopefully) encoder for AV1 based
      * on given parameters, and also set up opts. */
     codec = get_av1_encoder(context, rd, &opts, rectx, recty);
@@ -1038,8 +1220,14 @@ static AVStream *alloc_video_stream(MovieWriter *context,
         CLOG_WARN(&LOG, "Unknown preset number %i, ignoring.", context->ffmpeg_preset);
     }
     /* "codec_id != AV_CODEC_ID_AV1" is required due to "preset" already being set by an AV1 codec.
-     */
-    if (preset_name != nullptr && codec_id != AV_CODEC_ID_AV1) {
+     *
+     * ★GPU の符号化器にも渡さない。NVENC の preset は p1..p7 で、"slower" や
+     * "superfast" のような x264 の名前は受け取らない。渡すと
+     * `Error setting option preset to value slower.` で**書き出しが丸ごと失敗する**
+     * (出力パネルの品質を BEST か REALTIME にしただけで起きる)。GPU 側の preset は
+     * `get_hardware_encoder()` が p5 を入れてある。 */
+    const bool is_hw = codec != nullptr && BLI_str_endswith(codec->name, "_nvenc");
+    if (preset_name != nullptr && codec_id != AV_CODEC_ID_AV1 && !is_hw) {
       av_dict_set(&opts, "preset", preset_name, 0);
     }
     if (deadline_name != nullptr) {
@@ -1062,11 +1250,18 @@ static AVStream *alloc_video_stream(MovieWriter *context,
   const bool is_12_bpp = imf->depth == R_IMF_CHAN_DEPTH_12;
   const bool is_16_bpp = imf->depth == R_IMF_CHAN_DEPTH_16;
 
+  /* ★GPU の符号化器は **yuv420p10le を受け取らない**。同じ 10bit でも
+   * `p010le`(半平面)しか通らないので、ここで渡す形を変える。渡さないと
+   * `avcodec_open2` が落ち、**10bit の書き出しが丸ごと失敗する**
+   * (GPU 符号化を既定 ON にして初めて表に出た。既定 OFF の間は誰も踏まなかった)。
+   * 12bit は p012le、16bit は p016le。 */
+  const bool is_hardware_encoder = codec != nullptr && BLI_str_endswith(codec->name, "_nvenc");
+
   if (is_10_bpp) {
-    c->pix_fmt = AV_PIX_FMT_YUV420P10LE;
+    c->pix_fmt = is_hardware_encoder ? AV_PIX_FMT_P010LE : AV_PIX_FMT_YUV420P10LE;
   }
   else if (is_12_bpp) {
-    c->pix_fmt = AV_PIX_FMT_YUV420P12LE;
+    c->pix_fmt = is_hardware_encoder ? AV_PIX_FMT_P012LE : AV_PIX_FMT_YUV420P12LE;
   }
 
   if (context->ffmpeg_type == FFMPEG_XVID) {
@@ -1744,8 +1939,12 @@ static bool ffmpeg_movie_append(MovieWriter *context,
   CLOG_INFO(&LOG, "ffmpeg: writing frame #%i (%ix%i)", frame, image->x, image->y);
 
   if (context->video_stream) {
+    const double falcon_t_gen = BLI_time_now_seconds();
     avframe = generate_video_frame(context, image);
+    falcon_vse_log("generate_video_frame", falcon_t_gen);
+    const double falcon_t_enc = BLI_time_now_seconds();
     success = (avframe && write_video_frame(context, avframe, reports));
+    falcon_vse_log("encode_and_mux", falcon_t_enc);
   }
 
   if (context->audio_stream) {

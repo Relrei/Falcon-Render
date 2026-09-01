@@ -101,6 +101,35 @@ void filter_decompress(const Span<std::byte> src, Vector<std::byte> &buffer, Vec
 
 }  // namespace compression
 
+/**
+ * ★2026-08-25: undo が「1ダブごと」でなく「ストローク中1ノードにつき1回」であることを
+ * 数字で確かめるための計数。
+ *
+ * ブラシ全体をGPUへ移した後、undo のために毎ダブ読み戻すと消したはずの費用が全部戻る
+ * (読み戻し 1.40〜8.48ms/ダブ)。だが `ensure_node` はハッシュに初回だけ足すので、
+ * 実際に位置を複製するのは**新しく触れたノードだけ**のはず。
+ * それが本当なら、GPU常駐でも「初回だけ GPU->GPU で控えを取る」で済み、
+ * **毎ダブの遅延は増えない。**推測で決めずに測る。
+ *
+ * 既定でも数える(1ダブあたり数回の atomic なので費用は無視できる)。
+ */
+namespace falcon_stats {
+
+struct UndoCounters {
+  int64_t push_calls;      /* push_nodes が呼ばれた回数(≒ダブ数) */
+  int64_t calls_with_new;  /* そのうち新しいノードが1つ以上出た回数 */
+  int64_t new_nodes;       /* 新しく控えを取ったノードの総数 */
+  int64_t new_verts;       /* その控えに入った頂点の総数(=複製した量) */
+  double fill_seconds;     /* 控えを取るのに掛かった時間の合計 */
+};
+
+/** 現在の計数を取る。 */
+UndoCounters get_counters();
+/** 0 に戻す。ストロークの区切りで呼ぶ。 */
+void reset_counters();
+
+}  // namespace falcon_stats
+
 }  // namespace ed::sculpt_paint::undo
 
 }  // namespace blender

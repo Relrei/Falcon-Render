@@ -32,6 +32,29 @@ void IMB_alpha_under_color_float(float *rect_float, int x, int y, float backcol[
   });
 }
 
+bool IMB_alpha_is_opaque_byte(const uchar *rect, int x, int y)
+{
+  const int64_t count = int64_t(x) * y;
+  return threading::parallel_reduce(
+      IndexRange(count),
+      32 * 1024,
+      true,
+      [&](const IndexRange i_range, const bool init) {
+        if (!init) {
+          return false;
+        }
+        const uchar *pix = rect + i_range.first() * 4;
+        for ([[maybe_unused]] const int64_t i : i_range) {
+          if (pix[3] != 255) {
+            return false;
+          }
+          pix += 4;
+        }
+        return true;
+      },
+      [](const bool a, const bool b) { return a && b; });
+}
+
 void IMB_alpha_under_color_byte(uchar *rect, int x, int y, const float backcol[3])
 {
   threading::parallel_for(IndexRange(int64_t(x) * y), 32 * 1024, [&](const IndexRange i_range) {

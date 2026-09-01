@@ -32,9 +32,36 @@ static int node_shader_gpu_layer_weight(GPUMaterial *mat,
 NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
-  /* TODO: some outputs expected be implemented partially within the next iteration
-   * (see node-definition `<artistic_ior>`). */
-  return get_input_link("Blend", NodeItem::Type::Float);
+  /* ★2026-08-30: これまで Blend の繋ぎ先をそのまま返していた（値入力の時は空が返っていた）。
+   *   `gpu_shader_material_layer_weight.glsl` と同じ式をノードで組み、
+   *   Fresnel と Facing の2出力を分ける。
+   *   ⚠裏向きの面で eta を逆数にする分岐は MaterialX に口が無いので表向き固定。 */
+  NodeItem blend = get_input_value("Blend", NodeItem::Type::Float);
+  NodeItem normal = get_input_link("Normal", NodeItem::Type::Vector3);
+  if (!normal) {
+    normal = create_node(
+        "normal", NodeItem::Type::Vector3, {{"space", val(std::string("world"))}});
+  }
+  NodeItem view = create_node(
+      "viewdirection", NodeItem::Type::Vector3, {{"space", val(std::string("world"))}});
+  NodeItem c = normal.normalize().dotproduct(view).abs();
+
+  if (STREQ(socket_out_->identifier, "Fresnel")) {
+    /* 表向きの面では 1/eta を使う（GLSL 側と同じ）。 */
+    NodeItem eta = val(1.0f) / (val(1.0f) - blend).max(val(0.00001f));
+    NodeItem g2 = eta * eta - val(1.0f) + c * c;
+    NodeItem g = g2.max(val(0.0f)).sqrt();
+    NodeItem a = (g - c) / (g + c);
+    NodeItem b = (c * (g + c) - val(1.0f)) / (c * (g - c) + val(1.0f));
+    NodeItem fac = (val(0.5f) * a * a * (val(1.0f) + b * b)).clamp();
+    return g2.if_else(NodeItem::CompareOp::Greater, val(0.0f), fac, val(1.0f));
+  }
+
+  /* Facing。blend = 0.5 の時は指数が 1 になるので、GLSL 側の分岐は要らない。 */
+  NodeItem b = blend.clamp(0.0f, 0.99999f);
+  NodeItem exponent = b.if_else(
+      NodeItem::CompareOp::Less, val(0.5f), val(2.0f) * b, val(0.5f) / (val(1.0f) - b));
+  return val(1.0f) - (c ^ exponent);
 }
 #endif
 NODE_SHADER_MATERIALX_END

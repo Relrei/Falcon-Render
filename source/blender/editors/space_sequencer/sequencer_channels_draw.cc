@@ -27,6 +27,7 @@
 #include "SEQ_channels.hh"
 #include "SEQ_sequencer.hh"
 #include "SEQ_time.hh"
+#include "SEQ_transform.hh"
 
 #include "UI_interface.hh"
 #include "UI_resources.hh"
@@ -68,7 +69,7 @@ static float widget_y_offset(const SeqChannelDrawContext *context)
 
 static float channel_index_y_min(const SeqChannelDrawContext *context, const int index)
 {
-  float y = (index - context->draw_offset) * context->channel_height;
+  float y = (seq::channel_to_y(index) - context->draw_offset) * context->channel_height;
   y /= context->scale;
   return y;
 }
@@ -76,9 +77,21 @@ static float channel_index_y_min(const SeqChannelDrawContext *context, const int
 static void displayed_channel_range_get(const SeqChannelDrawContext *context,
                                         int r_channel_range[2])
 {
-  /* Channel 0 is not usable, so should never be drawn. */
-  r_channel_range[0] = max_ii(1, floor(context->timeline_region_v2d->cur.ymin));
-  r_channel_range[1] = ceil(context->timeline_region_v2d->cur.ymax);
+  const View2D *v2d = context->timeline_region_v2d;
+  if (seq::channel_flip_enabled()) {
+    /* With the flip, `cur.ymax` (the top of the view) is where the *smallest* channel numbers
+     * sit and `cur.ymin` (the bottom) is where the *largest* ones sit -- the opposite of the
+     * non-flipped case below. Mirror both which edge feeds which bound and the `-1`/`ceil`
+     * one-row margin (originally applied at the `ymax`/large-channel edge) so it still applies
+     * at the edge that now shows the smallest channel numbers. */
+    r_channel_range[0] = max_ii(1, seq::y_to_channel(v2d->cur.ymax) - 1);
+    r_channel_range[1] = seq::y_to_channel(v2d->cur.ymin);
+  }
+  else {
+    /* Channel 0 is not usable, so should never be drawn. */
+    r_channel_range[0] = max_ii(1, seq::y_to_channel(v2d->cur.ymin));
+    r_channel_range[1] = ceil(v2d->cur.ymax);
+  }
 
   rctf strip_boundbox;
   BLI_rctf_init(&strip_boundbox, 0.0f, 0.0f, 1.0f, r_channel_range[1]);

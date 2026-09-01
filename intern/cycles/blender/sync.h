@@ -110,7 +110,8 @@ class BlenderSync {
   static bool get_session_pause(blender::Scene &b_scene, bool background);
   static BufferParams get_buffer_params(blender::View3D *b_v3d,
                                         blender::RegionView3D *b_rv3d,
-                                        Camera *cam,
+                                        blender::Scene *b_scene,
+                                        Scene *scene,
                                         const int width,
                                         const int height);
 
@@ -118,6 +119,22 @@ class BlenderSync {
                                           blender::ViewLayer *b_view_layer,
                                           bool background,
                                           const DeviceInfo &denoise_device);
+
+  /* Falcon: is the viewport denoising with DLSS?
+   *
+   * "Automatic" is stored as DENOISER_NONE and only becomes a concrete denoiser inside
+   * get_denoise_params (Denoiser::automatic_viewport_denoiser_type). Reading `preview_denoiser`
+   * straight off the scene therefore answers "not DLSS" for every file left on Automatic, which
+   * is most of them -- measured 2026-08-31, the RNA test skipped all 86 camera view calls of a
+   * scene that was demonstrably running DLSS.
+   *
+   * Neither helper restates the selection rule, so there is nothing to keep in sync:
+   *  - before a session exists (get_session_params) the RNA value is resolved through the very
+   *    same automatic_viewport_denoiser_type;
+   *  - once the integrator has been synced it already holds the resolved result, so ask it. */
+  static bool is_dlss_viewport_denoise(blender::Scene &b_scene,
+                                       const DeviceInfo &denoise_device_info);
+  static bool is_dlss_denoise_active(const Scene *scene);
 
  private:
   /* sync */

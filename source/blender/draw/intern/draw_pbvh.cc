@@ -716,17 +716,39 @@ void falcon_draw_report_positions()
  * 位置の作り直し 6.90 -> 1.59ms / 転送量 1/3.80 / 描画は 200万面で 51.2 -> 42.6ms。
  * 条件別 11 件すべて対照の中に収まっている。
  *
- * 戻す口は FALCON_DRAW_WELD=0 だけ。空文字は「未設定」と同じ扱い(=オン)にしてある:
+ * ★★既定を**オフへ戻した**(2026-08-26)。速さの話ではなく、載せ替えの話:
+ *
+ *  - このファイルは Blender 5.3 が作り替える当のファイル(#160654 "Design: PBVH
+ *    drawing (Blender 5.3)")。公式はノードごとの VBO を GPU 上に持ち、
+ *    各ノードが取りうる最大量を予約して部分更新する形へ動いている
+ *  - 素の v5.2.0 に対するこの木の改変は 91ファイル・+12973/-158 で、**削除は 158行**。
+ *    そのうち **-40 行がこのファイル**で、既存コードを書き換えている唯一の場所。
+ *    追加だけなら載せ替えは軽いが、既存の書き換えは作り替え後に当て直しになる
+ *  - 本人の方針(2026-08-26): 本体への改変を増やさない / GPU化は凍結 /
+ *    公開は Falcor・Hayabusa・order engine が揃うまで先延ばし
+ *    → 既定でオンにしておく理由が3つとも消えた
+ *
+ * ★**実装は残す。**5.3 の新しい器の上でいつでも復活できる。実測(400万面)も生きている:
+ *   位置の作り直し 6.90 -> 1.59ms / 転送量 1/3.80 / 描画は 200万面で 51.2 -> 42.6ms。
+ *
+ * 入れる口は FALCON_DRAW_WELD=1 だけ。空文字を「指定あり」と読まないこと:
  * getenv は `FALCON_DRAW_WELD=` の空文字でも非 nullptr を返すので、
- * `value != nullptr` だけで判定すると外したつもりが外れない。 */
+ * `value != nullptr` だけで判定すると、入れたつもりが無い/外したつもりが外れない。
+ * この木は同じ罠を FALCON_SCULPT_GPU で一度踏んでいる。 */
 namespace falcon_weld {
 static bool enabled()
 {
+#ifndef WITH_FALCON_DRAW_WELD
+  /* release 版はこの道をビルドに入れない(FALCON_BUILD_FLAVOR=release)。
+   * 環境変数を置かれても効かない。 */
+  return false;
+#else
   static const bool on = []() {
     const char *value = getenv("FALCON_DRAW_WELD");
-    return !(value != nullptr && value[0] == '0');
+    return value != nullptr && value[0] == '1';
   }();
   return on;
+#endif
 }
 }  // namespace falcon_weld
 

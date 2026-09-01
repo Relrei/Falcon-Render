@@ -300,8 +300,19 @@ void timeline_init_boundbox(const Scene *scene, rctf *r_rect)
 {
   r_rect->xmin = scene->r.sfra;
   r_rect->xmax = scene->r.efra + 1;
-  r_rect->ymin = 1.0f; /* The first strip is drawn at y == 1.0f */
-  r_rect->ymax = 8.0f;
+  if (channel_flip_enabled()) {
+    /* Non-flipped default view spans channels [1, 8] as `[channel_to_y(1), 8.0f]` (channel 1 is
+     * the smallest Y). Flipped, channel 1 sits at the *largest* Y instead, so the same "show
+     * channels 1 through 8 by default" intent needs the roles of the two bounds swapped:
+     * `channel_to_y(8)` (smallest of the two Ys) becomes ymin, `channel_to_y(1) + 1` (largest)
+     * becomes ymax. */
+    r_rect->ymin = channel_to_y(8);
+    r_rect->ymax = channel_to_y(1) + 1.0f;
+  }
+  else {
+    r_rect->ymin = channel_to_y(1); /* The first strip is drawn at y == 1.0f */
+    r_rect->ymax = 8.0f;
+  }
 }
 
 void timeline_expand_boundbox(const Scene *scene, const ListBaseT<Strip> *seqbase, rctf *rect)
@@ -314,7 +325,15 @@ void timeline_expand_boundbox(const Scene *scene, const ListBaseT<Strip> *seqbas
     rect->xmin = std::min<float>(rect->xmin, strip.left_handle() - 1);
     rect->xmax = std::max<float>(rect->xmax, strip.right_handle(scene) + 1);
     /* We do +1 here to account for the channel thickness. Channel n has range of <n, n+1>. */
-    rect->ymax = std::max(rect->ymax, strip.channel + 1.0f);
+    rect->ymax = std::max(rect->ymax, channel_to_y(strip.channel) + 1.0f);
+    if (channel_flip_enabled()) {
+      /* Non-flipped, `ymin` is never updated here because channel 1 (the smallest Y) is always
+       * the init-time sentinel already, so nothing can shrink it further. Flipped, the smallest
+       * Y instead comes from whichever strip has the *largest* channel number, which isn't
+       * known in advance, so it does need updating per-strip -- gated on the flip so the
+       * non-flipped path (and its default-off behavior) is untouched. */
+      rect->ymin = std::min(rect->ymin, channel_to_y(strip.channel));
+    }
   }
 }
 

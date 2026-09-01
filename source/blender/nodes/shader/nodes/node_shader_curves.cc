@@ -6,7 +6,12 @@
  * \ingroup shdnodes
  */
 
+#include <cmath>
+#include <cstdlib>
+
 #include "node_shader_util.hh"
+
+#include <algorithm>
 
 #include "BKE_colortools.hh"
 
@@ -17,6 +22,152 @@
 #include "node_util.hh"
 
 namespace blender {
+
+#ifdef WITH_MATERIALX
+namespace nodes::node_shader_curves_cc {
+
+/* ★2026-08-30: CurveMapping の1本のカーブを MaterialX のノード列に組む。
+ *
+ * 形を3つに分ける。
+ *   恒等   → 入力をそのまま返す（0 ノード）
+ *   直線   → 乗算 + 加算（1〜3 ノード）
+ *   その他 → 等間隔 N 点の折れ線を、ColorRamp（`node_shader_color_ramp.cc`）と同じ
+ *            「左から mix で畳む」形にする。
+ *              u   = (t - x0) / dx
+ *              w_i = clamp(u - (i-1))
+ *              acc = mix(acc, y[i], w_i)
+ *            係数が両端で飽和するので、定義域の外は端の値で伸びる。
+ *
+ * ⚠恒等・直線の判定は BKE_curvemapping_is_map_identity を使わない。
+ *   あの関数は curve[1] を (1,1) でなく (0,0) と比べているので実際のカーブでは
+ *   常に false を返す（= 恒等でも畳み込みが走る。777 ノードの主因）。
+ *   ここでは「実際に評価した値が端点を結ぶ直線と一致するか」で見る。
+ *   Vector カーブ（定義域 -1..1）も同じ物差しで拾える。 */
+enum class CurveShape { Identity, Affine, General };
+
+static CurveShape classify_curve(const CurveMapping *cumap,
+                                 int cur,
+                                 bool use_clip,
+                                 float x0,
+                                 float x1,
+                                 float &out_a,
+                                 float &out_b)
+{
+  /* 戻す口: FALCON_MTLX_CURVE_FOLD=0 で畳み込みの削減を切り、全部 General にする。 */
+  static const bool fold = []() {
+    const char *e = std::getenv("FALCON_MTLX_CURVE_FOLD");
+    return !(e && std::atoi(e) == 0);
+  }();
+  if (!fold) {
+    return CurveShape::General;
+  }
+
+  auto eval = [&](float x) {
+    float y = BKE_curvemap_evaluateF(cumap, &cumap->cm[cur], x);
+    if (use_clip && (cumap->flag & CUMA_DO_CLIP)) {
+      y = std::min(std::max(y, cumap->clipr.ymin), cumap->clipr.ymax);
+    }
+    return y;
+  };
+
+  const float ya = eval(x0);
+  const float yb = eval(x1);
+  const float a = (yb - ya) / (x1 - x0);
+  const float b = ya - a * x0;
+
+  /* 端点を結ぶ直線からのずれを 33 点で見る。 */
+  const int probes = 33;
+  float max_dev = 0.0f;
+  for (int i = 0; i <= probes; i++) {
+    const float x = x0 + (x1 - x0) * (float(i) / float(probes));
+    max_dev = std::max(max_dev, std::abs(eval(x) - (a * x + b)));
+  }
+  if (max_dev > 1.0e-5f) {
+    return CurveShape::General;
+  }
+  out_a = a;
+  out_b = b;
+  if (std::abs(a - 1.0f) <= 1.0e-6f && std::abs(b) <= 1.0e-6f) {
+    return CurveShape::Identity;
+  }
+  return CurveShape::Affine;
+}
+
+static materialx::NodeItem curve_map_to_nodes(const CurveMapping *cumap,
+                                              int cur,
+                                              const materialx::NodeItem &t,
+                                              bool use_clip)
+{
+  using NodeItem = materialx::NodeItem;
+
+  /* 折れ線の点数。
+   *
+   * ⚠2026-08-30 実測: 32 点にすると mix の鎖が 1 カーブあたり約 124 ノードになり、
+   * RGB カーブ 1 個(R/G/B + 合成 = 4 本)で材質 1 つが 777 ノードへ膨らむ。
+   * classroom(60 材質)のシェーダー生成が 59 秒 → 21 分でも終わらなくなり、
+   * 場面が録れなくなった。⇒ 32 点はやめる。既定は 12 点（classroom の実カーブで誤差 1/255 を切る最小点数。
+   * 恒等/直線の畳み込みが入ったので、12 点でも 8-30 の 8 点より ND 合計は 27% 少ない）。
+   *
+   * FALCON_MTLX_CURVE_SAMPLES=N で点数を変えられる。
+   * N <= 1 なら畳まずに入力をそのまま返す(= 2026-08-30 以前の素通しに戻る口)。 */
+  static const int samples = []() {
+    if (const char *e = std::getenv("FALCON_MTLX_CURVE_SAMPLES")) {
+      const int v = std::atoi(e);
+      return v > 64 ? 64 : v;
+    }
+    return 12;
+  }();
+  if (samples <= 1) {
+    return t;
+  }
+  const float x0 = cumap->clipr.xmin;
+  const float x1 = cumap->clipr.xmax;
+  if (!(x1 > x0)) {
+    return t;
+  }
+
+  float a = 1.0f, b = 0.0f;
+  switch (classify_curve(cumap, cur, use_clip, x0, x1, a, b)) {
+    case CurveShape::Identity:
+      return t;
+    case CurveShape::Affine: {
+      NodeItem res = t;
+      if (std::abs(a - 1.0f) > 1.0e-6f) {
+        res = res * t.val(a);
+      }
+      if (std::abs(b) > 1.0e-6f) {
+        res = res + t.val(b);
+      }
+      return res;
+    }
+    case CurveShape::General:
+      break;
+  }
+
+  const float dx = (x1 - x0) / float(samples - 1);
+
+  auto eval = [&](int i) {
+    float y = BKE_curvemap_evaluateF(cumap, &cumap->cm[cur], x0 + dx * float(i));
+    if (use_clip && (cumap->flag & CUMA_DO_CLIP)) {
+      y = std::min(std::max(y, cumap->clipr.ymin), cumap->clipr.ymax);
+    }
+    return y;
+  };
+
+  /* 区間ごとに (t - xa)/dx を作り直すと除算が点数ぶん増える。
+   * u = (t - x0)/dx を一度だけ作り、以降は整数の引き算で済ませる。 */
+  NodeItem u = (t - t.val(x0)) * t.val(1.0f / dx);
+  NodeItem res = t.val(eval(0));
+  for (int i = 1; i < samples; i++) {
+    NodeItem w = (i == 1) ? u.clamp() : (u - t.val(float(i - 1))).clamp();
+    res = w.mix(res, t.val(eval(i)));
+  }
+  return res;
+}
+
+}  // namespace nodes::node_shader_curves_cc
+#endif
+
 
 namespace nodes::node_shader_curves_cc::vec {
 
@@ -134,8 +285,32 @@ static void sh_node_curve_vec_build_multi_function(NodeMultiFunctionBuilder &bui
 NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
-  /* TODO: implement */
-  return get_input_value("Vector", NodeItem::Type::Vector3);
+  NodeItem vector = get_input_value("Vector", NodeItem::Type::Vector3);
+  CurveMapping *cumap = static_cast<CurveMapping *>(node_->storage);
+  if (cumap == nullptr) {
+    return vector;
+  }
+  BKE_curvemapping_init(cumap);
+
+  /* ★定数入力は CPU で評価(RGB カーブと同じ理由・2026-08-31)。 */
+  if (vector.value && get_input_value("Fac", NodeItem::Type::Float).value) {
+    const MaterialX::Vector3 v = vector.value->asA<MaterialX::Vector3>();
+    const float fac_v = get_input_value("Fac", NodeItem::Type::Float).value->asA<float>();
+    float in[3] = {v[0], v[1], v[2]}, out[3];
+    BKE_curvemapping_evaluate3F(cumap, out, in);
+    return vector.val(MaterialX::Vector3(in[0] + (out[0] - in[0]) * fac_v,
+                                          in[1] + (out[1] - in[1]) * fac_v,
+                                          in[2] + (out[2] - in[2]) * fac_v));
+  }
+
+  NodeItem x = curve_map_to_nodes(cumap, 0, vector[0], false);
+  NodeItem y = curve_map_to_nodes(cumap, 1, vector[1], false);
+  NodeItem z = curve_map_to_nodes(cumap, 2, vector[2], false);
+  NodeItem mapped = create_node(
+      "combine3", NodeItem::Type::Vector3, {{"in1", x}, {"in2", y}, {"in3", z}});
+
+  NodeItem fac = get_input_value("Fac", NodeItem::Type::Float);
+  return fac.mix(vector, mapped);
 }
 #endif
 NODE_SHADER_MATERIALX_END
@@ -310,8 +485,42 @@ static void sh_node_curve_rgb_build_multi_function(NodeMultiFunctionBuilder &bui
 NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
-  /* TODO: implement */
-  return get_input_value("Color", NodeItem::Type::Color3);
+  NodeItem color = get_input_value("Color", NodeItem::Type::Color3);
+  CurveMapping *cumap = static_cast<CurveMapping *>(node_->storage);
+  if (cumap == nullptr) {
+    return color;
+  }
+  BKE_curvemapping_init(cumap);
+
+  /* ★入力が定数なら CPU で評価して定数のまま返す(2026-08-31)。
+   *   ノードを1つも作らない = 誤差ゼロ・下流の「リテラルを見て判断する」処理
+   *   (falcon-live のポータル復元など)が今までどおり動く。
+   *   ⚠ これを入れる前は、Sky Texture が未対応で入力が既定の黒に落ちた材質で
+   *     `mix(bg=(0,0,0), fg=combine3(0,0,0))` というノードが残り、
+   *     「黒のリテラル」を探す側が見つけられずに窓の発光が消えた(classroom 実測)。 */
+  if (color.value && get_input_value("Fac", NodeItem::Type::Float).value) {
+    const MaterialX::Color3 c = color.value->asA<MaterialX::Color3>();
+    const float fac_v = get_input_value("Fac", NodeItem::Type::Float).value->asA<float>();
+    float in[3] = {c[0], c[1], c[2]}, out[3];
+    BKE_curvemapping_evaluateRGBF(cumap, out, in);
+    return color.val(MaterialX::Color3(in[0] + (out[0] - in[0]) * fac_v,
+                                        in[1] + (out[1] - in[1]) * fac_v,
+                                        in[2] + (out[2] - in[2]) * fac_v));
+  }
+
+  /* `BKE_curvemapping_evaluateRGBF()` と同じ順。合成カーブ（3番）が先、次に各チャンネル。 */
+  NodeItem channel[3];
+  for (int i = 0; i < 3; i++) {
+    NodeItem v = curve_map_to_nodes(cumap, 3, color[i], false);
+    channel[i] = curve_map_to_nodes(cumap, i, v, false);
+  }
+  NodeItem mapped = create_node(
+      "combine3",
+      NodeItem::Type::Color3,
+      {{"in1", channel[0]}, {"in2", channel[1]}, {"in3", channel[2]}});
+
+  NodeItem fac = get_input_value("Fac", NodeItem::Type::Float);
+  return fac.mix(color, mapped);
 }
 #endif
 NODE_SHADER_MATERIALX_END
@@ -456,8 +665,27 @@ static void sh_node_curve_float_build_multi_function(NodeMultiFunctionBuilder &b
 NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
-  /* TODO: implement */
-  return get_input_value("Value", NodeItem::Type::Float);
+  NodeItem value = get_input_value("Value", NodeItem::Type::Float);
+  CurveMapping *cumap = static_cast<CurveMapping *>(node_->storage);
+  if (cumap == nullptr) {
+    return value;
+  }
+  BKE_curvemapping_init(cumap);
+
+  /* ★定数入力は CPU で評価(RGB カーブと同じ理由・2026-08-31)。 */
+  if (value.value && get_input_value("Factor", NodeItem::Type::Float).value) {
+    const float in = value.value->asA<float>();
+    const float fac_v = get_input_value("Factor", NodeItem::Type::Float).value->asA<float>();
+    float out = BKE_curvemapping_evaluateF(cumap, 0, in);
+    if (cumap->flag & CUMA_DO_CLIP) {
+      out = std::min(std::max(out, cumap->clipr.ymin), cumap->clipr.ymax);
+    }
+    return value.val(in + (out - in) * fac_v);
+  }
+
+  NodeItem mapped = curve_map_to_nodes(cumap, 0, value, true);
+  NodeItem fac = get_input_value("Factor", NodeItem::Type::Float);
+  return fac.mix(value, mapped);
 }
 #endif
 NODE_SHADER_MATERIALX_END

@@ -8,19 +8,30 @@
  * \ingroup sequencer
  */
 
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 #include "DNA_scene_types.h"
 #include "DNA_sequence_types.h"
 
 #include "BLI_listbase.h"
 #include "BLI_math_base.h"
+#include "BLI_memory_cache.hh"
+#include "BLI_system.h"
+#include "BLI_time.h"
 #include "BLI_session_uid.h"
 #include "BLI_string.h"
 
 #include "BKE_layer.hh"
 #include "BKE_main.hh"
 #include "BKE_report.hh"
+#include "BKE_scene.hh"
 
 #include "DEG_depsgraph.hh"
+
+#include "IMB_cache.hh"
 
 #include "MOV_read.hh"
 
@@ -75,11 +86,133 @@ void cache_settings_changed(Scene *scene)
   }
 }
 
+/**
+ * 空きメモリがこれを割ったら、設定した上限に達していなくてもキャッシュを手放す (MB)。
+ * `FALCON_VSE_MEM_FLOOR_MB=0` で無効(従来どおり上限だけで判断する)。
+ *
+ * ★なぜ要るか: `U.memcachelimit` は「VSE のキャッシュがどこまで太ってよいか」しか見ておらず、
+ * **機械の空きメモリを誰も見ていない**。設定値を大きくすると、空きが尽きかけていても
+ * 1枚も捨てないので、他の作業(モデリング・アニメーション)ごと機械が溢れる。
+ * しかも同じ `U.memcachelimit` は ImBuf のキャッシュ制限と汎用メモリキャッシュにも
+ * 別々に渡されているので、実際の天井は設定値の数倍になりうる。
+ */
+static size_t seq_cache_memory_floor_bytes()
+{
+  static const size_t floor_bytes = []() -> size_t {
+    const char *env = getenv("FALCON_VSE_MEM_FLOOR_MB");
+    int mb = 1024;
+    if (env != nullptr) {
+      mb = std::max(0, atoi(env));
+    }
+    return size_t(mb) * 1024 * 1024;
+  }();
+  return floor_bytes;
+}
+
+/**
+ * 機械の空きメモリが下限を割っているか。分からない時は false。
+ *
+ * ⚠**「分からない」を「空きが無い」と読まないこと。**
+ * #BLI_system_memory_available_in_bytes は対応していないプラットフォームで 0 を返す。
+ * そこで真を返すと、そのプラットフォームでは常時キャッシュが空になる。
+ *
+ * `/proc/meminfo` の読み出しは 100ms に1回までに間引く。この関数は追い出しのループの中から
+ * 呼ばれるので、1回の追い出しの間は同じ答えを返す = 「下限を割っていたら、下の keep 分まで
+ * 縮めて止まる」という決まった動きになる。
+ */
+static bool seq_system_memory_is_low()
+{
+  const size_t floor_bytes = seq_cache_memory_floor_bytes();
+  if (floor_bytes == 0) {
+    return false;
+  }
+  static std::atomic<double> last_check_time{-1.0};
+  static std::atomic<bool> last_result{false};
+  const double now = BLI_time_now_seconds();
+  const double last = last_check_time.load(std::memory_order_relaxed);
+  if (last >= 0.0 && now - last < 0.1) {
+    return last_result.load(std::memory_order_relaxed);
+  }
+  const size_t available = BLI_system_memory_available_in_bytes();
+  /* 0 = 取れなかった。「空きが無い」ではない。 */
+  const bool low = (available != 0) && (available < floor_bytes);
+  last_result.store(low, std::memory_order_relaxed);
+  last_check_time.store(now, std::memory_order_relaxed);
+  return low;
+}
+
+/**
+ * `U.memcachelimit` を「3系統で分け合う1つの予算」として扱うか(`FALCON_VSE_MEM_SHARED_BUDGET=1`)。
+ *
+ * 既定は従来どおり OFF = VSE は自分のキャッシュだけを設定値と比べる。ON にすると
+ * ImBuf のキャッシュと汎用メモリキャッシュが今持っている分も足してから比べるので、
+ * 「設定した数字までしか使わない」という**ユーザーの期待どおり**の意味になる。
+ * ⚠ただし VSE 側だけが遠慮する形になる(他の2つは自分の分しか見ない)ので、
+ * 実験用の口として置く。既定を倒すかは本人判断。
+ */
+static bool seq_use_shared_budget()
+{
+  static const bool shared = []() {
+    const char *env = getenv("FALCON_VSE_MEM_SHARED_BUDGET");
+    return env != nullptr && atoi(env) != 0;
+  }();
+  return shared;
+}
+
+/** 内訳を1秒に1回だけ出す(`FALCON_VSE_MEM_DEBUG=1`)。 */
+static void seq_cache_memory_debug_print(size_t seq_bytes, size_t imbuf_bytes, size_t memcache_bytes)
+{
+  static const bool enabled = []() {
+    const char *env = getenv("FALCON_VSE_MEM_DEBUG");
+    return env != nullptr && atoi(env) != 0;
+  }();
+  if (!enabled) {
+    return;
+  }
+  static std::atomic<double> last{-1.0};
+  const double now = BLI_time_now_seconds();
+  const double prev = last.load(std::memory_order_relaxed);
+  if (prev >= 0.0 && now - prev < 1.0) {
+    return;
+  }
+  last.store(now, std::memory_order_relaxed);
+  const double mb = 1024.0 * 1024.0;
+  /* ★「0」と「そもそも入れ物がまだ無い」を分けて出す。混ぜると、測れていないことが
+   * 「使っていない」に化ける(この計画で何度も踏んでいる形)。 */
+  printf("### VSEMEM seq=%.1f imbuf=%.1f%s memcache=%.1f 合計=%.1f 上限=%d 空き=%.1f (MB)\n",
+         seq_bytes / mb,
+         imbuf_bytes / mb,
+         IMB_cache_is_active() ? "" : "(未作成)",
+         memcache_bytes / mb,
+         (seq_bytes + imbuf_bytes + memcache_bytes) / mb,
+         U.memcachelimit,
+         BLI_system_memory_available_in_bytes() / mb);
+  fflush(stdout);
+}
+
 bool is_cache_full(const Scene *scene)
 {
-  size_t cache_limit = size_t(U.memcachelimit) * 1024 * 1024;
-  return source_image_cache_calc_memory_size(scene) + final_image_cache_calc_memory_size(scene) >
-         cache_limit;
+  const size_t cache_limit = size_t(U.memcachelimit) * 1024 * 1024;
+  const size_t seq_bytes = source_image_cache_calc_memory_size(scene) +
+                           final_image_cache_calc_memory_size(scene);
+  const size_t imbuf_bytes = IMB_cache_memory_in_use();
+  const size_t memcache_bytes = size_t(std::max<int64_t>(memory_cache::approximate_used_size(), 0));
+  seq_cache_memory_debug_print(seq_bytes, imbuf_bytes, memcache_bytes);
+
+  /* 既定は従来どおり VSE の分だけ。共有予算を頼まれた時だけ3系統の合計で比べる。 */
+  const size_t used = seq_use_shared_budget() ? (seq_bytes + imbuf_bytes + memcache_bytes) :
+                                                seq_bytes;
+  if (used > cache_limit) {
+    return true;
+  }
+  /* 空きが下限を割っている間は、設定した上限に達していなくても手放す。
+   * ただし丸ごと空にはしない: ここまでは残す、という下駄を履かせて追い出しのループを止める
+   * (全部捨てると、圧力が一瞬かすめただけで再生が最初からやり直しになる)。 */
+  const size_t keep = std::max<size_t>(cache_limit / 8, 64 * 1024 * 1024);
+  if (used > keep && seq_system_memory_is_low()) {
+    return true;
+  }
+  return false;
 }
 
 bool evict_caches_if_full(Scene *scene)
@@ -181,6 +314,28 @@ void relations_invalidate_cache(Scene *scene, Strip *strip)
   /* Needed to update VSE sound. */
   DEG_id_tag_update(&scene->id, ID_RECALC_SEQUENCER_STRIPS);
   prefetch_stop(scene);
+}
+
+void relations_tag_temporary_animation_frame(Scene *scene)
+{
+  Editing *ed = editing_get(scene);
+  if (ed != nullptr) {
+    ed->runtime->temporary_animation_frame = BKE_scene_frame_get(scene);
+  }
+}
+
+void relations_invalidate_temporary_animation_frame(Scene *scene)
+{
+  Editing *ed = editing_get(scene);
+  if (ed == nullptr || !ed->runtime->temporary_animation_frame.has_value()) {
+    return;
+  }
+
+  const float temp_frame = ed->runtime->temporary_animation_frame.value();
+  if (temp_frame != BKE_scene_frame_get(scene)) {
+    final_image_cache_invalidate_frame_range(scene, temp_frame, temp_frame);
+    ed->runtime->temporary_animation_frame.reset();
+  }
 }
 
 void relations_invalidate_scene_strips(const Main *bmain, const Scene *scene_target)

@@ -2,6 +2,11 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+# Falcon: GPU化の口は debug 版だけに入れる (FALCON_BUILD_FLAVOR)
+if(WITH_FALCON_SCULPT_GPU)
+  add_definitions(-DWITH_FALCON_SCULPT_GPU)
+endif()
+
 set(INC
   ../..
 
@@ -90,6 +95,7 @@ set(SRC
   mesh/paint_vertex_weight_utils.cc
   mesh/paint_weight.cc
   mesh/falcon_sculpt_gpu.cc
+  mesh/falcon_sculpt_resident.cc
   mesh/sculpt.cc
   mesh/sculpt_automasking.cc
   mesh/sculpt_boundary.cc
@@ -142,6 +148,7 @@ set(SRC
   mesh/sculpt_gesture.hh
   mesh/sculpt_hide.hh
   mesh/falcon_sculpt_gpu.hh
+  mesh/falcon_sculpt_resident.hh
   mesh/sculpt_intern.hh
   mesh/sculpt_islands.hh
   mesh/sculpt_pose.hh

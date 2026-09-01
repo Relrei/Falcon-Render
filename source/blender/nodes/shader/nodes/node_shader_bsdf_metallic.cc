@@ -151,8 +151,17 @@ NODE_SHADER_MATERIALX_BEGIN
 
   NodeItem color = get_input_value("Base Color", NodeItem::Type::Color3);
   NodeItem edge_tint = get_input_value("Edge Tint", NodeItem::Type::Color3);
-  NodeItem roughness = get_input_value("Roughness", NodeItem::Type::Vector2);
-  NodeItem anisotropy = get_input_value("Anisotropy", NodeItem::Type::Color3);
+  /* ★2026-08-30: 粗さは `roughness_anisotropy` を通す。
+   *   `conductor_bsdf` の roughness は α（粗さの2乗）を2つ並べたものなので、
+   *   Blender の粗さをそのまま Vector2 へ広げて渡すと二乗ぶん外れる。
+   *   正しい形は `node_shader_bsdf_glossy.cc` と Principled にある。
+   *   異方性は Color3 で取って一度も繋いでいなかったので Float にして渡す。 */
+  NodeItem roughness = get_input_value("Roughness", NodeItem::Type::Float);
+  NodeItem anisotropy = get_input_value("Anisotropy", NodeItem::Type::Float);
+  NodeItem roughness_vector = create_node(
+      "roughness_anisotropy",
+      NodeItem::Type::Vector2,
+      {{"roughness", roughness}, {"anisotropy", anisotropy}});
   NodeItem normal = get_input_link("Normal", NodeItem::Type::Vector3);
   NodeItem tangent = get_input_link("Tangent", NodeItem::Type::Vector3);
   NodeItem thin_film_thickness = get_input_value("Thin Film Thickness", NodeItem::Type::Float);
@@ -177,7 +186,7 @@ NODE_SHADER_MATERIALX_BEGIN
                       {"tangent", tangent},
                       {"ior", ior_out},
                       {"extinction", extinction_out},
-                      {"roughness", roughness},
+                      {"roughness", roughness_vector},
                       {"thinfilm_thickness", thin_film_thickness},
                       {"thinfilm_ior", thin_film_ior}});
 }

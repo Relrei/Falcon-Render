@@ -1933,6 +1933,19 @@ def _falcon_camera_fcurves(cam_obj):
     return curves
 
 
+def _falcon_shot_camera(scene, cut):
+    """そのカットで有効になるカメラ。マーカーが無ければシーンのカメラ。
+
+    ★frame_set はマーカーの束縛を再適用するので、カットの手前のフレームでは
+    「前のショットのカメラ」に戻ってしまう。ウォームアップはこれを打ち消す。
+    """
+    cam = None
+    for m in sorted((m for m in scene.timeline_markers if m.camera), key=lambda m: m.frame):
+        if m.frame <= cut:
+            cam = m.camera
+    return cam or scene.camera
+
+
 def _falcon_cut_frames(scene):
     """カットの開始フレーム。マーカーでカメラが切り替わる所=履歴が捨てられる所。"""
     cuts = [scene.frame_start]
@@ -1973,18 +1986,29 @@ class CYCLES_OT_falcon_warmup_render(Operator):
 
         # ショットの手前にキーが無いとカメラは静止したままで、視差が出ない=温まらない。
         # 補外を直線にすると「そのまま動き続けていた」状態になり、実フレーム相当の視差が出る。
-        curves = _falcon_camera_fcurves(scene.camera)
-        saved = [(fc, fc.extrapolation) for fc in curves]
-        for fc in curves:
-            fc.extrapolation = 'LINEAR'
+        # ★ショットごとのカメラすべてに掛ける。1台だけだと2本目以降のカットで効かない。
+        saved = []
+        for cam in {c for c in (_falcon_shot_camera(scene, cut) for cut in cuts) if c}:
+            for fc in _falcon_camera_fcurves(cam):
+                saved.append((fc, fc.extrapolation))
+                fc.extrapolation = 'LINEAR'
 
+        original_camera = scene.camera
         try:
             for i, cut in enumerate(cuts):
                 shot_end = (cuts[i + 1] - 1) if i + 1 < len(cuts) else scene.frame_end
+                shot_cam = _falcon_shot_camera(scene, cut)
 
                 # 捨て焼き。連番で焼くのが必須(フレームが飛ぶとカット扱いで履歴が捨てられる)。
+                #
+                # ★カットの手前のフレームは、マーカーの束縛では**前のショットのカメラ**が
+                #   有効になる(実測: cut=15 の warm 4枚は 11〜14 が全部 CamA だった)。
+                #   それで温めると、カットで捨てられる側の絵で履歴を埋めることになる。
+                #   frame_set の後に、そのショットのカメラへ差し戻す。
                 for f in range(cut - warm, cut):
                     scene.frame_set(f)
+                    if shot_cam is not None:
+                        scene.camera = shot_cam
                     bpy.ops.render.render(write_still=False)
 
                 # 本番。ここから履歴は温まっている。write_stillは連番を付けないので、

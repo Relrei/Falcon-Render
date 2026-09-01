@@ -96,6 +96,10 @@ class PathTrace {
    * scene content changed, since carried history would ghost the edit. */
   void clear_denoiser_temporal_history();
 
+  /* Tell the denoiser which frame the following renders belong to. DLSS-RR
+   * needs it to tell a frame change from more samples on the same frame. */
+  void set_denoiser_frame(int frame);
+
   /* Set parameters used for adaptive sampling.
    * Use this to configure the adaptive sampler before rendering any samples. */
   void set_adaptive_sampling(const AdaptiveSampling &adaptive_sampling);
@@ -293,6 +297,9 @@ class PathTrace {
 
   /* Denoiser which takes care of denoising the big tile. */
   unique_ptr<Denoiser> denoiser_;
+
+  /* Frame the renders belong to, handed to the denoiser at denoise time. */
+  int denoiser_frame_ = 0;
 
   /* Denoiser device descriptor which holds the denoised big tile for multi-device workloads. */
   unique_ptr<PathTraceWork> big_tile_denoise_work_;

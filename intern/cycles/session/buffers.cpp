@@ -92,6 +92,13 @@ NODE_DEFINE(BufferParams)
   SOCKET_INT(full_width, "Full Width", 0);
   SOCKET_INT(full_height, "Full Height", 0);
 
+  SOCKET_INT(display_x, "Display X", 0);
+  SOCKET_INT(display_y, "Display Y", 0);
+  SOCKET_INT(display_width, "Display Width", 0);
+  SOCKET_INT(display_height, "Display Height", 0);
+  SOCKET_INT(display_full_width, "Display Full Width", 0);
+  SOCKET_INT(display_full_height, "Display Full Height", 0);
+
   SOCKET_STRING(layer, "Layer", ustring());
   SOCKET_STRING(view, "View", ustring());
   SOCKET_INT(samples, "Samples", 0);
@@ -235,6 +242,14 @@ bool BufferParams::modified(const BufferParams &other) const
 
   if (window_x != other.window_x || window_y != other.window_y ||
       window_width != other.window_width || window_height != other.window_height)
+  {
+    return true;
+  }
+
+  if (display_x != other.display_x || display_y != other.display_y ||
+      display_width != other.display_width || display_height != other.display_height ||
+      display_full_width != other.display_full_width ||
+      display_full_height != other.display_full_height)
   {
     return true;
   }

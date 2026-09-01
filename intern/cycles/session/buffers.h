@@ -85,6 +85,27 @@ class BufferParams : public Node {
   int full_width = 0;
   int full_height = 0;
 
+  /* Rectangle this buffer is drawn into on screen, in the coordinates the display driver draws
+   * in, when that is not the same as the buffer's own geometry.
+   *
+   * Everything above describes the render: the buffer covers `width` x `height` pixels at
+   * (`full_x`, `full_y`) of a `full_width` x `full_height` raster, and the camera is fitted to
+   * that raster (Session::update_scene). Normally the render is also what is on screen, one
+   * pixel per pixel, so the display driver reads the same fields. When the two are allowed to
+   * differ -- currently only the viewport camera view with DLSS-RR, which renders a size that
+   * the zoom cannot move -- these carry the on-screen side and the display stretches the
+   * rendered result over them, the same way it already stretches a resolution-divided render.
+   *
+   * A zero `display_width` (the default) means "the render is the screen", which is upstream
+   * behaviour. These are screen pixels, so the resolution divider must not scale them
+   * (PathTrace::scale_buffer_params overwrites only the render fields, so they pass through). */
+  int display_x = 0;
+  int display_y = 0;
+  int display_width = 0;
+  int display_height = 0;
+  int display_full_width = 0;
+  int display_full_height = 0;
+
   /* Runtime fields, only valid after `update_passes()` or `update_offset_stride()`. */
   int offset = -1, stride = -1;
 

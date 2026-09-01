@@ -6,6 +6,7 @@
  * \ingroup imbuf
  */
 
+#include "BLI_utility_mixins.hh"
 #include "IMB_colormanagement.hh"
 #include "IMB_colormanagement_intern.hh"
 
@@ -45,6 +46,7 @@
 #include "BLI_string_ref.hh"
 #include "BLI_string_utf8.h"
 #include "BLI_task.hh"
+#include "BLI_time.h"
 #include "BLI_threads.h"
 #include "BLI_vector_set.hh"
 
@@ -123,14 +125,24 @@ float3x3 global_scene_linear_to_xyz_default = float3x3::zero();
  */
 static pthread_mutex_t processor_lock = BLI_MUTEX_INITIALIZER;
 
-static struct GlobalGPUState {
+static struct GlobalGPUState : NonCopyable {
   GlobalGPUState() = default;
 
   ~GlobalGPUState()
   {
+    reset();
+  }
+
+  void reset()
+  {
+    gpu_shader_bound = false;
     if (curve_mapping) {
       BKE_curvemapping_free(curve_mapping);
+      curve_mapping = nullptr;
     }
+    orig_curve_mapping = nullptr;
+    use_curve_mapping = false;
+    curve_mapping_timestamp = 0;
   }
 
   /* GPU shader currently bound. */
@@ -349,7 +361,7 @@ void colormanagement_init()
 
 void colormanagement_exit()
 {
-  global_gpu_state = GlobalGPUState();
+  global_gpu_state.reset();
   global_color_picking_state = GlobalColorPickingState();
 
   colormanage_free_config();
@@ -2257,10 +2269,114 @@ static const char *imbuf_colorspace_name(const ImBuf *ibuf, const bool prefer_by
                                               global_role_default_byte;
 }
 
+/* --- 区間の計測(環境変数 FALCON_VSE_TIMING=1 の時だけ)--- */
+static bool falcon_cm_timing()
+{
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("FALCON_VSE_TIMING");
+    on = (e && e[0] == '1') ? 1 : 0;
+  }
+  return on == 1;
+}
+static void falcon_cm_log(const char *name, double t0)
+{
+  if (falcon_cm_timing()) {
+    printf("FVSE %s %.3f\n", name, (BLI_time_now_seconds() - t0) * 1000.0);
+    fflush(stdout);
+  }
+}
+
+/* --- 恒等と分かっている書き出し変換を素通しする(戻す口 FALCON_MOVIE_SKIP_IDENTITY_DISPLAY=0)---
+ *
+ * 素通しするのは、結果がビット単位で同じだと**先に確かめられる**2つだけ。
+ *   ① 表示変換: 素材が byte のみ・出力も byte・ビュー変換が Standard 等で
+ *      「byte バッファの色空間 == 表示の色空間」の時(判定は上流の
+ *      imb_colormanagement_display_processor_needed をそのまま使う)。
+ *   ② 黒への合成: 出力が RGB(アルファ無し)でも、全画素が不透明なら
+ *      IMB_alpha_under_color_byte は何も変えない。
+ * どちらも byte_data_for_write() を呼ばずに済むので、暗黙共有の写しも起きなくなる。
+ *
+ * FALCON_MOVIE_VERIFY_IDENTITY=1(デバッグビルドでは既定で)を付けると、
+ * 素通しした場所で本来の処理を控えに掛け直し、1バイトでも違えば止まる。 */
+static bool falcon_skip_identity_display()
+{
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("FALCON_MOVIE_SKIP_IDENTITY_DISPLAY");
+    on = (e && e[0] == '0') ? 0 : 1;
+  }
+  return on == 1;
+}
+
+/* 門の陰性対照。恒等でない場所でも素通しさせて、検証が本当に落ちるかを確かめる。
+ * FALCON_MOVIE_VERIFY_IDENTITY=1 と併用する(常用しない)。 */
+static bool falcon_force_identity_skip()
+{
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("FALCON_MOVIE_FORCE_IDENTITY_SKIP");
+    on = (e && e[0] == '1') ? 1 : 0;
+  }
+  return on == 1;
+}
+
+static bool falcon_verify_identity_enabled()
+{
+#ifndef NDEBUG
+  return true;
+#else
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("FALCON_MOVIE_VERIFY_IDENTITY");
+    on = (e && e[0] == '1') ? 1 : 0;
+  }
+  return on == 1;
+#endif
+}
+
+/* 素通しした処理を控えに掛け直して、byte バッファが1バイトも動かないことを確かめる。 */
+template<typename OpFn>
+static void falcon_verify_identity_skip(const ImBuf *ibuf, const char *what, OpFn &&op)
+{
+  if (!falcon_verify_identity_enabled()) {
+    return;
+  }
+  ImBuf *probe = IMB_dupImBuf(ibuf);
+  if (probe == nullptr) {
+    return;
+  }
+  op(probe);
+  const size_t bytes = size_t(ibuf->x) * size_t(ibuf->y) * 4;
+  const bool same = probe->byte_data() && ibuf->byte_data() &&
+                    memcmp(probe->byte_data(), ibuf->byte_data(), bytes) == 0;
+  IMB_freeImBuf(probe);
+  if (!same) {
+    fprintf(stderr,
+            "FALCON: identity skip violated in IMB_colormanagement_imbuf_for_write (%s). "
+            "Set FALCON_MOVIE_SKIP_IDENTITY_DISPLAY=0 to disable the skip.\n",
+            what);
+    fflush(stderr);
+    BLI_assert_msg(false, "FALCON identity skip is not identity");
+  }
+}
+
+/* 動画書き出しで float 側の表示バッファ書き戻しを省く(戻す口: =0)。 */
+static bool falcon_movie_skip_float_display()
+{
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("FALCON_MOVIE_SKIP_FLOAT_DISPLAY");
+    on = (e && e[0] == '0') ? 0 : 1;
+  }
+  return on == 1;
+}
+
 ImBuf *IMB_colormanagement_imbuf_for_write(ImBuf *ibuf,
                                            bool save_as_render,
                                            bool allocate_result,
-                                           const ImageFormatData *image_format)
+                                           const ImageFormatData *image_format,
+                                           bool byte_result_only)
 {
   ImBuf *colormanaged_ibuf = ibuf;
 
@@ -2304,10 +2420,25 @@ ImBuf *IMB_colormanagement_imbuf_for_write(ImBuf *ibuf,
     }
 
     if (colormanaged_ibuf->byte_data()) {
-      IMB_alpha_under_color_byte(colormanaged_ibuf->byte_data_for_write(),
-                                 colormanaged_ibuf->x,
-                                 colormanaged_ibuf->y,
-                                 color);
+      const double falcon_t = BLI_time_now_seconds();
+      /* 全画素が不透明なら、この合成は1バイトも変えない。読むだけで済ませる。 */
+      const bool falcon_opaque = falcon_skip_identity_display() &&
+                                 IMB_alpha_is_opaque_byte(colormanaged_ibuf->byte_data(),
+                                                          colormanaged_ibuf->x,
+                                                          colormanaged_ibuf->y);
+      if (falcon_opaque) {
+        const float backcol[3] = {color[0], color[1], color[2]};
+        falcon_verify_identity_skip(colormanaged_ibuf, "alpha_under_byte", [&](ImBuf *probe) {
+          IMB_alpha_under_color_byte(probe->byte_data_for_write(), probe->x, probe->y, backcol);
+        });
+      }
+      else {
+        IMB_alpha_under_color_byte(colormanaged_ibuf->byte_data_for_write(),
+                                   colormanaged_ibuf->x,
+                                   colormanaged_ibuf->y,
+                                   color);
+      }
+      falcon_cm_log("cm_alpha_under_byte", falcon_t);
     }
   }
 
@@ -2319,16 +2450,59 @@ ImBuf *IMB_colormanagement_imbuf_for_write(ImBuf *ibuf,
       IMB_alloc_byte_pixels(colormanaged_ibuf);
     }
 
+    /* 呼び出し側が byte しか読まないなら、float 側への書き戻しを省く。 */
+    const bool skip_float_display = byte_result_only && byte_output &&
+                                    colormanaged_ibuf->float_data() != nullptr &&
+                                    falcon_movie_skip_float_display();
+
+    const double falcon_t_disp = BLI_time_now_seconds();
+
+    /* 表示変換が恒等になる時は丸ごと飛ばす(byte のみ・byte 出力・色空間が表示と同じ)。
+     * ここを通らなければ byte_data_for_write() も呼ばれないので、暗黙共有の写しも起きない。 */
+    const ColorManagedDisplaySpace falcon_display_space =
+        image_format->media_type == MEDIA_TYPE_VIDEO ? DISPLAY_SPACE_VIDEO_OUTPUT :
+                                                       DISPLAY_SPACE_IMAGE_OUTPUT;
+    const bool falcon_identity_display =
+        falcon_skip_identity_display() && byte_output && colormanaged_ibuf->byte_data() &&
+        (falcon_force_identity_skip() ||
+         (colormanaged_ibuf->float_data() == nullptr &&
+          !imb_colormanagement_display_processor_needed(colormanaged_ibuf,
+                                                        &image_format->view_settings,
+                                                        &image_format->display_settings,
+                                                        falcon_display_space)));
+    if (falcon_identity_display) {
+      falcon_verify_identity_skip(colormanaged_ibuf, "display_transform", [&](ImBuf *probe) {
+        colormanage_display_buffer_process(probe,
+                                           nullptr,
+                                           probe->byte_data_for_write(),
+                                           &image_format->view_settings,
+                                           &image_format->display_settings,
+                                           falcon_display_space);
+      });
+      colormanaged_ibuf->byte_buffer.colorspace = IMB_colormangement_display_get_color_space(
+          &image_format->view_settings, &image_format->display_settings);
+      falcon_cm_log("cm_display_process", falcon_t_disp);
+      return colormanaged_ibuf;
+    }
+
     colormanage_display_buffer_process(colormanaged_ibuf,
-                                       colormanaged_ibuf->float_data_for_write(),
+                                       skip_float_display ?
+                                           nullptr :
+                                           colormanaged_ibuf->float_data_for_write(),
                                        colormanaged_ibuf->byte_data_for_write(),
                                        &image_format->view_settings,
                                        &image_format->display_settings,
                                        image_format->media_type == MEDIA_TYPE_VIDEO ?
                                            DISPLAY_SPACE_VIDEO_OUTPUT :
                                            DISPLAY_SPACE_IMAGE_OUTPUT);
+    falcon_cm_log("cm_display_process", falcon_t_disp);
 
-    if (colormanaged_ibuf->float_data()) {
+    if (skip_float_display) {
+      /* float は線形のまま。byte だけが表示空間になった。 */
+      colormanaged_ibuf->byte_buffer.colorspace = IMB_colormangement_display_get_color_space(
+          &image_format->view_settings, &image_format->display_settings);
+    }
+    else if (colormanaged_ibuf->float_data()) {
       /* Float buffer isn't linear anymore.
        * - Image format write callback checks for this flag and assumes no space
        *   conversion should happen if ibuf->float_buffer.colorspace != nullptr. */

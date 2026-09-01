@@ -159,8 +159,59 @@ static void sh_node_valtorgb_build_multi_function(nodes::NodeMultiFunctionBuilde
 NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
-  /* TODO: Implement */
-  NodeItem res = empty();
+  /* カラーランプ(ColorBand)を MaterialX のノード列で組む。1D の LUT は使わない。
+   *
+   * 停止点が位置の順に並んでいることを使って、左から順に
+   *   acc = mix(acc, 停止点 i の色, clamp((t - p[i-1]) / (p[i] - p[i-1])))
+   * と畳んでいく。係数が両端で飽和するので、
+   *   ・最初の停止点より左 → 係数 0 が続いて acc = 停止点 0 の色
+   *   ・最後の停止点より右 → 係数 1 が続いて acc = 最後の色
+   * となり、`BKE_colorband_evaluate()` の端の扱いとそのまま一致する。
+   *
+   * ★対応するのは RGB の LINEAR / EASE / CONSTANT まで。
+   *   B_SPLINE と CARDINAL は 4 点の重みが要るので LINEAR で近似する。
+   *   HSV / HSL の色モードも RGB の直線補間で近似する
+   *   (Blender 側も RGB 以外では補間形を LINEAR に落としている)。 */
+  const ColorBand *coba = static_cast<const ColorBand *>(node_->storage);
+  if (coba == nullptr || coba->tot <= 0) {
+    return empty();
+  }
+
+  auto stop_color = [&](int i) {
+    const CBData &d = coba->data[i];
+    return val(MaterialX::Color4(d.r, d.g, d.b, d.a));
+  };
+
+  const int ipotype = (coba->color_mode == COLBAND_BLEND_RGB) ? int(coba->ipotype) :
+                                                                int(COLBAND_INTERP_LINEAR);
+  if (!ELEM(ipotype, COLBAND_INTERP_LINEAR, COLBAND_INTERP_EASE, COLBAND_INTERP_CONSTANT)) {
+    CLOG_WARN(materialx::LOG_IO_MATERIALX,
+              "ColorRamp: %s は書き出せないので直線で近似します",
+              ipotype == COLBAND_INTERP_CARDINAL ? "Cardinal" : "B-Spline");
+  }
+
+  NodeItem fac = get_input_value("Fac", NodeItem::Type::Float);
+  NodeItem res = stop_color(0);
+  for (int i = 1; i < coba->tot; i++) {
+    const float p0 = coba->data[i - 1].pos;
+    const float p1 = coba->data[i].pos;
+    NodeItem w = empty();
+    if (ipotype == COLBAND_INTERP_CONSTANT || !(p1 > p0)) {
+      /* 段状。位置が重なっている時もこちら(0 除算を避ける)。 */
+      w = fac.if_else(NodeItem::CompareOp::GreaterEq, val(p1), val(1.0f), val(0.0f));
+    }
+    else {
+      w = ((fac - val(p0)) / val(p1 - p0)).clamp();
+      if (ipotype == COLBAND_INTERP_EASE) {
+        w = w * w * (val(3.0f) - val(2.0f) * w);
+      }
+    }
+    res = w.mix(res, stop_color(i));
+  }
+
+  if (STREQ(socket_out_->identifier, "Alpha")) {
+    res = res[3];
+  }
   return res;
 }
 #endif

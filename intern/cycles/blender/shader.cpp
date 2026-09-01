@@ -1688,6 +1688,16 @@ void BlenderSync::sync_materials(blender::Depsgraph &b_depsgraph,
         scene_attr_needs_recalc(shader, b_depsgraph) || aovs_changed_between_view_layers ||
         (shader->has_time_dependency && update_time))
     {
+      if (getenv("FALCON_DLSS_DEBUG")) {
+        fprintf(stderr,
+                "[resync] material %s: map=%d all=%d attr=%d aov=%d time=%d\n",
+                BKE_id_name(b_mat.id),
+                int(shader_map.is_recalc_debug(&b_mat.id)),
+                int(update_all),
+                int(scene_attr_needs_recalc(shader, b_depsgraph)),
+                int(aovs_changed_between_view_layers),
+                int(shader->has_time_dependency && update_time));
+      }
       unique_ptr<ShaderGraph> graph = make_unique<ShaderGraph>();
 
       shader->name = BKE_id_name(b_mat.id);
@@ -1775,6 +1785,11 @@ void BlenderSync::sync_world(blender::Depsgraph &b_depsgraph,
 
   Shader *shader = scene->default_background;
 
+  if (getenv("FALCON_DLSS_DEBUG") && (world_recalc || update_all || b_world != world_map ||
+      scene_attr_needs_recalc(shader, b_depsgraph) || (shader->has_time_dependency && update_time))) {
+    fprintf(stderr, "[resync] world: recalc=%d all=%d time=%d\n", int(world_recalc), int(update_all),
+            int(shader->has_time_dependency && update_time));
+  }
   if (world_recalc || update_all || b_world != world_map ||
       viewport_parameters.shader_modified(new_viewport_parameters) ||
       scene_attr_needs_recalc(shader, b_depsgraph) || (shader->has_time_dependency && update_time))

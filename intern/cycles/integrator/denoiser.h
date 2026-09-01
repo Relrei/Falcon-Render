@@ -69,6 +69,16 @@ class Denoiser {
    * DLSS-RR pre-roll pass), so the history is already aligned with it. */
   virtual void set_same_frame_restart(bool /*same_frame_restart*/) {}
 
+  /* The denoise about to run belongs to a DLSS-RR pre-roll pass whose image is
+   * discarded. */
+  virtual void set_preroll_pass(bool /*preroll_pass*/) {}
+
+  /* Number of the frame the next denoise belongs to (the scene's current frame).
+   * DLSS-RR uses it to tell "a new frame" from "more samples on the same frame";
+   * counting samples alone is wrong once a time limit or adaptive sampling makes
+   * the per-frame sample count move up and down. */
+  virtual void set_frame(int /*frame*/) {}
+
   /* Camera matrices for the frame being denoised, in the row-major left-multiply
    * form NGX wants. DLSS-RR needs them to make sense of the specular hit
    * distance, which is a world-space length. */

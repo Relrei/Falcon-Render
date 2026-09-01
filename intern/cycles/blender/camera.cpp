@@ -5,6 +5,7 @@
 #include "scene/camera.h"
 #include "device/denoise.h"
 #include "scene/bake.h"
+#include "scene/integrator.h"
 #include "scene/osl.h"
 #include "scene/scene.h"
 
@@ -1180,10 +1181,12 @@ void BlenderSync::sync_view(blender::View3D *b_v3d,
    * since a walk view is always a pinhole, which is why the two look nothing alike. Close the
    * aperture while previewing with DLSS so they match; check the bokeh with OIDN or in a final
    * render. */
-  if (get_boolean(cscene, "use_preview_denoising") &&
-      get_enum(cscene, "preview_denoiser", DENOISER_NUM, DENOISER_NONE) == DENOISER_DLSS &&
+  if (BlenderSync::is_dlss_denoise_active(scene) &&
       get_boolean(cscene, "preview_denoising_bypass_dof"))
   {
+    if (getenv("FALCON_DLSS_DEBUG") && bcam.aperturesize > 0.0f) {
+      fprintf(stderr, "[dlss] bypass_dof: aperture %.4f -> 0\n", (double)bcam.aperturesize);
+    }
     bcam.aperturesize = 0.0f;
     bcam.focaldistance = 0.0f;
   }
@@ -1207,12 +1210,161 @@ void BlenderSync::sync_view(blender::View3D *b_v3d,
   }
 }
 
+/* Viewport camera view with DLSS-RR: render a size that the zoom cannot move.
+ *
+ * Camera view is always drawn as a border (the "else" branch below), and the border is measured
+ * in on-screen pixels -- so zooming changes the size of the render buffer even though the picture
+ * inside the camera frame is the same picture. DLSS rebuilds its feature whenever the input or
+ * the output size moves (DLSSDenoiser::denoise_create_if_needed) and a rebuilt feature starts
+ * with no temporal history: measured 2026-08-31, 24 to 39 rebuilds over one zoom sweep against 0
+ * for panning or orbiting the same distance. It is the invariant the navigation history carry
+ * protects by skipping the resolution ladder, broken from the other side.
+ *
+ * So describe the render at a size that does not depend on the zoom -- the camera frame fitted
+ * into this region, a function of the region size and the camera aspect only -- and hand the
+ * on-screen rectangle to the display separately (BufferParams::display_x), which stretches the
+ * result over the camera frame exactly as it already stretches a resolution-divided render.
+ *
+ * Everything the renderer derives from these numbers stays consistent because the whole raster is
+ * scaled by the same factor: the camera is fitted to full_width x full_height (Session::
+ * update_scene), and the tiles are placed at full_x / full_y.
+ *
+ * Two earlier attempts do not work and are not worth retrying: overwriting only the buffer size
+ * (the camera raster then no longer matches the tile offsets) and folding the ratio into the
+ * resolution divider (one scalar cannot truncate both axes onto their targets -- there is often
+ * no divider at all with int(bw/d) == fixed_w and int(bh/d) == fixed_h).
+ *
+ * Left alone for everything else: a walk view, a final render, any other denoiser, a camera frame
+ * that has grown past the region edges (there the border is the region and stops moving anyway),
+ * and FALCON_DLSS_CAMERA_FIXED_SIZE=0. */
+static void camera_view_fixed_size(BufferParams &params,
+                                   blender::View3D *b_v3d,
+                                   blender::RegionView3D *b_rv3d,
+                                   blender::Scene *b_scene,
+                                   const Scene *scene,
+                                   const int width,
+                                   const int height)
+{
+  static const bool enabled = getenv("FALCON_DLSS_CAMERA_FIXED_SIZE") ?
+                                  atoi(getenv("FALCON_DLSS_CAMERA_FIXED_SIZE")) != 0 :
+                                  true;
+  static const bool debug = getenv("FALCON_DLSS_DEBUG") != nullptr;
+#define FIXED_SIZE_BAIL(why) \
+  do { \
+    if (debug) { \
+      fprintf(stderr, "[dlss] fixed_size skip: %s\n", why); \
+    } \
+    return; \
+  } while (0)
+
+  if (!enabled) {
+    return;
+  }
+  if (!b_v3d || !b_rv3d || b_scene == nullptr || scene == nullptr) {
+    FIXED_SIZE_BAIL("no viewport");
+  }
+  if (b_rv3d->persp != blender::RV3D_CAMOB) {
+    FIXED_SIZE_BAIL("not camera view");
+  }
+
+  /* Ask the integrator, not the RNA (BlenderSync::is_dlss_denoise_active). */
+  if (!BlenderSync::is_dlss_denoise_active(scene)) {
+    FIXED_SIZE_BAIL("not DLSS preview");
+  }
+
+  const int border_x = params.full_x;
+  const int border_y = params.full_y;
+  const int border_width = params.width;
+  const int border_height = params.height;
+  if (width <= 0 || height <= 0 || border_width <= 0 || border_height <= 0) {
+    FIXED_SIZE_BAIL("degenerate size");
+  }
+  /* Only while the camera frame is fully inside the region. Once it runs past an edge the border
+   * is clamped to the region, which is where it stops following the zoom on its own. */
+  if (border_x <= 0 || border_y <= 0 || border_x + border_width >= width ||
+      border_y + border_height >= height)
+  {
+    if (debug) {
+      fprintf(stderr,
+              "[dlss] fixed_size skip: border touches the region edge %dx%d at %d,%d in %dx%d\n",
+              border_width, border_height, border_x, border_y, width, height);
+    }
+    return;
+  }
+
+  const blender::RenderData &r = b_scene->r;
+  const float aspect_x = (float)r.xsch * ((r.xasp > 0.0f) ? r.xasp : 1.0f);
+  const float aspect_y = (float)r.ysch * ((r.yasp > 0.0f) ? r.yasp : 1.0f);
+  if (!(aspect_x > 0.0f) || !(aspect_y > 0.0f)) {
+    FIXED_SIZE_BAIL("no aspect");
+  }
+  const float aspect = aspect_x / aspect_y;
+
+  /* The camera frame fitted into the region: the axis that runs out first is what limits it. */
+  const int fit_width = max(1, min(width, (int)lroundf((float)height * aspect)));
+
+  /* A size that never moves costs what the fitted frame costs at every zoom, and zooming out is
+   * where that hurts: with the frame at a third of the region it is about ten times the pixels
+   * this renders today, and the display then has to shrink the result to fit. So step the size
+   * down a ladder anchored at the fitted size instead of holding one value -- the size is still
+   * constant over each stretch of the zoom, the pixel count stays within FALCON_DLSS_CAMERA_
+   * SIZE_STEP squared (1.5625 by default) of what the border asks for, and a whole zoom sweep
+   * crosses a handful of steps instead of rebuilding on every one of them.
+   *
+   * FALCON_DLSS_CAMERA_SIZE_STEP=1 (or less) gives one truly fixed size, which is the version
+   * that rebuilds nothing at all; it is off by default because of the cost above. */
+  static const float size_step = getenv("FALCON_DLSS_CAMERA_SIZE_STEP") ?
+                                     (float)atof(getenv("FALCON_DLSS_CAMERA_SIZE_STEP")) :
+                                     1.25f;
+  int fixed_width = fit_width;
+  if (size_step > 1.0f) {
+    const float ratio = min(1.0f, (float)border_width / (float)fit_width);
+    const int steps = (int)ceilf(logf(ratio) / logf(size_step));
+    fixed_width = clamp((int)lroundf((float)fit_width * powf(size_step, (float)steps)), 1,
+                        fit_width);
+  }
+  const int fixed_height = max(1, (int)lroundf((float)fixed_width / aspect));
+  if (fixed_width == border_width && fixed_height == border_height) {
+    FIXED_SIZE_BAIL("already the fixed size");
+  }
+
+  const float scale = (float)fixed_width / (float)border_width;
+  const int full_width = max(fixed_width, (int)lroundf((float)width * scale));
+  const int full_height = max(fixed_height, (int)lroundf((float)height * scale));
+
+  params.display_x = border_x;
+  params.display_y = border_y;
+  params.display_width = border_width;
+  params.display_height = border_height;
+  params.display_full_width = width;
+  params.display_full_height = height;
+
+  params.full_x = clamp((int)lroundf((float)border_x * scale), 0, full_width - fixed_width);
+  params.full_y = clamp((int)lroundf((float)border_y * scale), 0, full_height - fixed_height);
+  params.full_width = full_width;
+  params.full_height = full_height;
+  params.width = fixed_width;
+  params.height = fixed_height;
+  params.window_width = fixed_width;
+  params.window_height = fixed_height;
+
+  if (debug) {
+    fprintf(stderr,
+            "[dlss] fixed_size: render %dx%d at %d,%d of %dx%d  screen %dx%d at %d,%d\n",
+            fixed_width, fixed_height, params.full_x, params.full_y, full_width, full_height,
+            border_width, border_height, border_x, border_y);
+  }
+#undef FIXED_SIZE_BAIL
+}
+
 BufferParams BlenderSync::get_buffer_params(blender::View3D *b_v3d,
                                             blender::RegionView3D *b_rv3d,
-                                            Camera *cam,
+                                            blender::Scene *b_scene,
+                                            Scene *scene,
                                             const int width,
                                             const int height)
 {
+  Camera *cam = scene->camera;
   BufferParams params;
   bool use_border = false;
 
@@ -1247,6 +1399,8 @@ BufferParams BlenderSync::get_buffer_params(blender::View3D *b_v3d,
 
   params.window_width = params.width;
   params.window_height = params.height;
+
+  camera_view_fixed_size(params, b_v3d, b_rv3d, b_scene, scene, width, height);
 
   return params;
 }

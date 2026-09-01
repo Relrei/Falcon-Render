@@ -609,6 +609,13 @@ void Film::update_passes(Scene *scene)
     if (denoiser_passes & DENOISER_PASS_SPECULAR_HIT_DISTANCE) {
       add_auto_pass(scene, PASS_DENOISING_SPECULAR_HIT_DISTANCE);
     }
+    if (denoiser_passes & DENOISER_PASS_EMISSION) {
+      add_auto_pass(scene, PASS_EMISSION);
+    }
+    if (denoiser_passes & DENOISER_PASS_VOLUME) {
+      add_auto_pass(scene, PASS_VOLUME_DIRECT);
+      add_auto_pass(scene, PASS_VOLUME_INDIRECT);
+    }
   }
 
   /* Create passes for shadow catcher. */

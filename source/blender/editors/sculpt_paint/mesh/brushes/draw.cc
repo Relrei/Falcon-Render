@@ -20,6 +20,7 @@
 #include "BLI_task.hh"
 
 #include "editors/sculpt_paint/mesh/falcon_sculpt_gpu.hh"
+#include "editors/sculpt_paint/mesh/falcon_sculpt_resident.hh"
 #include "editors/sculpt_paint/mesh/mesh_brush_common.hh"
 #include "editors/sculpt_paint/mesh/sculpt_automask.hh"
 #include "editors/sculpt_paint/mesh/sculpt_intern.hh"
@@ -156,6 +157,24 @@ static void offset_positions(const Depsgraph &depsgraph,
   threading::EnumerableThreadSpecific<LocalData> all_tls;
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
+      /* ★ブラシ本体をまるごとGPUで回す(`FALCON_SCULPT_GPU=resident`)。
+       * 頂点はGPUに常駐し、係数の適用も書き戻しもGPUで済む。CPU に残るのは
+       * ノード探索とノードの境界だけ = 実測の床 0.45ms/ダブ(400万面)。
+       *
+       * 下の `falcon_gpu::calc_factors`(係数だけGPU)とは**別の道**。
+       * そちらは 2026-08-17 に実測で負けたことが分かっている
+       * (転送も読み戻しも消した probe で 110.9ms 対 CPU 71.7ms)。
+       * 負けた原因はGPUの周りに残った CPU の世話なので、それごと移したのがこちら。 */
+      if (falcon_resident::offset_positions(depsgraph, sd, object, brush, offset, node_mask)) {
+        const PositionDeformData position_data(depsgraph, object);
+        MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
+        node_mask.foreach_index(
+            [&](const int i) {
+              bke::pbvh::update_node_bounds_mesh(position_data.eval, nodes[i]);
+            },
+            exec_mode::grain_size(1));
+        break;
+      }
       if (falcon_gpu::can_use_factors(depsgraph, sd.paint, object, brush)) {
         use_gpu = falcon_gpu::calc_factors(
             depsgraph, object, brush, node_mask, gpu_offsets, gpu_factors);
@@ -186,6 +205,9 @@ static void offset_positions(const Depsgraph &depsgraph,
             bke::pbvh::update_node_bounds_mesh(position_data.eval, nodes[i]);
           },
           exec_mode::grain_size(1));
+      /* `resident-verify` の時だけ、CPU が出した位置と GPU の結果を突き合わせる。
+       * GPU は書き込んでいないので**絵は1画素も変わらない**。 */
+      falcon_resident::note_after_cpu(depsgraph, object, node_mask);
       break;
     }
     case bke::pbvh::Type::Grids: {

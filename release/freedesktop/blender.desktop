@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=Blender
+Name=Falcon Render
 GenericName=3D modeler
 GenericName[ar]=3D المنمذج ثلاثي الأبعاد
 GenericName[ca]=Modelador 3D
@@ -27,7 +27,7 @@ GenericName[uk]=Редактор 3D-моделей
 GenericName[wa]=Modeleu 3D
 GenericName[zh_CN]=3D 建模
 GenericName[zh_TW]=3D 模型
-Comment=3D modeling, animation, rendering and post-production
+Comment=Falcon Render v0.4 — a Blender 5.2.1 based build with a much faster video sequencer
 Comment[ar]=3D النمذجة، الرسوم المتحركة، والتجسيد، وما بعد الإنتاج
 Comment[ast]=Modeláu 3D, animación, renderizáu y postproducción
 Comment[eu]=3D modelatzea, animazioa, errendatzea eta post-produkzioa
@@ -86,4 +86,6 @@ Type=Application
 PrefersNonDefaultGPU=true
 Categories=Graphics;3DGraphics;
 MimeType=application/x-blender;
+# ⚠ 窓のクラスは GHOST が "Blender" を名乗る(GHOST_X11_RES_CLASS)。
+# ここを製品名に変えるとアイコンが窓に紐づかなくなるので触らない。
 StartupWMClass=Blender

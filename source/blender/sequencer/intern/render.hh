@@ -30,6 +30,9 @@ namespace seq {
 struct SeqRenderState {
   Set<Scene *> scenes_in_progress;
   Set<Strip *> strips_in_progress;
+
+  /* Is the top-level render request for the scene's currently evaluated frame. */
+  bool is_current_frame = false;
 };
 
 /* Strip corner coordinates in screen pixel space. Note that they might not be
@@ -93,6 +96,31 @@ bool seq_image_strip_is_multiview_render(const Scene *scene,
                                          const char *filepath,
                                          char *r_prefix,
                                          const char *r_ext);
+
+/**
+ * Block until every in-flight BL_VSE_PREFETCH_N background decode task
+ * (see render.cc) has finished. Must be called before the source image
+ * cache it writes into is torn down (source_image_cache_destroy()) --
+ * otherwise a still-running task can call source_image_cache_put() on a
+ * Scene that has already been freed (use-after-free). No-op, without
+ * touching the task pool at all, when BL_VSE_PREFETCH_N=0 (read-ahead
+ * is on by default with N=8).
+ */
+void vse_prefetch_wait_all();
+
+/**
+ * Block until every currently in-flight BL_VSE_PREFETCH_N background
+ * decode task for this exact Strip (see render.cc) has finished. Must be
+ * called before the caller frees `strip` -- otherwise a still-running
+ * task's vse_prefetch_task_run() can dereference `strip` (its `->start`,
+ * via source_image_cache_put()) after it has already been freed
+ * (use-after-free). Cheap when no task is currently reading ahead for
+ * this particular strip (the common case): a single lookup under the
+ * prefetch state's own mutex, no task-pool wait at all. No-op, without
+ * touching anything, when BL_VSE_PREFETCH_N=0 (read-ahead is on by
+ * default with N=8).
+ */
+void vse_prefetch_wait_for_strip(const Strip *strip);
 
 }  // namespace seq
 }  // namespace blender

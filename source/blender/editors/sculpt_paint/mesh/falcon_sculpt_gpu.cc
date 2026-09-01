@@ -54,8 +54,19 @@ static constexpr int GROUP_SIZE = 256;
 
 bool enabled()
 {
-  static const bool on = (getenv("FALCON_SCULPT_GPU") != nullptr);
+  /* ★`resident` 系はこの道ではない(`falcon_sculpt_resident.cc`)。
+   * 同じ環境変数を使うので、値で振り分けないと**両方の道が同時に走る**。 */
+#ifndef WITH_FALCON_SCULPT_GPU
+  /* release 版はこの道をビルドに入れない(FALCON_BUILD_FLAVOR=release)。
+   * 環境変数を置かれても効かない。 */
+  return false;
+#else
+  static const bool on = []() {
+    const char *v = getenv("FALCON_SCULPT_GPU");
+    return v != nullptr && !STRPREFIX(v, "resident");
+  }();
   return on;
+#endif
 }
 
 static const char *env_value()

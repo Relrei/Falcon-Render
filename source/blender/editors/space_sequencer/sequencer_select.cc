@@ -99,7 +99,7 @@ Strip *strip_under_mouse_get(const Scene *scene, const View2D *v2d, const int mv
   ui::view2d_region_to_view(v2d, mval[0], mval[1], &mouse_co[0], &mouse_co[1]);
 
   Vector<Strip *> visible = sequencer_visible_strips_get(scene, v2d);
-  int mouse_channel = int(mouse_co[1]);
+  int mouse_channel = seq::y_to_channel(mouse_co[1]);
   for (Strip *strip : visible) {
     if (strip->channel != mouse_channel) {
       continue;
@@ -297,8 +297,8 @@ rctf strip_bounds_get(const Scene *scene, const Strip *strip)
   rctf bounds;
   bounds.xmin = strip->left_handle();
   bounds.xmax = strip->right_handle(scene);
-  bounds.ymin = strip->channel + STRIP_OFSBOTTOM;
-  bounds.ymax = strip->channel + STRIP_OFSTOP;
+  bounds.ymin = seq::channel_to_y(strip->channel) + STRIP_OFSBOTTOM;
+  bounds.ymax = seq::channel_to_y(strip->channel) + STRIP_OFSTOP;
   return bounds;
 }
 
@@ -1052,7 +1052,7 @@ static Vector<Strip *> padded_strips_under_mouse_get(const Scene *scene,
 
   Vector<Strip *> strips;
   for (Strip &strip : *ed->current_strips()) {
-    if (strip.channel != int(mouse_co[1])) {
+    if (strip.channel != seq::y_to_channel(mouse_co[1])) {
       continue;
     }
     if (strip.left_handle() > v2d->cur.xmax) {
@@ -1199,8 +1199,11 @@ wmOperatorStatus sequencer_select_exec(bContext *C, wmOperator *op)
       key = try_to_realize_fake_keys(scene, v2d, strip_key_owner, mouse_co.region);
     }
     else {
-      /* There may be fake key on either side of strip. It must be realized. */
+      /* There may be a fake key on either side of the strip. It must be realized. Realizing
+       * reallocates the key array, so `key` has to be looked up again. */
+      const int key_frame = seq::retiming_key_frame_get(scene, strip_key_owner, key);
       seq::realize_fake_keys(scene, strip_key_owner);
+      key = seq::retiming_key_get_by_frame(scene, strip_key_owner, key_frame);
     }
 
     if (key != nullptr) {

@@ -151,12 +151,14 @@ if(WITH_MATERIALX)
     materialx/node_graph.cc
     materialx/node_item.cc
     materialx/node_parser.cc
+    materialx/node_ramp_blend.cc
 
     materialx/group_nodes.h
     materialx/material.h
     materialx/node_graph.h
     materialx/node_item.h
     materialx/node_parser.h
+    materialx/node_ramp_blend.h
   )
   list(APPEND LIB
     MaterialXCore

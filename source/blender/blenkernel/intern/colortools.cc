@@ -1432,7 +1432,17 @@ bool BKE_curvemapping_is_map_identity(const CurveMapping *curve_mapping, int ind
   if (curve_map->curve[0].x != 0 || curve_map->curve[0].y != 0) {
     return false;
   }
-  if (curve_map->curve[1].x != 0 || curve_map->curve[1].y != 0) {
+  /* ★2026-08-30: 上流は 2 点目を (1,1) でなく (0,0) と比べている。
+   * 恒等カーブの 2 点目は必ず (1,1) なので、この関数は実際のカーブでは常に false を返し、
+   * 呼び出し側（コンポジターの RGB カーブ・GPU シェーダー・MaterialX 出力）の
+   * 「恒等なら飛ばす」道が一度も通らない。
+   * 戻す口: FALCON_CURVE_IDENTITY_FIX=0 で上流の比較に戻す。 */
+  static const bool identity_fix = []() {
+    const char *e = getenv("FALCON_CURVE_IDENTITY_FIX");
+    return !(e && atoi(e) == 0);
+  }();
+  const float expect = identity_fix ? 1.0f : 0.0f;
+  if (curve_map->curve[1].x != expect || curve_map->curve[1].y != expect) {
     return false;
   }
   return true;

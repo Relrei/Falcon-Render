@@ -23,10 +23,14 @@
 #include "BLI_index_mask.hh"
 #include "BLI_vector.hh"
 
+/* ★DNA の型は 5.x で `namespace blender` の中に入っている(下の宣言を大域に
+ * 置くと別の型になり、.cc の定義と一致しない)。 */
+namespace blender {
 struct Brush;
 struct Depsgraph;
 struct Object;
 struct Paint;
+}  // namespace blender
 
 namespace blender::ed::sculpt_paint::falcon_gpu {
 

@@ -17,6 +17,9 @@
 #include <pxr/imaging/hd/xformSchema.h>
 #include <pxr/imaging/pxOsd/tokens.h>
 
+#include <cctype>
+
+#include "BLI_color.hh"
 #include "BLI_index_mask.hh"
 #include "BLI_task.hh"
 #include "BLI_vector_set.hh"
@@ -43,7 +46,17 @@ struct SubMesh {
   pxr::VtVec3fArray points;
   pxr::VtVec3fArray normals;
   pxr::VtVec2fArray uvs;
+  /* ★頂点色(2026-08-29)。属性名ごとに、三角形の角の並び(faceVarying)で持つ。
+   *   BYTE_COLOR は sRGB 符号化なので ColorGeometry4f 経由で線形へ復号済み
+   *   (Cycles も線形で読む)。POINT 領域のものは角へ内挿してから入る。 */
+  Vector<std::pair<std::string, pxr::VtVec3fArray>> colors;
   int mat_index = 0;
+};
+
+/* メッシュ1つぶんの色属性。角(corner)の並びに揃えて materialize してある。 */
+struct ColorLayer {
+  std::string name;
+  Array<ColorGeometry4f> corner_colors;
 };
 
 /* Build a single submesh from the given subset of triangles for a material.
@@ -59,6 +72,7 @@ static void copy_submesh(const Mesh &mesh,
                          const Span<float3> corner_normals,
                          const bke::MeshNormalDomain normals_domain,
                          const Span<float2> uv_map,
+                         const Span<ColorLayer> color_layers,
                          const IndexMask &triangles,
                          SubMesh &sm)
 {
@@ -145,6 +159,20 @@ static void copy_submesh(const Mesh &mesh,
       }
     });
   }
+
+  /* ★頂点色。UV とまったく同じ規則(角で引く)で並べる。 */
+  for (const ColorLayer &layer : color_layers) {
+    pxr::VtVec3fArray values;
+    resize_uninitialized(values, triangles.size() * 3);
+    triangles.foreach_index([&](const int src, const int dst) {
+      const int3 &tri = corner_tris[src];
+      for (int c = 0; c < 3; c++) {
+        const ColorGeometry4f &col = layer.corner_colors[tri[c]];
+        values[dst * 3 + c] = pxr::GfVec3f(col.r, col.g, col.b);
+      }
+    });
+    sm.colors.append({layer.name, std::move(values)});
+  }
 }
 
 static Vector<SubMesh> build_submeshes(const Object *object, const Mesh &mesh)
@@ -164,6 +192,38 @@ static Vector<SubMesh> build_submeshes(const Object *object, const Mesh &mesh)
   const VArraySpan<float2> uv_map = *attributes.lookup<float2>(active_uv, bke::AttrDomain::Corner);
   const VArraySpan<int> material_indices = *attributes.lookup<int>("material_index",
                                                                    bke::AttrDomain::Face);
+
+  /* ★色属性を集める(2026-08-29)。POINT/CORNER・BYTE/FLOAT の4通りを、
+   *   角の領域の ColorGeometry4f 1つに揃えてしまう(領域の内挿も sRGB の復号も
+   *   属性の仕組みが持っている)。名前は Blender 側のものをそのまま使う
+   *   ── Attribute ノードの materialx 出力 `geompropvalue` が同じ名前で引く。 */
+  Vector<ColorLayer> color_layers;
+  attributes.foreach_attribute([&](const bke::AttributeIter &iter) {
+    if (!ELEM(iter.data_type, bke::AttrType::ColorFloat, bke::AttrType::ColorByte)) {
+      return;
+    }
+    if (!ELEM(iter.domain, bke::AttrDomain::Point, bke::AttrDomain::Corner)) {
+      return;
+    }
+    /* primvar の名前になるので、識別子として通る名前だけ通す。 */
+    bool ok = !iter.name.is_empty() && !isdigit(iter.name[0]);
+    for (const char c : StringRef(iter.name)) {
+      ok = ok && (isalnum(c) || c == '_');
+    }
+    if (!ok) {
+      return;
+    }
+    const VArray<ColorGeometry4f> varray = *attributes.lookup<ColorGeometry4f>(
+        iter.name, bke::AttrDomain::Corner);
+    if (!varray) {
+      return;
+    }
+    ColorLayer layer;
+    layer.name = iter.name;
+    layer.corner_colors.reinitialize(varray.size());
+    varray.materialize(layer.corner_colors);
+    color_layers.append(std::move(layer));
+  });
 
   const bke::MeshNormalDomain normals_domain = mesh.normals_domain();
   const Span<float3> face_normals = (normals_domain == bke::MeshNormalDomain::Face) ?
@@ -187,6 +247,7 @@ static Vector<SubMesh> build_submeshes(const Object *object, const Mesh &mesh)
                  corner_normals,
                  normals_domain,
                  uv_map,
+                 color_layers,
                  corner_tris.index_range(),
                  submeshes.first());
   }
@@ -212,6 +273,7 @@ static Vector<SubMesh> build_submeshes(const Object *object, const Mesh &mesh)
                      corner_normals,
                      normals_domain,
                      uv_map,
+                     color_layers,
                      triangles_by_material[i],
                      submeshes[i]);
       }
@@ -284,6 +346,23 @@ static EmittedGeometryPrim build_submesh_geometry(const SubMesh &sm,
                 pxr::HdPrimvarSchemaTokens->faceVarying))
             .SetRole(pxr::HdPrimvarSchema::BuildRoleDataSource(
                 pxr::HdPrimvarSchemaTokens->textureCoordinate))
+            .Build());
+  }
+
+  /* ★頂点色(2026-08-29)。属性名そのままの primvar として出す。
+   *   角の並びなので faceVarying、役割は color。 */
+  for (const std::pair<std::string, pxr::VtVec3fArray> &layer : sm.colors) {
+    if (layer.second.empty()) {
+      continue;
+    }
+    primvars.add(
+        pxr::TfToken(layer.first),
+        pxr::HdPrimvarSchema::Builder()
+            .SetPrimvarValue(
+                pxr::HdRetainedTypedSampledDataSource<pxr::VtVec3fArray>::New(layer.second))
+            .SetInterpolation(pxr::HdPrimvarSchema::BuildInterpolationDataSource(
+                pxr::HdPrimvarSchemaTokens->faceVarying))
+            .SetRole(pxr::HdPrimvarSchema::BuildRoleDataSource(pxr::HdPrimvarSchemaTokens->color))
             .Build());
   }
 

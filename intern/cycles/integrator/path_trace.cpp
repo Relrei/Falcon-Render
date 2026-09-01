@@ -800,6 +800,11 @@ void PathTrace::clear_denoiser_temporal_history()
   }
 }
 
+void PathTrace::set_denoiser_frame(const int frame)
+{
+  denoiser_frame_ = frame;
+}
+
 void PathTrace::set_denoiser_params(const DenoiseParams &params)
 {
   if (!params.use) {
@@ -882,6 +887,15 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
   else {
     render_scheduler_.set_denoiser_params(effective_denoise_params);
   }
+
+  if (getenv("FALCON_DLSS_DEBUG")) {
+    fprintf(stderr,
+            "[path_trace] in=%.3f effective=%.3f scheduler=%.3f\n",
+            params.upscale_factor,
+            effective_denoise_params.upscale_factor,
+            (denoise_device_ && denoiser_) ? denoiser_->get_params().upscale_factor :
+                                             effective_denoise_params.upscale_factor);
+  }
 }
 
 void PathTrace::set_adaptive_sampling(const AdaptiveSampling &adaptive_sampling)
@@ -915,6 +929,8 @@ void PathTrace::denoise(const RenderWork &render_work)
   LOG_DEBUG << "Perform denoising work.";
 
   denoiser_->set_same_frame_restart(render_work.denoise_same_frame_restart);
+  denoiser_->set_preroll_pass(render_work.denoise_preroll_pass);
+  denoiser_->set_frame(denoiser_frame_);
 
   {
     /* The specular hit distance is a world-space length; RR needs the camera

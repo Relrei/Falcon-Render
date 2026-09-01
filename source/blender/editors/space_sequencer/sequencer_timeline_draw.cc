@@ -98,10 +98,10 @@ Vector<Strip *> sequencer_visible_strips_get(const Scene *scene, const View2D *v
     if (max_ii(strip.right_handle(scene), strip.content_end(scene)) < v2d->cur.xmin) {
       continue;
     }
-    if (strip.channel + 1.0f < v2d->cur.ymin) {
+    if (seq::channel_to_y(strip.channel) + 1.0f < v2d->cur.ymin) {
       continue;
     }
-    if (strip.channel > v2d->cur.ymax) {
+    if (seq::channel_to_y(strip.channel) > v2d->cur.ymax) {
       continue;
     }
     strips.append(&strip);
@@ -209,8 +209,8 @@ static StripDrawContext strip_draw_context_get(const TimelineDrawContext &ctx, S
   Scene *scene = ctx.scene;
 
   strip_ctx.strip = strip;
-  strip_ctx.bottom = strip->channel + STRIP_OFSBOTTOM;
-  strip_ctx.top = strip->channel + STRIP_OFSTOP;
+  strip_ctx.bottom = channel_to_y(strip->channel) + STRIP_OFSBOTTOM;
+  strip_ctx.top = channel_to_y(strip->channel) + STRIP_OFSTOP;
   strip_ctx.left_handle = strip->left_handle();
   strip_ctx.right_handle = strip->right_handle(scene);
   strip_ctx.content_start = strip->content_start();
@@ -671,7 +671,13 @@ static void drawmeta_contents(const TimelineDrawContext &ctx,
     float x1_chan = strip.left_handle() + offset;
     float x2_chan = strip.right_handle(scene) + offset;
     if (x1_chan <= meta_x2 && x2_chan >= meta_x1) {
-      float y_chan = (strip.channel - chan_min) / float(chan_range) * draw_range;
+      /* `y_chan` is a distance from `bottom`, not a Y coordinate produced via #channel_to_y, so
+       * it isn't automatically flipped by that function. When flipped, the direction that
+       * increasing channel numbers move (down, matching the rest of the timeline) reverses, so
+       * mirror which end of `[chan_min, chan_max]` maps to `bottom`. */
+      float y_chan = channel_flip_enabled() ?
+                        (chan_max - strip.channel) / float(chan_range) * draw_range :
+                        (strip.channel - chan_min) / float(chan_range) * draw_range;
 
       if (strip.type == STRIP_TYPE_COLOR) {
         SolidColorVars *colvars = static_cast<SolidColorVars *>(strip.effectdata);
@@ -1217,7 +1223,11 @@ static void draw_multicam_highlight(const TimelineDrawContext &ctx,
 
   View2D *v2d = ctx.v2d;
   uchar color[4] = {255, 255, 255, 48};
-  ctx.quads->add_quad(v2d->cur.xmin, channel, v2d->cur.xmax, channel + 1, color);
+  ctx.quads->add_quad(v2d->cur.xmin,
+                      seq::channel_to_y(channel),
+                      v2d->cur.xmax,
+                      seq::channel_to_y(channel + 1),
+                      color);
 }
 
 /* Force redraw, when prefetching and using cache view. */
@@ -1236,13 +1246,41 @@ static void draw_seq_timeline_channels(const TimelineDrawContext &ctx)
   uchar4 color;
   ui::theme::get_color_4ubv(TH_ROW_ALTERNATE, color);
 
-  /* Alternating horizontal stripes. */
-  int i = max_ii(1, int(v2d->cur.ymin) - 1);
-  while (i < v2d->cur.ymax) {
-    if (i & 1) {
-      ctx.quads->add_quad(v2d->cur.xmin, i, v2d->cur.xmax, i + 1, color);
+  /* Alternating horizontal stripes.
+   * The loop bound used to be `i < v2d->cur.ymax`, comparing a channel number against a raw
+   * View2D Y coordinate. That only happened to work because `channel_to_y()` was the identity
+   * function; with #seq::channel_flip_enabled the two spaces genuinely differ (`cur.ymax` is
+   * where the *smallest* visible channel sits, not the largest). Kept the original mixed-space
+   * comparison for the non-flipped case (so the default-off behavior is provably unchanged) and
+   * derive both ends of the visible channel range explicitly from `channel_to_y`'s inverse only
+   * when flipped. */
+  if (seq::channel_flip_enabled()) {
+    const int chan_at_ymin = seq::y_to_channel(v2d->cur.ymin);
+    const int chan_at_ymax = seq::y_to_channel(v2d->cur.ymax);
+    int i = max_ii(1, min_ii(chan_at_ymin, chan_at_ymax) - 1);
+    const int i_end = max_ii(chan_at_ymin, chan_at_ymax) + 1;
+    for (; i <= i_end; i++) {
+      if (i & 1) {
+        ctx.quads->add_quad(v2d->cur.xmin,
+                            seq::channel_to_y(i),
+                            v2d->cur.xmax,
+                            seq::channel_to_y(i + 1),
+                            color);
+      }
     }
-    i++;
+  }
+  else {
+    int i = max_ii(1, seq::y_to_channel(v2d->cur.ymin) - 1);
+    while (i < v2d->cur.ymax) {
+      if (i & 1) {
+        ctx.quads->add_quad(v2d->cur.xmin,
+                            seq::channel_to_y(i),
+                            v2d->cur.xmax,
+                            seq::channel_to_y(i + 1),
+                            color);
+      }
+      i++;
+    }
   }
 
   ctx.quads->draw();
@@ -1706,7 +1744,7 @@ static void draw_cache_source_iter_fn(void *userdata, const Strip *strip, int ti
   CacheDrawData *drawdata = static_cast<CacheDrawData *>(userdata);
 
   const uchar4 col{255, 25, 5, 100};
-  float stripe_bot = strip->channel + STRIP_OFSBOTTOM + drawdata->stripe_ofs_y;
+  float stripe_bot = seq::channel_to_y(strip->channel) + STRIP_OFSBOTTOM + drawdata->stripe_ofs_y;
   float stripe_top = stripe_bot + drawdata->stripe_ht;
   drawdata->quads->add_quad(timeline_frame, stripe_bot, timeline_frame + 1, stripe_top, col);
 }
@@ -1754,7 +1792,7 @@ static void draw_cache_background(const bContext *C, const CacheDrawData *draw_d
   strips.remove_if([&](const Strip *strip) { return strip->type == STRIP_TYPE_SOUND; });
 
   for (const Strip *strip : strips) {
-    stripe_bot = strip->channel + STRIP_OFSBOTTOM + draw_data->stripe_ofs_y;
+    stripe_bot = seq::channel_to_y(strip->channel) + STRIP_OFSBOTTOM + draw_data->stripe_ofs_y;
     if (sseq->cache_overlay.flag & SEQ_CACHE_SHOW_RAW) {
       draw_cache_stripe(scene, strip, *draw_data->quads, stripe_bot, draw_data->stripe_ht, bg_raw);
     }

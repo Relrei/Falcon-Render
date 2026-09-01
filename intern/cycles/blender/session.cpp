@@ -166,7 +166,7 @@ void BlenderSession::create_session()
 
   /* set buffer parameters */
   const BufferParams buffer_params = BlenderSync::get_buffer_params(
-      b_v3d, b_rv3d, scene->camera, width, height);
+      b_v3d, b_rv3d, b_scene, scene, width, height);
   session->reset(session_params, buffer_params);
 
   /* Viewport and preview (as in, material preview) does not do tiled rendering, so can inform
@@ -257,7 +257,7 @@ void BlenderSession::reset_session(blender::Main &b_data, blender::Depsgraph &b_
   sync->sync_camera(*b_render, width, height, "");
 
   const BufferParams buffer_params = BlenderSync::get_buffer_params(
-      nullptr, nullptr, scene->camera, width, height);
+      nullptr, nullptr, b_scene, scene, width, height);
   session->reset(session_params, buffer_params);
 
   /* reset time */
@@ -360,9 +360,42 @@ void BlenderSession::clear_denoiser_history_on_cut()
                                                       (const void *)b_scene->camera;
   const int cut_frame = b_scene->r.cfra;
 
-  if ((last_cut_camera_ != nullptr && cut_camera != last_cut_camera_) ||
-      (last_cut_frame_ != INT_MIN && std::abs(cut_frame - last_cut_frame_) > 1))
-  {
+  /* The frame number is what tells DLSS-RR "new frame" from "more samples on
+   * the same frame"; this runs once per render/update, before the denoise. */
+  session->set_denoiser_frame(cut_frame);
+
+  if (getenv("FALCON_DLSS_DEBUG")) {
+    fprintf(stderr,
+            "[cut] cfra=%d cam=%p last=%p\n",
+            cut_frame,
+            cut_camera,
+            last_cut_camera_);
+  }
+
+  /* How far the frame may move before it counts as a jump. A final render
+   * steps by the scene's frame step, so a step of 2 is one frame, not a cut.
+   * Viewport playback drops frames whenever it cannot keep up (a path-traced
+   * viewport never keeps up: measured 2 -> 12 -> 8 -> 4 on a 16-frame loop),
+   * and every dropped frame looked like a cut here, so the history was thrown
+   * away on every update of exactly the playback it was meant to smooth. The
+   * interactive motion pass holds where things were at the previous update,
+   * dropped frames included, so playback is left to the motion-limit check
+   * (clear_denoiser_history_on_jump). FALCON_DLSS_CUT_ON_PLAYBACK=1 restores
+   * the frame rule during playback. */
+  const bool playing = (b_v3d != nullptr) && (b_screen != nullptr) &&
+                       (b_screen->animtimer != nullptr);
+  static const bool cut_on_playback = getenv("FALCON_DLSS_CUT_ON_PLAYBACK") != nullptr;
+  const int frame_tolerance = (b_v3d == nullptr) ? max(1, b_scene->r.frame_step) : 1;
+  const bool frame_jump = (last_cut_frame_ != INT_MIN) &&
+                          (std::abs(cut_frame - last_cut_frame_) > frame_tolerance) &&
+                          (!playing || cut_on_playback);
+
+  if ((last_cut_camera_ != nullptr && cut_camera != last_cut_camera_) || frame_jump) {
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr, "[cut] -> clear history (camera=%d frame=%d playing=%d)\n",
+              int(last_cut_camera_ != nullptr && cut_camera != last_cut_camera_),
+              int(frame_jump), int(playing));
+    }
     session->clear_denoiser_temporal_history();
   }
 
@@ -442,6 +475,15 @@ void BlenderSession::clear_denoiser_history_on_jump()
     motion_pixels = max(motion_pixels, (step / distance) * pixels_per_radian);
   }
 
+  if (getenv("FALCON_DLSS_DEBUG")) {
+    fprintf(stderr,
+            "[jump] motion=%.1fpx limit=%d turn=%.4f shift=%.4f%s\n",
+            motion_pixels,
+            motion_limit,
+            turn,
+            shift,
+            (motion_pixels > float(motion_limit)) ? " -> clear history" : "");
+  }
   if (motion_pixels > float(motion_limit)) {
     session->clear_denoiser_temporal_history();
   }
@@ -502,7 +544,7 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
   const SessionParams session_params = BlenderSync::get_session_params(
       b_engine, b_userpref, *b_scene, background, pixelsize);
   BufferParams buffer_params = BlenderSync::get_buffer_params(
-      b_v3d, b_rv3d, scene->camera, width, height);
+      b_v3d, b_rv3d, b_scene, scene, width, height);
 
   /* temporary render result to find needed passes and views */
   blender::RenderResult *b_rr = RE_engine_begin_result(
@@ -952,6 +994,11 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
    * synchronization at a later time to not block on running updates */
   sync->sync_recalc(b_depsgraph_, b_screen, b_v3d, b_rv3d);
 
+  /* Timeline playback in the viewport: see Session::set_playback and
+   * clear_denoiser_history_on_cut for what it changes. */
+  session->set_playback((b_v3d != nullptr) && (b_screen != nullptr) &&
+                        (b_screen->animtimer != nullptr));
+
   /* don't do synchronization if on pause */
   if (session_pause) {
     tag_update();
@@ -989,7 +1036,7 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
 
   /* get buffer parameters */
   const BufferParams buffer_params = BlenderSync::get_buffer_params(
-      b_v3d, b_rv3d, scene->camera, width, height);
+      b_v3d, b_rv3d, b_scene, scene, width, height);
 
   /* reset if needed */
   if (scene->need_reset()) {
@@ -1111,7 +1158,7 @@ void BlenderSession::view_draw(const int w, const int h)
       const SessionParams session_params = BlenderSync::get_session_params(
           b_engine, b_userpref, *b_scene, background, pixelsize);
       const BufferParams buffer_params = BlenderSync::get_buffer_params(
-          b_v3d, b_rv3d, scene->camera, width, height);
+          b_v3d, b_rv3d, b_scene, scene, width, height);
       const bool session_pause = BlenderSync::get_session_pause(*b_scene, background);
 
       if (session_pause == false) {

@@ -39,6 +39,7 @@
 #include "BKE_sound.hh"
 
 #include "DEG_depsgraph.hh"
+#include "DEG_depsgraph_query.hh"
 
 #include "MOV_read.hh"
 
@@ -66,6 +67,7 @@
 #include "effects/effects.hh"
 #include "modifiers/modifier.hh"
 #include "prefetch.hh"
+#include "render.hh"
 #include "sequencer.hh"
 
 #include "BKE_scene_runtime.hh"
@@ -320,6 +322,21 @@ void editing_free(Scene *scene, const bool do_id_user)
   }
 
   seq_prefetch_free(scene);
+
+  /* seq_free_strip_recurse() below frees each Strip with do_cache=false,
+   * i.e. it does *not* go through relations_invalidate_cache_raw() ->
+   * source_image_cache_invalidate_strip() (that path assumes the rest of
+   * the seqbase listbase is still intact, which it is not while this
+   * loop is tearing it down -- see the comment on seq_strip_free_ex()).
+   * That means the per-strip drain in source_image_cache_invalidate_
+   * strip() is skipped here, so any BL_VSE_PREFETCH_N read-ahead task
+   * still in flight for one of these strips must be drained up front,
+   * before the loop starts freeing them out from under it (use-after-
+   * free otherwise: source_image_cache_destroy() below only drains
+   * *after* every strip has already been freed). Scene is still fully
+   * alive at this point, so this is safe/cheap the same way
+   * source_image_cache_destroy()'s call is. */
+  vse_prefetch_wait_all();
 
   /* handle cache freeing above */
   for (Strip &strip : ed->seqbase.items_mutable()) {
@@ -1264,6 +1281,10 @@ static bool strip_sound_update_cb(Strip *strip, void *user_data)
 void eval_strips(Depsgraph *depsgraph, Scene *scene, ListBaseT<Strip> *seqbase)
 {
   DEG_debug_print_eval(depsgraph, __func__, scene->id.name, scene);
+
+  /* Note: sequencer caches are stored on the original scene, not the evaluated copy. */
+  relations_invalidate_temporary_animation_frame(DEG_get_original(scene));
+
   BKE_sound_ensure_scene(scene);
 
   foreach_strip(seqbase, strip_sound_update_cb, scene);

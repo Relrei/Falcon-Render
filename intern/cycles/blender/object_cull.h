@@ -28,6 +28,9 @@ class BlenderObjectCulling {
   bool use_scene_distance_cull_;
   bool use_distance_cull_;
   float distance_cull_margin_;
+  /* ★カリングの枠にレンダー領域(Render Region)を使うか。
+   *   領域が無い時は Camera::border が [0,1] なので、真でも従来と同じ結果になる。 */
+  bool use_render_region_;
 };
 
 CCL_NAMESPACE_END

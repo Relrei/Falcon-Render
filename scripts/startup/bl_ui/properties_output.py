@@ -537,6 +537,11 @@ class RENDER_PT_encoding_video(RenderOutputButtonsPanel, Panel):
         if needs_codec:
             layout.prop(ffmpeg, "codec")
 
+            # GPUエンコード: H.264 / HEVC のときだけ意味があるので、
+            # コーデックを選んだ直後に置く
+            if ffmpeg.codec in {'H264', 'H265'}:
+                layout.prop(ffmpeg, "use_hardware_encoder", text="GPUで書き出す")
+
         if needs_codec and ffmpeg.codec == 'NONE':
             return
 

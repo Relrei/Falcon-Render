@@ -24,6 +24,8 @@
 
 #include "DNA_object_types.h"
 #include "DNA_scene_types.h"
+#include "DNA_screen_types.h"
+#include "DNA_space_types.h"
 #include "DNA_userdef_types.h"
 #include "DNA_view3d_types.h"
 
@@ -51,6 +53,7 @@
 #include "ED_render.hh"
 #include "ED_screen.hh"
 #include "ED_util.hh"
+#include "ED_view3d.hh"
 
 #include "RE_engine.h"
 #include "RE_pipeline.h"
@@ -69,6 +72,112 @@ namespace blender {
 
 /* Render Callbacks */
 static bool render_break(void *rjv);
+
+/* -------------------------------------------------------------------- */
+/** \name Falcon: viewport render engine eviction
+ *
+ * Free the render engine of every 3D viewport that is in Rendered shading
+ * before a final render starts, so the device does not have to hold the scene
+ * twice. See `RE_falcon_evict_viewport_enabled()` in `RE_engine.h`.
+ *
+ * Both functions are main thread only: they are called from the render operator
+ * and from the job end callback, never from the render thread.
+ * \{ */
+
+template<typename Fn> static void falcon_foreach_view3d_window_region(Main *bmain, Fn &&fn)
+{
+  for (wmWindowManager &wm : bmain->wm) {
+    for (wmWindow &win : wm.windows) {
+      bScreen *screen = WM_window_get_active_screen(&win);
+      if (screen == nullptr) {
+        continue;
+      }
+      for (ScrArea &area : screen->areabase) {
+        if (area.spacetype != SPACE_VIEW3D) {
+          continue;
+        }
+        for (ARegion &region : area.regionbase) {
+          if (region.regiontype != RGN_TYPE_WINDOW || region.regiondata == nullptr) {
+            continue;
+          }
+          fn(wm, region);
+        }
+      }
+    }
+  }
+}
+
+static void falcon_evict_viewport_render_engines(Main *bmain)
+{
+  if (!RE_falcon_evict_viewport_enabled()) {
+    return;
+  }
+
+  const double time_start = BLI_time_now_seconds();
+  int freed = 0;
+
+  falcon_foreach_view3d_window_region(bmain, [&](wmWindowManager &wm, ARegion &region) {
+    const RegionView3D *rv3d = static_cast<const RegionView3D *>(region.regiondata);
+    if (rv3d->view_render == nullptr) {
+      return;
+    }
+    /* Same teardown as leaving Rendered shading: kills the preview job and frees
+     * the engine (and with it the Cycles session and all of its device memory)
+     * with the draw GPU context bound. */
+    ED_view3d_stop_render_preview(&wm, &region);
+    freed++;
+  });
+
+  RE_falcon_evict_viewport_set_active(freed > 0);
+
+  if (freed > 0) {
+    printf("[falcon-evict] freed %d viewport render engine(s) in %.3f s\n",
+           freed,
+           BLI_time_now_seconds() - time_start);
+    fflush(stdout);
+  }
+}
+
+static void falcon_evict_viewport_finish(Main *bmain, const Scene *scene)
+{
+  /* Only true when this render actually evicted a viewport. With no 3D viewport
+   * in Rendered shading nothing was taken away, so there is nothing to give
+   * back and nothing below runs. */
+  if (!RE_falcon_evict_viewport_is_active()) {
+    return;
+  }
+
+  RE_falcon_evict_viewport_set_active(false);
+
+  /* Give the device back to the viewport, the other way round this time.
+   *
+   * With Persistent Data on, the final render keeps its whole scene on the
+   * device after the frame is done. The viewport would then have to rebuild on
+   * top of it and runs out of GPU memory on its way back -- measured
+   * 2026-08-27 on the tree scene: the render itself fits (5175 MiB) but the
+   * viewport coming back does not. Letting only one side go is not enough: the
+   * render gets through and the way back falls over.
+   *
+   * This is deliberately as narrow as it can be:
+   * - only when a viewport was evicted, so "render in the background with
+   *   Persistent Data while I work" keeps its cache untouched,
+   * - and only for the scene that was just rendered, not every Render in the
+   *   file.
+   * What is left is the case where a Rendered viewport was open during the
+   * render, and there the cache could not have survived anyway -- the whole
+   * point is that both do not fit on the device at once. */
+  RE_FreePersistentData(scene);
+
+  /* The external draw engine refuses to rebuild while the eviction is active, so
+   * ask for one redraw now that it is not. */
+  falcon_foreach_view3d_window_region(
+      bmain, [](wmWindowManager & /*wm*/, ARegion &region) { ED_region_tag_redraw(&region); });
+
+  printf("[falcon-evict] final render done, viewports tagged for rebuild\n");
+  fflush(stdout);
+}
+
+/** \} */
 
 struct RenderJob : public RenderJobBase {
   Main *main;
@@ -307,6 +416,9 @@ static wmOperatorStatus screen_render_exec(bContext *C, wmOperator *op)
 
   RE_SetReports(re, op->reports);
 
+  /* Falcon: hand the device back before the final render allocates on it. */
+  falcon_evict_viewport_render_engines(mainp);
+
   if (is_animation) {
     RE_RenderAnim(re,
                   mainp,
@@ -327,6 +439,8 @@ static wmOperatorStatus screen_render_exec(bContext *C, wmOperator *op)
                    scene->r.subframe,
                    is_write_still);
   }
+
+  falcon_evict_viewport_finish(mainp, scene);
 
   RE_SetReports(re, nullptr);
 
@@ -498,7 +612,9 @@ static void image_renderinfo_cb(void *rjv, RenderStats *rs)
 
   RE_ReleaseResult(rj->re);
 
-  BKE_callback_exec_string(G_MAIN, rs->infostr, BKE_CB_EVT_RENDER_STATS);
+  if (rs->infostr != nullptr) {
+    BKE_callback_exec_string(G_MAIN, rs->infostr, BKE_CB_EVT_RENDER_STATS);
+  }
 
   /* make jobs timer to send notifier */
   *(rj->do_update) = true;
@@ -763,6 +879,7 @@ static void render_endjob(void *rjv)
 
   /* XXX render stability hack */
   G.is_rendering = false;
+  falcon_evict_viewport_finish(G_MAIN, rj->scene);
   WM_main_add_notifier(NC_SCENE | ND_RENDER_RESULT, nullptr);
 
   /* Partial render result will always update display buffer
@@ -995,6 +1112,9 @@ static wmOperatorStatus screen_render_invoke(bContext *C, wmOperator *op, const 
 
   /* stop all running jobs, except screen one. currently previews frustrate Render */
   WM_jobs_kill_all_except(CTX_wm_manager(C), CTX_wm_screen(C));
+
+  /* Falcon: hand the device back before the final render allocates on it. */
+  falcon_evict_viewport_render_engines(bmain);
 
   /* cancel animation playback */
   if (ED_screen_animation_playing(CTX_wm_manager(C))) {

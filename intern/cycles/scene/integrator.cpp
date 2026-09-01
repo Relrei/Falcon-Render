@@ -331,6 +331,7 @@ NODE_DEFINE(Integrator)
   SOCKET_FLOAT(denoiser_upscale_factor, "Denoiser Upscale Factor", 1.0f);
   SOCKET_BOOLEAN(denoiser_carry_history, "Denoiser Carry History", false);
   SOCKET_INT(denoiser_preroll_passes, "Denoiser Preroll Passes", 4);
+  SOCKET_INT(denoiser_preroll_passes_cut, "Denoiser Preroll Passes Cut", 0);
 
 #ifdef WITH_FALCON_SHARC
   /* Falcon knobs, see integrator.h. Defaults repeat the values device_update()
@@ -440,6 +441,7 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
   kintegrator->caustics_reflective = caustics_reflective;
   kintegrator->caustics_refractive = caustics_refractive;
   kintegrator->filter_glossy = (filter_glossy == 0.0f) ? FLT_MAX : 1.0f / filter_glossy;
+  kintegrator->differential_widen_scale = min(1.0f, filter_glossy);
 
   kintegrator->filter_closures = 0;
   if (!use_direct_light) {
@@ -772,15 +774,31 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
                                 nullptr;
     const float world_radiance = world_env ? (float)atof(world_env) : 0.0f;
     if (photon_light || world_radiance > 0.0f) {
-      const size_t floats = size_t(FALCON_SHARC_CELL_COUNT) * FALCON_SHARC_CELL_STRIDE;
-      if (dscene->falcon_sharc_cache.size() != floats) {
+      /* ★2026-08-25: ライトトレースは格子に一度も書かない。
+       * shade_surface.h の LT の分岐は `return LABEL_NONE` で抜けるので、
+       * その下の堆積コードには到達しない。それなのにここで
+       * 2^26 セル × 4 float = **1 GiB ちょうど**を確保し、memset して
+       * GPU へ転送していた(毎レンダー)。読みもしないので、VRAM も時間も丸損。
+       * 焼き(bake)と足し込み(add)は今までどおり要る。 */
+      const bool sharc_needed = (kintegrator->falcon_lighttrace == 0);
+      const size_t floats = sharc_needed ?
+                                size_t(FALCON_SHARC_CELL_COUNT) * FALCON_SHARC_CELL_STRIDE :
+                                0;
+      if (!sharc_needed) {
+        if (dscene->falcon_sharc_cache.size() != 0) {
+          dscene->falcon_sharc_cache.free();
+        }
+      }
+      else if (dscene->falcon_sharc_cache.size() != floats) {
         if (dscene->falcon_sharc_cache.size() != 0) {
           dscene->falcon_sharc_cache.free();
         }
         dscene->falcon_sharc_cache.alloc(floats);
       }
+      LOG_INFO << "Falcon SHARC: " << (sharc_needed ? "alloc " : "skipped (light tracing) ")
+               << (floats * sizeof(float) / (1024 * 1024)) << " MiB";
       bool loaded = false;
-      if (grid_accumulate) {
+      if (sharc_needed && grid_accumulate) {
         /* Start from what the previous pass wrote. A missing or short file is
          * not an error -- the first pass of a bake has nothing to read. */
         FILE *pf = fopen(dscene->falcon_sharc_cache_path.c_str(), "rb");
@@ -794,11 +812,13 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
           }
         }
       }
-      if (!loaded) {
-        memset(dscene->falcon_sharc_cache.data(), 0, floats * sizeof(float));
-        dscene->falcon_sharc_cache.copy_to_device();
+      if (sharc_needed) {
+        if (!loaded) {
+          memset(dscene->falcon_sharc_cache.data(), 0, floats * sizeof(float));
+          dscene->falcon_sharc_cache.copy_to_device();
+        }
+        dscene->falcon_sharc_cache.clear_modified();
       }
-      dscene->falcon_sharc_cache.clear_modified();
 
       double n_photons = 1e6;
       const char *n_env = getenv("FALCON_PHOTON_N");
@@ -1502,6 +1522,7 @@ DenoiseParams Integrator::get_denoise_params() const
   denoise_params.upscale_factor = denoiser_upscale_factor;
   denoise_params.carry_history = denoiser_carry_history;
   denoise_params.preroll_passes = denoiser_preroll_passes;
+  denoise_params.preroll_passes_cut = denoiser_preroll_passes_cut;
 
   return denoise_params;
 }

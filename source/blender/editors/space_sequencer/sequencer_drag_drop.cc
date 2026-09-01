@@ -217,8 +217,13 @@ static float update_overlay_strip_position_data(bContext *C, const int mval[2])
     int snap_delta;
     float2 snap_point;
 
-    const bool valid_snap = transform::snap_sequencer_calc_drag_drop(
-        scene, region, start_frame, end_frame, channel, &snap_delta, &snap_point);
+    const bool valid_snap = transform::snap_sequencer_calc_drag_drop(scene,
+                                                                      region,
+                                                                      start_frame,
+                                                                      end_frame,
+                                                                      seq::y_to_channel(channel),
+                                                                      &snap_delta,
+                                                                      &snap_point);
 
     if (valid_snap) {
       /* We snapped onto something! */
@@ -236,7 +241,7 @@ static float update_overlay_strip_position_data(bContext *C, const int mval[2])
   /* Check if there is a strip that would intersect with the new strip(s). */
   coords->is_intersecting = false;
   Strip dummy_strip{};
-  seq::strip_channel_set(&dummy_strip, coords->channel);
+  seq::strip_channel_set(&dummy_strip, seq::y_to_channel(coords->channel));
   dummy_strip.start = coords->start_frame;
   dummy_strip.len = coords->strip_length;
   dummy_strip.speed_factor = 1.0f;
@@ -421,9 +426,10 @@ static void draw_strip_in_view(bContext *C, wmWindow * /*win*/, wmDrag *drag, co
 
   StripsDrawBatch batch(&region->v2d);
 
+  const int base_channel = seq::y_to_channel(coords->channel);
   for (int i = 0; i < coords->num_channels; i++) {
-    float y1 = floorf(coords->channel) + i + STRIP_OFSBOTTOM;
-    float y2 = floorf(coords->channel) + i + STRIP_OFSTOP;
+    float y1 = seq::channel_to_y(base_channel + i) + STRIP_OFSBOTTOM;
+    float y2 = seq::channel_to_y(base_channel + i) + STRIP_OFSTOP;
 
     /* Audio strips sit at the bottom, video strips sit above them. */
     if (i < coords->num_audio) {

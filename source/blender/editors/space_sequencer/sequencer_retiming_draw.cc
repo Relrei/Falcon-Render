@@ -30,6 +30,7 @@
 #include "UI_view2d.hh"
 
 #include "SEQ_retiming.hh"
+#include "SEQ_transform.hh"
 
 #include "sequencer_intern.hh"
 #include "sequencer_quads_batch.hh"
@@ -79,8 +80,8 @@ static inline float retiming_key_size()
 
 static inline float retiming_key_center(const View2D *v2d, const Strip *strip)
 {
-  return (ui::view2d_view_to_region_y(v2d, strip->channel + STRIP_OFSBOTTOM) + 4 +
-          retiming_key_size() / 2);
+  const float channel_y = seq::channel_to_y(strip->channel) + STRIP_OFSBOTTOM;
+  return (ui::view2d_view_to_region_y(v2d, channel_y) + 4 + retiming_key_size() / 2);
 }
 
 rcti strip_retiming_keys_box_get(const Scene *scene, const View2D *v2d, const Strip *strip)
@@ -336,7 +337,7 @@ static std::optional<float2> speed_label_pos_get(const TimelineDrawContext &ctx,
   const float bottom_pad = (ctx.pixely * 5.0f);
 
   const float x = 0.5f * (key_x + next_x - label_width); /* Left edge of centered label. */
-  const float y = (strip_ctx.strip->channel + STRIP_OFSBOTTOM) + bottom_pad;
+  const float y = (seq::channel_to_y(strip_ctx.strip->channel) + STRIP_OFSBOTTOM) + bottom_pad;
   return float2{x, y};
 }
 

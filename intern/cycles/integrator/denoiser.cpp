@@ -224,6 +224,22 @@ bool Denoiser::is_device_supported(DenoiserType type, const DeviceInfo &denoise_
 
 DenoiserType Denoiser::automatic_viewport_denoiser_type(const DeviceInfo &denoise_device_info)
 {
+  /* Falcon: prefer DLSS-RR in the viewport when the device can run it. Upstream's Automatic picks
+   * OpenImageDenoise, which is the better single frame but is re-run from scratch on every update;
+   * RR carries a temporal history, so it settles across updates and is markedly faster at high
+   * resolution (4K, 1spp: DLSS 2.74 s against OIDN-GPU 10.16 s, measured 2026-08-28).
+   * FALCON_DLSS_VIEWPORT_AUTO=0 restores the upstream preference. */
+#ifdef WITH_DLSS
+  {
+    static const bool prefer_dlss = getenv("FALCON_DLSS_VIEWPORT_AUTO") ?
+                                        atoi(getenv("FALCON_DLSS_VIEWPORT_AUTO")) != 0 :
+                                        true;
+    if (prefer_dlss && DLSSDenoiser::is_device_supported(denoise_device_info)) {
+      return DENOISER_DLSS;
+    }
+  }
+#endif
+
 #ifdef WITH_OPENIMAGEDENOISE
   if (denoise_device_info.type != DEVICE_CPU &&
       OIDNDenoiserGPU::is_device_supported(denoise_device_info))

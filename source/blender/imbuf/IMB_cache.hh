@@ -31,6 +31,26 @@ using ImBufCachePriorityDeleterFP = void (*)(void *priority_data);
 void IMB_cache_init();
 void IMB_cache_destruct();
 
+/**
+ * Bytes currently held by the shared ImBuf cache limiter, across every #ImBufCache.
+ *
+ * Read-only accounting. Note that this limiter is handed the *same* `U.memcachelimit`
+ * value as the sequencer caches and the generic memory cache, and each of the three
+ * enforces that number on its own contents -- so the real ceiling is a multiple of what
+ * the user typed. This getter exists to be able to measure that, and to let a caller
+ * treat the three as one shared budget.
+ */
+size_t IMB_cache_memory_in_use();
+
+/**
+ * Whether the shared limiter exists yet at all.
+ *
+ * It is created lazily, on the first #IMB_cache_put. Until then
+ * #IMB_cache_memory_in_use reports 0 -- and "nothing cached yet" must not be confused
+ * with "this cache holds nothing", which is a different claim about a live cache.
+ */
+bool IMB_cache_is_active();
+
 ImBufCache *IMB_cache_create(const char *name, int keysize, GHashHashFP hashfp, GHashCmpFP cmpfp);
 void IMB_cache_set_getdata_callback(ImBufCache *cache, ImBufCacheGetKeyDataFP getdatafp);
 void IMB_cache_set_priority_callback(ImBufCache *cache,
