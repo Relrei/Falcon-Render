@@ -1,0 +1,8 @@
+# flcompat が使う公開 .blend の台帳
+# 名前 <TAB> パス <TAB> 出所(ライセンス)
+# ★ここに書く物は「公開デモ由来」だけ。自作の台は入れない(互換性の主張の証拠にならない)。
+classroom	/home/mirai/Documents2/render-research/classroom-copy/classroom.blend	Blender Demo Files "Class room" / Christophe Seux (CC0)
+bmw27	/home/mirai/Documents2/Blender /blend/benchmark/BMW27.blend	Blender Benchmark "BMW27" / Mike Pan (CC0)
+lone-monk	/home/mirai/Documents2/Blender /blend/benchmark/official/lone-monk_cycles_and_exposure-node_demo.blend	Blender Demo Files "Lone Monk" / Carlo Bergonzini (CC-BY)
+monster	/home/mirai/Documents2/Blender /blend/benchmark/official/monster_under_the_bed_sss_demo_by_metin_seven.blend	Blender Demo Files "Monster Under The Bed" / Metin Seven (CC-BY)
+splash-5.2	/home/mirai/Documents2/Blender /blend/benchmark/official/blender-5.2-splash.blend	Blender 5.2 Splash / Blender Studio (CC-BY)
