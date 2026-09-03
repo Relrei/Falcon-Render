@@ -9,7 +9,7 @@ Blender は GNU GPL なので、**このビルドに対応するソースコー�
 
 - ベース: Blender `v5.2.1` (`9e2066aef7e`)
 - 改変部分: 上記に Falcon 系のコミットを重ねたもの
-- このビルドのコミット: `5a1ade52865`
+- このビルドのコミット: `bab756c6a9f`(公開スナップショット `aac1ac037cc` = tag `v0.4-r2`)
 
 ## 入手方法
 
@@ -32,7 +32,9 @@ git submodule update --init --checkout lib/linux_x64
 
 ## ソースは GitHub でも公開しています
 
-**https://github.com/Relrei/blender-cyclesf-falcon**
+**https://github.com/Relrei/Falcon-Render**(この repo の `main`・tag `v0.4-r2`)
+> 2026-09-04: ソースはこの repo に同居させました(`main` = Blender 5.2.1 ベースのスナップショット系列)。旧 `blender-cyclesf-falcon` は archive 済み(読み取り専用・履歴は残っています)。
+
 
 このビルドに対応するソースは、同梱の `falcon-render-v0.4-src.tar.xz` と
 **タグ `v0.4`**(GitHub)のどちらでも同じものが取れます。

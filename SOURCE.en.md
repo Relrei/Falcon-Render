@@ -58,7 +58,9 @@ ninja -j6
 
 ## The source is also public on GitHub
 
-**https://github.com/Relrei/blender-cyclesf-falcon**
+**https://github.com/Relrei/Falcon-Render** (this repo: `main`, tag `v0.4-r2`)
+> 2026-09-04: the source now lives in this same repo (`main` = the snapshot series on Blender 5.2.1). The old `blender-cyclesf-falcon` is archived (read-only, history kept).
+
 
 The source corresponding to this build is available either from the bundled
 `falcon-render-v0.4-src.tar.xz` or from the **`v0.4` tag** on GitHub —
