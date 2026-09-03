@@ -414,6 +414,52 @@ def update_pause(self, context):
     context.area.tag_redraw()
 
 
+# 簡単表示のチェックボックス「コースティクス」の中身。
+# ON  = cycles.falcon_auto_caustics と同じ処理(ガラス+ライトを検出して焼く)
+# OFF = cycles.falcon_photon_clear と同じ処理(合成を外す。キャッシュは残す)
+#
+# ★プロパティの update から直接オペレータを呼ばない。falcon_photon_bake は
+#   ベイク中に RENDERED ビューポートを SOLID へ落とす(2026-07-12 の CUDA
+#   illegal-address 対策)ので、UI の更新中に走らせると同じ空間を二重に触る。
+#   タイマーで一度だけ後回しにして、通常のオペレータ実行と同じ土俵に置く。
+_falcon_caustics_syncing = [False]
+
+
+def _falcon_caustics_on_update(self, context):
+    if _falcon_caustics_syncing[0]:
+        return
+    want = bool(self.falcon_caustics_on)
+
+    def _run():
+        from . import operators as _fops
+        try:
+            if want:
+                bpy.ops.cycles.falcon_auto_caustics()
+            else:
+                bpy.ops.cycles.falcon_photon_clear()
+        except RuntimeError:
+            pass
+        # 焼けなかった時にチェックだけ ON で残さない(実体は環境変数側)。
+        active = _fops._falcon_caustics_active()
+        if active != want:
+            _falcon_caustics_syncing[0] = True
+            try:
+                for scene in bpy.data.scenes:
+                    scene.cycles.falcon_caustics_on = active
+            finally:
+                _falcon_caustics_syncing[0] = False
+        return None
+
+    if bpy.app.background:
+        # 画面が無いので後回しにする理由が無く、タイマーも回らない
+        _run()
+        return
+    try:
+        bpy.app.timers.register(_run, first_interval=0.0)
+    except Exception:
+        _run()
+
+
 class CyclesRenderSettings(bpy.types.PropertyGroup):
     __slots__ = ()
 
@@ -1559,6 +1605,27 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         ),
         default='AUTO',
     )
+    # --- 簡単表示(Caustica の形)で使う2つ ---------------------------------
+    #  CyclesF パネルの「機能1つ・チェックボックス1つ」の形。既定 OFF の
+    #  falcon_simple_panel(CyclesPreferences)がこの2つを見せるかを決める。
+    falcon_caustics_on: BoolProperty(
+        name="コースティクス",
+        description="ガラス/屈折とライトのコースティクス(集光模様)を出す。"
+                    "ONで実証済みの設定で焼き、以後のレンダーに合成される。"
+                    "OFFで合成を外す(キャッシュは残る)",
+        default=False,
+        update=_falcon_caustics_on_update,
+    )
+    falcon_caustics_quality: EnumProperty(
+        name="品質",
+        description="速い=焼いたフォトンをそのままレンダーに合成する。"
+                    "清書=ライトトレースで収束させた滑らかな集光を作る(数分)",
+        items=(
+            ('FAST', "速い", "焼いたフォトンをそのまま合成する(既定)"),
+            ('CLEAN', "清書(数分)", "ライトトレースで収束させた滑らかな集光を作る"),
+        ),
+        default='FAST',
+    )
 
     @classmethod
     def register(cls):
@@ -2112,6 +2179,19 @@ class CyclesPreferences(bpy.types.AddonPreferences):
         name="Embree on GPU",
         description="Embree on GPU enables the use of hardware ray tracing on Intel GPUs, providing better overall performance",
         default=True,
+    )
+
+    # CyclesF パネルを「機能1つ・チェックボックス1つ」の形にするかどうか。
+    # ★既定 False = いままでのパネルがそのまま出る(見た目は1画素も変わらない)。
+    #   True で、親は[コースティクス]/[強さ]/[品質]だけになり、今までの子パネルは
+    #   「詳細」の下へそのまま移る。値は1つも消えない。
+    # ★ここは画面に出る言葉なので、本人の Yes が出るまで既定は False のまま。
+    #   倒す時に変えるのはこの1行の default だけ。
+    falcon_simple_panel: BoolProperty(
+        name="CyclesF を簡単表示にする",
+        description="CyclesF パネルをコースティクスのチェックボックス1つに絞り、"
+                    "今までのツマミは「詳細」の下へ畳む",
+        default=False,
     )
 
     kernel_optimization_level: EnumProperty(

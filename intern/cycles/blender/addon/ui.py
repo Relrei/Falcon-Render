@@ -2655,275 +2655,451 @@ def get_panels():
     return panels
 
 
+def _falcon_simple_panel(context):
+    """CyclesF パネルを「機能1つ・チェックボックス1つ」の形で出すか。
+
+    アドオン設定の `falcon_simple_panel`(既定 False)。False の間は今までの
+    パネルがそのまま出る=見た目は1画素も変わらない。倒すのは properties.py の
+    default の1行だけ。"""
+    try:
+        prefs = context.preferences.addons[__package__].preferences
+        return bool(getattr(prefs, "falcon_simple_panel", False))
+    except Exception:
+        return False
+
+
+def _falcon_draw_status(layout, context):
+    """状態は「異常な時だけ喋る」。正常時はGPUの1行のみ。"""
+    cscene = context.scene.cycles
+    prefs = context.preferences.addons[__package__].preferences
+
+    col = layout.column(align=True)
+    gpu_on = (cscene.device == 'GPU' and prefs.compute_device_type != 'NONE' and
+              prefs.has_active_device())
+    if gpu_on:
+        col.label(text="GPU: %s" % prefs.compute_device_type, icon='CHECKMARK')
+    else:
+        col.label(text="CPUレンダー中 — デバイスをGPUコンピュートに", icon='ERROR')
+    if not (cscene.use_denoising and cscene.denoising_use_gpu):
+        col.label(text="最終デノイズがGPUではない (下のプリセットで解決)", icon='ERROR')
+    if not (cscene.use_preview_denoising and cscene.preview_denoising_use_gpu):
+        col.label(text="ビューポートデノイズ OFF", icon='INFO')
+    if cscene.falcon_sharc_mode != 'OFF':
+        col.label(text="SHARC: %s" % cscene.falcon_sharc_mode, icon='OUTLINER_OB_LIGHT')
+
+
+def _falcon_draw_classic(layout, context):
+    """従来の CyclesF 親パネル(既定)。中身は1つも変えていない。"""
+    from . import operators as _fops
+    cscene = context.scene.cycles
+
+    _falcon_draw_status(layout, context)
+
+    # --- コースティクス自動化(Octane式: ガラス+ライトを置くだけで出す) ---
+    # レシピ知識ゼロで使える一本道。触りたい人向けの細部は下の子パネルに温存。
+    if cscene.falcon_auto_caustics == 'AUTO':
+        box = layout.box()
+        hdr = box.row(align=True)
+        hdr.label(text="コースティクス", icon='LIGHT_AREA')
+        hdr.prop(cscene, "falcon_auto_caustics", text="")
+        if _fops._falcon_caustics_active():
+            r = box.row(align=True)
+            r.label(text="有効 — レンダーに集光が出ます", icon='CHECKMARK')
+            r.operator("cycles.falcon_photon_clear", text="", icon='X')
+            # 強さは焼き直し不要の render-time ノブ(点マップ gain の env を更新)
+            box.prop(cscene, "falcon_photon_point_gain", text="強さ", slider=True)
+        elif _fops._falcon_scene_has_caustics(context.scene):
+            box.label(text="ガラス+ライトを検出", icon='CHECKMARK')
+            box.operator("cycles.falcon_auto_caustics", icon='SHADERFX')
+        else:
+            # 空状態=「最初の一手」を案内(黙って無反応にしない)
+            box.label(text="ガラス/屈折とライトを置くと出せます", icon='INFO')
+        # 清書コースティクス(LT): フォトンと別経路の仕上げ。検出時は常に選べる。
+        if _fops._falcon_scene_has_caustics(context.scene):
+            sub = box.column(align=True)
+            sub.operator("cycles.falcon_lt_clean_caustics",
+                         text="清書コースティクス (LT・数分)", icon='RENDER_STILL')
+            risk = _fops._falcon_lt_flood_risk(context.scene)
+            if risk:
+                sub.label(text=risk, icon='ERROR')
+    else:
+        # OFF でも戻す導線を1行だけ残す(見つかる/Discoverability)
+        layout.prop(cscene, "falcon_auto_caustics", text="コースティクス自動化")
+
+
+def _falcon_draw_simple(layout, context):
+    """Caustica の形: 機能1つ・チェックボックス1つ。
+    ここに出る言葉は「コースティクス / 強さ / 品質(速い・清書)」だけ。
+    今までのツマミは1つも消さず「詳細」子パネルの下へ移してある。"""
+    from . import operators as _fops
+    cscene = context.scene.cycles
+    has = _fops._falcon_scene_has_caustics(context.scene)
+
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.enabled = has
+    row.prop(cscene, "falcon_caustics_on", text="コースティクス")
+    if not has:
+        col.label(text="ガラス/屈折とライトを置くと出せます", icon='INFO')
+        return
+    if not cscene.falcon_caustics_on:
+        return
+
+    body = layout.column(align=True)
+    body.prop(cscene, "falcon_photon_point_gain", text="強さ", slider=True)
+    body.separator()
+    # ★2択は行いっぱいに置く。ラベルと同じ行に入れると N パネルの幅で
+    #   「清書(数分)」が丸ごと消える(実測)。
+    # ★★`expand=True` に `text=""` を渡すと Blender は「アイコンだけ」の扱いにして
+    #   項目名を描かなくなる(N パネルで両方とも空欄になった。2026-09-02 実測)。
+    #   ⇒ ラベルは自分で1行出し、prop には text を渡さない。
+    body.label(text="品質")
+    row = body.row(align=True)
+    row.prop(cscene, "falcon_caustics_quality", expand=True)
+    if cscene.falcon_caustics_quality == 'CLEAN':
+        # F12 には割り込まない。清書は押した時だけ走る別経路。
+        body.operator("cycles.falcon_lt_clean_caustics",
+                      text="レンダー", icon='RENDER_STILL')
+        risk = _fops._falcon_lt_flood_risk(context.scene)
+        if risk:
+            body.label(text=risk, icon='ERROR')
+
+
+# --- CyclesF パネル ---------------------------------------------------------
+#
+# ★**登録済みの Panel クラスを継いで別の空間へ出してはいけない。**
+#   継ぐと、継がれた側(親)の draw / poll が RNA から外れ、元の場所から
+#   黙って消える。2026-09-02 に実測: レンダープロパティから CyclesF が
+#   7組まるごと消えていた(エラーも警告も出ず、N パネル側は正常に出るので
+#   気づけない)。→ 罠/2026-09-02_パネルを継いで別空間へ出すと元のパネルが黙って消える
+#
+# ⇒ 別の空間・別の親へ出す写しは、**継承でなく同じ描画関数を呼ぶ**。
+#   中身(文言・ツマミ)は下の _falcon_draw_* の1箇所にしかないので、
+#   二重管理にはならない(片方だけ直る事故が起きない)。
+
+def _falcon_draw_presets(layout, context):
+    col = layout.column(align=True)
+    col.operator("cycles.falcon_near_realtime",
+                 text="ビューポート高速化", icon='SHADERFX')
+    col.operator("cycles.falcon_still_quality",
+                 text="静止画 高品質", icon='RENDER_STILL')
+    col.operator("cycles.falcon_final_quality",
+                 text="アニメーション用", icon='RENDER_ANIMATION')
+
+
+def _falcon_draw_photon(layout, context):
+    import os as _os
+    cscene = context.scene.cycles
+
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_photon_photons", text="光子数")
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_photon_cell", text="セル")
+    row.prop(cscene, "falcon_photon_dispersion", text="分散")
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_photon_gpu", text="GPU (速い)")
+    row.prop(cscene, "falcon_photon_point", text="点マップ")
+    if cscene.falcon_photon_gpu:
+        # The blur width is asked for in pixels and measured out in the
+        # scene, so it reads the same whether it ends up as a lookup radius
+        # (point map) or a cell size (grid).
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_photon_point_radius_auto", text="半径を自動")
+        if cscene.falcon_photon_point_radius_auto:
+            row.prop(cscene, "falcon_photon_point_radius_px", text="画素")
+        row = col.row(align=True)
+        sub = row.row()
+        sub.active = not cscene.falcon_photon_point_radius_auto
+        if cscene.falcon_photon_point:
+            sub.prop(cscene, "falcon_photon_point_radius", text="半径(m)")
+            row.prop(cscene, "falcon_photon_point_gain", text="ゲイン")
+        else:
+            sub.prop(cscene, "falcon_photon_cell", text="セル(m)")
+            row.prop(cscene, "falcon_photon_radius", text="広がり")
+        if cscene.falcon_photon_point:
+            row = col.row(align=True)
+            row.prop(cscene, "falcon_photon_point_maxpts", text="点上限")
+            row.prop(cscene, "falcon_photon_point_normal_deg", text="法線角(度)")
+    else:
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_photon_radius", text="滑らかさ")
+    col.operator("cycles.falcon_photon_bake", icon='LIGHT_SUN')
+    # Runs in a separate background process (safe against the Vulkan
+    # viewport crash); confirmation dialog picks once/per-frame bake.
+    col.operator("cycles.falcon_bake_and_render_range",
+                 icon='RENDER_ANIMATION')
+    if _os.environ.get("FALCON_PHOTON_MODE") == "add":
+        r = col.row(align=True)
+        if _os.environ.get("FALCON_PHOTON_POINTS"):
+            r.label(text="合成: 有効 (点マップ)", icon='CHECKMARK')
+        else:
+            r.label(text="合成: 有効", icon='CHECKMARK')
+        r.operator("cycles.falcon_photon_clear", text="", icon='X')
+
+
+def _falcon_draw_lt(layout, context):
+    cscene = context.scene.cycles
+
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_lt_blur", text="ぼかし(px)")
+    row.prop(cscene, "falcon_lt_gain", text="ゲイン")
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_lt_visibility", text="可視性 (遮蔽/ガラス越し除去)")
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_lt_direct", text="直接光の床も撒く (明るさ較正用)")
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_lt_guide_tiles", text="発射誘導")
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_lt_world", text="ワールド光子 (影の中の埋め込みコースティクス)")
+    col.operator("cycles.falcon_lighttrace_render", icon='RENDER_STILL')
+    # 生パスが残っていれば、ゲイン/ぼかし変更は再レンダー不要で反映できる
+    col.operator("cycles.falcon_lt_recomposite", icon='FILE_REFRESH')
+
+
+def _falcon_draw_culling(layout, context):
+    scene = context.scene
+
+    col = layout.column(align=True)
+    col.operator("cycles.falcon_auto_cull", icon='CAMERA_DATA')
+    col.operator("cycles.falcon_auto_cull_verify", icon='CHECKMARK')
+    col.operator("cycles.falcon_auto_cull_clear", icon='X')
+
+    # 現状の適用数を表示
+    n = sum(1 for ob in scene.objects
+            if getattr(ob.cycles, "use_camera_cull", False))
+    if n:
+        col.label(text="カリング中: %d 個" % n, icon='CHECKMARK')
+        if not (scene.render.use_simplify and scene.cycles.use_camera_cull):
+            col.label(text="簡略化+カメラカリングがOFF (無効状態)", icon='ERROR')
+    col.label(text="対象は反射/GI/影からも消える点に注意", icon='INFO')
+
+
+def _falcon_draw_temporal(layout, context):
+
+    cscene = context.scene.cycles
+
+    col = layout.column(align=True)
+    col.operator("cycles.falcon_temporal_setup",
+                 text="除去用の素材を自動保存する", icon='NODE_COMPOSITING')
+    col.label(text="レンダー後 tools/falcon_temporal.py で適用", icon='INFO')
+
+    # DLSSの履歴は「別視点の実フレーム」からしか育たない=冷えた1枚目とカット直後だけ
+    # ノイズが多い。手前を捨て焼きして埋める。
+    if cscene.use_denoising and cscene.denoiser == 'DLSS':
+        col = layout.column(align=True)
+        col.separator()
+        col.prop(cscene, "denoising_warmup_frames", text="ウォームアップ枚数")
+        col.operator("cycles.falcon_warmup_render",
+                     text="ウォームアップ付きレンダー", icon='RENDER_ANIMATION')
+
+
+def _falcon_draw_sharc(layout, context):
+    cscene = context.scene.cycles
+    mode = cscene.falcon_sharc_mode
+
+    col = layout.column()
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(cscene, "falcon_sharc_mode", text="モード")
+
+    sub = col.column()
+    sub.active = mode != 'OFF'
+    sub.prop(cscene, "falcon_sharc_alpha", text="ブレンド", slider=True)
+    if mode in {'BLEND', 'LIVE'}:
+        sub.prop(cscene, "falcon_sharc_gate", text="自動GIゲート")
+        if cscene.falcon_sharc_gate:
+            gate = sub.row(align=True)
+            gate.prop(cscene, "falcon_sharc_gate_low", text="ゲート下限")
+            gate.prop(cscene, "falcon_sharc_gate_high", text="上限")
+    if mode == 'LIVE':
+        sub.prop(cscene, "falcon_sharc_keep", text="履歴保持", slider=True)
+    sub.prop(cscene, "falcon_sharc_cache", text="キャッシュ")
+
+    if mode == 'WARMUP':
+        layout.label(text="高sppで一度レンダー後、Blendに切替", icon='INFO')
+    elif mode == 'BLEND':
+        # 実測(2026-07-02): OIDN併用のfinalでは全ブレンド量で悪化(cellバイアス)。
+        if cscene.use_denoising:
+            layout.label(text="Blend+デノイズはfinalで逆効果 — Live(ビューポート)推奨", icon='ERROR')
+        else:
+            layout.label(text="デノイズ無しのGI重シーン向け", icon='INFO')
+    elif mode == 'LIVE':
+        layout.label(text="ビューポート専用: カメラ静止中にGIが収束し続ける", icon='INFO')
+        if not (cscene.use_preview_denoising and cscene.preview_denoising_use_gpu):
+            layout.label(text="「ビューポート高速化」併用で効果大", icon='ERROR')
+
+
+def _falcon_draw_header_preset(layout):
+    # 走っているのが再ビルド後のバイナリか、ここで即分かるようにする。
+    # (GUIを開いたまま再ビルドしても中身は入れ替わらないので、見分けがつかず
+    #  「直したのに変わらない」で何度も時間を溶かした)
+    # 時刻はバイナリの更新時刻。bpy.app.build_time はUTCで、壁時計と9時間
+    # ずれて読み違えるため使わない。
+    import bpy
+    import os
+    import time
+
+    h = bpy.app.build_hash
+    if isinstance(h, bytes):
+        h = h.decode(errors="replace")
+    try:
+        stamp = time.strftime("%m/%d %H:%M",
+                              time.localtime(os.path.getmtime(bpy.app.binary_path)))
+    except OSError:
+        stamp = "?"
+    layout.label(text="%s  %s" % (h[:9], stamp))
+
+
+# --- 機能ごとの見出しと中身。ここが唯一の正本で、下の4組(レンダープロパティ /
+#     その「詳細」の下 / N パネル / N パネルの「詳細」の下)が全部これを指す。
+class _FalconPresets:
+    bl_label = "用途プリセット"
+
+    def draw(self, context):
+        _falcon_draw_presets(self.layout, context)
+
+
+class _FalconPhoton:
+    bl_label = "コースティクス (Photon)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_photon(self.layout, context)
+
+
+class _FalconLT:
+    bl_label = "ライトトレース (LT・FQ静止画)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_lt(self.layout, context)
+
+
+class _FalconCulling:
+    bl_label = "自動カリング (シーン痩身)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_culling(self.layout, context)
+
+
+class _FalconTemporal:
+    bl_label = "アニメのちらつき除去 (Temporal)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_temporal(self.layout, context)
+
+
+class _FalconSharc:
+    bl_label = "SHARC キャッシュ (実験的)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_sharc(self.layout, context)
+
+
+# --- レンダープロパティ側(Blender の作法どおりの置き場) --------------------
 class CYCLES_RENDER_PT_falcon(CyclesButtonsPanel, Panel):
     bl_label = "CyclesF"
     bl_order = 1000  # 本家パネル群より後ろ=レンダープロパティの一番下に置く
 
     def draw_header_preset(self, context):
-        # 走っているのが再ビルド後のバイナリか、ここで即分かるようにする。
-        # (GUIを開いたまま再ビルドしても中身は入れ替わらないので、見分けがつかず
-        #  「直したのに変わらない」で何度も時間を溶かした)
-        # 時刻はバイナリの更新時刻。bpy.app.build_time はUTCで、壁時計と9時間
-        # ずれて読み違えるため使わない。
-        import bpy
-        import os
-        import time
-
-        h = bpy.app.build_hash
-        if isinstance(h, bytes):
-            h = h.decode(errors="replace")
-        try:
-            stamp = time.strftime("%m/%d %H:%M",
-                                  time.localtime(os.path.getmtime(bpy.app.binary_path)))
-        except OSError:
-            stamp = "?"
-        self.layout.label(text="%s  %s" % (h[:9], stamp))
+        _falcon_draw_header_preset(self.layout)
 
     def draw(self, context):
-        import os as _os
-        from . import operators as _fops
-        layout = self.layout
-        cscene = context.scene.cycles
-        prefs = context.preferences.addons[__package__].preferences
-
-        # 状態は「異常な時だけ喋る」。正常時はGPUの1行のみ。
-        col = layout.column(align=True)
-        gpu_on = (cscene.device == 'GPU' and prefs.compute_device_type != 'NONE' and
-                  prefs.has_active_device())
-        if gpu_on:
-            col.label(text="GPU: %s" % prefs.compute_device_type, icon='CHECKMARK')
+        if _falcon_simple_panel(context):
+            _falcon_draw_simple(self.layout, context)
         else:
-            col.label(text="CPUレンダー中 — デバイスをGPUコンピュートに", icon='ERROR')
-        if not (cscene.use_denoising and cscene.denoising_use_gpu):
-            col.label(text="最終デノイズがGPUではない (下のプリセットで解決)", icon='ERROR')
-        if not (cscene.use_preview_denoising and cscene.preview_denoising_use_gpu):
-            col.label(text="ビューポートデノイズ OFF", icon='INFO')
-        if cscene.falcon_sharc_mode != 'OFF':
-            col.label(text="SHARC: %s" % cscene.falcon_sharc_mode, icon='OUTLINER_OB_LIGHT')
+            _falcon_draw_classic(self.layout, context)
 
-        # --- コースティクス自動化(Octane式: ガラス+ライトを置くだけで出す) ---
-        # レシピ知識ゼロで使える一本道。触りたい人向けの細部は下の子パネルに温存。
-        if cscene.falcon_auto_caustics == 'AUTO':
-            box = layout.box()
-            hdr = box.row(align=True)
-            hdr.label(text="コースティクス", icon='LIGHT_AREA')
-            hdr.prop(cscene, "falcon_auto_caustics", text="")
-            if _fops._falcon_caustics_active():
-                r = box.row(align=True)
-                r.label(text="有効 — レンダーに集光が出ます", icon='CHECKMARK')
-                r.operator("cycles.falcon_photon_clear", text="", icon='X')
-                # 強さは焼き直し不要の render-time ノブ(点マップ gain の env を更新)
-                box.prop(cscene, "falcon_photon_point_gain", text="強さ", slider=True)
-            elif _fops._falcon_scene_has_caustics(context.scene):
-                box.label(text="ガラス+ライトを検出", icon='CHECKMARK')
-                box.operator("cycles.falcon_auto_caustics", icon='SHADERFX')
-            else:
-                # 空状態=「最初の一手」を案内(黙って無反応にしない)
-                box.label(text="ガラス/屈折とライトを置くと出せます", icon='INFO')
-            # 清書コースティクス(LT): フォトンと別経路の仕上げ。検出時は常に選べる。
-            if _fops._falcon_scene_has_caustics(context.scene):
-                sub = box.column(align=True)
-                sub.operator("cycles.falcon_lt_clean_caustics",
-                             text="清書コースティクス (LT・数分)", icon='RENDER_STILL')
-                risk = _fops._falcon_lt_flood_risk(context.scene)
-                if risk:
-                    sub.label(text=risk, icon='ERROR')
-        else:
-            # OFF でも戻す導線を1行だけ残す(見つかる/Discoverability)
-            layout.prop(cscene, "falcon_auto_caustics", text="コースティクス自動化")
 
+class CYCLES_RENDER_PT_falcon_advanced(CyclesButtonsPanel, Panel):
+    """簡単表示の時だけ出る受け皿。今までの子パネルはここへそのまま移る。"""
+    bl_label = "詳細"
+    bl_parent_id = "CYCLES_RENDER_PT_falcon"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return CyclesButtonsPanel.poll(context) and _falcon_simple_panel(context)
+
+    def draw(self, context):
+        _falcon_draw_status(self.layout, context)
+
+
+class FalconClassicChild:
+    """簡単表示が OFF の時だけ出る子(=今までの並び)。"""
+    bl_parent_id = "CYCLES_RENDER_PT_falcon"
+
+    @classmethod
+    def poll(cls, context):
+        return CyclesButtonsPanel.poll(context) and not _falcon_simple_panel(context)
+
+
+class FalconAdvancedChild:
+    """簡単表示が ON の時だけ出る子。「詳細」の下に置いた同じ子の写しで、
+    描画は同じ関数を呼ぶ(中身が二重管理にならない)。"""
+    bl_parent_id = "CYCLES_RENDER_PT_falcon_advanced"
+
+    @classmethod
+    def poll(cls, context):
+        return CyclesButtonsPanel.poll(context) and _falcon_simple_panel(context)
 
 
 # --- CyclesF 親は「状態」だけのダッシュボードに絞り、用途プリセット/各機能は
 #     すべて下の折りたたみ子パネルへ分解した(旧: 1枚べた書きで塊すぎた)。
-#     子パネルは bl_parent_id を差し替えるだけで別タブへ移設できる設計。
-class CYCLES_RENDER_PT_falcon_presets(CyclesButtonsPanel, Panel):
-    bl_label = "用途プリセット"
-    bl_parent_id = "CYCLES_RENDER_PT_falcon"
-
-    def draw(self, context):
-        layout = self.layout
-        col = layout.column(align=True)
-        col.operator("cycles.falcon_near_realtime",
-                     text="ビューポート高速化", icon='SHADERFX')
-        col.operator("cycles.falcon_still_quality",
-                     text="静止画 高品質", icon='RENDER_STILL')
-        col.operator("cycles.falcon_final_quality",
-                     text="アニメーション用", icon='RENDER_ANIMATION')
+class CYCLES_RENDER_PT_falcon_presets(_FalconPresets, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
 
 
-class CYCLES_RENDER_PT_falcon_photon(CyclesButtonsPanel, Panel):
-    bl_label = "コースティクス (Photon)"
-    bl_parent_id = "CYCLES_RENDER_PT_falcon"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        import os as _os
-        layout = self.layout
-        cscene = context.scene.cycles
-
-        col = layout.column(align=True)
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_photon_photons", text="光子数")
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_photon_cell", text="セル")
-        row.prop(cscene, "falcon_photon_dispersion", text="分散")
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_photon_gpu", text="GPU (速い)")
-        row.prop(cscene, "falcon_photon_point", text="点マップ")
-        if cscene.falcon_photon_gpu:
-            # The blur width is asked for in pixels and measured out in the
-            # scene, so it reads the same whether it ends up as a lookup radius
-            # (point map) or a cell size (grid).
-            row = col.row(align=True)
-            row.prop(cscene, "falcon_photon_point_radius_auto", text="半径を自動")
-            if cscene.falcon_photon_point_radius_auto:
-                row.prop(cscene, "falcon_photon_point_radius_px", text="画素")
-            row = col.row(align=True)
-            sub = row.row()
-            sub.active = not cscene.falcon_photon_point_radius_auto
-            if cscene.falcon_photon_point:
-                sub.prop(cscene, "falcon_photon_point_radius", text="半径(m)")
-                row.prop(cscene, "falcon_photon_point_gain", text="ゲイン")
-            else:
-                sub.prop(cscene, "falcon_photon_cell", text="セル(m)")
-                row.prop(cscene, "falcon_photon_radius", text="広がり")
-            if cscene.falcon_photon_point:
-                row = col.row(align=True)
-                row.prop(cscene, "falcon_photon_point_maxpts", text="点上限")
-                row.prop(cscene, "falcon_photon_point_normal_deg", text="法線角(度)")
-        else:
-            row = col.row(align=True)
-            row.prop(cscene, "falcon_photon_radius", text="滑らかさ")
-        col.operator("cycles.falcon_photon_bake", icon='LIGHT_SUN')
-        # Runs in a separate background process (safe against the Vulkan
-        # viewport crash); confirmation dialog picks once/per-frame bake.
-        col.operator("cycles.falcon_bake_and_render_range",
-                     icon='RENDER_ANIMATION')
-        if _os.environ.get("FALCON_PHOTON_MODE") == "add":
-            r = col.row(align=True)
-            if _os.environ.get("FALCON_PHOTON_POINTS"):
-                r.label(text="合成: 有効 (点マップ)", icon='CHECKMARK')
-            else:
-                r.label(text="合成: 有効", icon='CHECKMARK')
-            r.operator("cycles.falcon_photon_clear", text="", icon='X')
+class CYCLES_RENDER_PT_falcon_photon(_FalconPhoton, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
 
 
-class CYCLES_RENDER_PT_falcon_lt(CyclesButtonsPanel, Panel):
-    bl_label = "ライトトレース (LT・FQ静止画)"
-    bl_parent_id = "CYCLES_RENDER_PT_falcon"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        cscene = context.scene.cycles
-
-        col = layout.column(align=True)
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_lt_blur", text="ぼかし(px)")
-        row.prop(cscene, "falcon_lt_gain", text="ゲイン")
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_lt_visibility", text="可視性 (遮蔽/ガラス越し除去)")
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_lt_direct", text="直接光の床も撒く (明るさ較正用)")
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_lt_guide_tiles", text="発射誘導")
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_lt_world", text="ワールド光子 (影の中の埋め込みコースティクス)")
-        col.operator("cycles.falcon_lighttrace_render", icon='RENDER_STILL')
-        # 生パスが残っていれば、ゲイン/ぼかし変更は再レンダー不要で反映できる
-        col.operator("cycles.falcon_lt_recomposite", icon='FILE_REFRESH')
+class CYCLES_RENDER_PT_falcon_lt(_FalconLT, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
 
 
-class CYCLES_RENDER_PT_falcon_culling(CyclesButtonsPanel, Panel):
-    bl_label = "自動カリング (シーン痩身)"
-    bl_parent_id = "CYCLES_RENDER_PT_falcon"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        scene = context.scene
-
-        col = layout.column(align=True)
-        col.operator("cycles.falcon_auto_cull", icon='CAMERA_DATA')
-        col.operator("cycles.falcon_auto_cull_verify", icon='CHECKMARK')
-        col.operator("cycles.falcon_auto_cull_clear", icon='X')
-
-        # 現状の適用数を表示
-        n = sum(1 for ob in scene.objects
-                if getattr(ob.cycles, "use_camera_cull", False))
-        if n:
-            col.label(text="カリング中: %d 個" % n, icon='CHECKMARK')
-            if not (scene.render.use_simplify and scene.cycles.use_camera_cull):
-                col.label(text="簡略化+カメラカリングがOFF (無効状態)", icon='ERROR')
-        col.label(text="対象は反射/GI/影からも消える点に注意", icon='INFO')
+class CYCLES_RENDER_PT_falcon_culling(_FalconCulling, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
 
 
-class CYCLES_RENDER_PT_falcon_temporal(CyclesButtonsPanel, Panel):
-    bl_label = "アニメのちらつき除去 (Temporal)"
-    bl_parent_id = "CYCLES_RENDER_PT_falcon"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-
-        cscene = context.scene.cycles
-
-        col = layout.column(align=True)
-        col.operator("cycles.falcon_temporal_setup",
-                     text="除去用の素材を自動保存する", icon='NODE_COMPOSITING')
-        col.label(text="レンダー後 tools/falcon_temporal.py で適用", icon='INFO')
-
-        # DLSSの履歴は「別視点の実フレーム」からしか育たない=冷えた1枚目とカット直後だけ
-        # ノイズが多い。手前を捨て焼きして埋める。
-        if cscene.use_denoising and cscene.denoiser == 'DLSS':
-            col = layout.column(align=True)
-            col.separator()
-            col.prop(cscene, "denoising_warmup_frames", text="ウォームアップ枚数")
-            col.operator("cycles.falcon_warmup_render",
-                         text="ウォームアップ付きレンダー", icon='RENDER_ANIMATION')
+class CYCLES_RENDER_PT_falcon_temporal(_FalconTemporal, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
 
 
-class CYCLES_RENDER_PT_falcon_sharc(CyclesButtonsPanel, Panel):
-    bl_label = "SHARC キャッシュ (実験的)"
-    bl_parent_id = "CYCLES_RENDER_PT_falcon"
-    bl_options = {'DEFAULT_CLOSED'}
+class CYCLES_RENDER_PT_falcon_sharc(_FalconSharc, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
 
-    def draw(self, context):
-        layout = self.layout
-        cscene = context.scene.cycles
-        mode = cscene.falcon_sharc_mode
 
-        col = layout.column()
-        col.use_property_split = True
-        col.use_property_decorate = False
-        col.prop(cscene, "falcon_sharc_mode", text="モード")
+# --- 「詳細」の下へ移した同じ子の写し(簡単表示の時だけ出る) ----------------
+#     bl_parent_id は登録時に決まるので、旗で親を付け替えることはできない。
+#     ⇒ 親違いの写しを両方登録し、poll でどちらか一方だけを出す。
+class CYCLES_RENDER_PT_falcon_adv_presets(_FalconPresets, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
 
-        sub = col.column()
-        sub.active = mode != 'OFF'
-        sub.prop(cscene, "falcon_sharc_alpha", text="ブレンド", slider=True)
-        if mode in {'BLEND', 'LIVE'}:
-            sub.prop(cscene, "falcon_sharc_gate", text="自動GIゲート")
-            if cscene.falcon_sharc_gate:
-                gate = sub.row(align=True)
-                gate.prop(cscene, "falcon_sharc_gate_low", text="ゲート下限")
-                gate.prop(cscene, "falcon_sharc_gate_high", text="上限")
-        if mode == 'LIVE':
-            sub.prop(cscene, "falcon_sharc_keep", text="履歴保持", slider=True)
-        sub.prop(cscene, "falcon_sharc_cache", text="キャッシュ")
 
-        if mode == 'WARMUP':
-            layout.label(text="高sppで一度レンダー後、Blendに切替", icon='INFO')
-        elif mode == 'BLEND':
-            # 実測(2026-07-02): OIDN併用のfinalでは全ブレンド量で悪化(cellバイアス)。
-            if cscene.use_denoising:
-                layout.label(text="Blend+デノイズはfinalで逆効果 — Live(ビューポート)推奨", icon='ERROR')
-            else:
-                layout.label(text="デノイズ無しのGI重シーン向け", icon='INFO')
-        elif mode == 'LIVE':
-            layout.label(text="ビューポート専用: カメラ静止中にGIが収束し続ける", icon='INFO')
-            if not (cscene.use_preview_denoising and cscene.preview_denoising_use_gpu):
-                layout.label(text="「ビューポート高速化」併用で効果大", icon='ERROR')
+class CYCLES_RENDER_PT_falcon_adv_photon(_FalconPhoton, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_adv_lt(_FalconLT, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_adv_culling(_FalconCulling, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_adv_temporal(_FalconTemporal, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_adv_sharc(_FalconSharc, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
 
 
 # --- CyclesF をビューポートのサイドバー(N パネル)にも出す ------------------
@@ -2933,10 +3109,10 @@ class CYCLES_RENDER_PT_falcon_sharc(CyclesButtonsPanel, Panel):
 # = 3Dビューポートの N パネルの「Falcon」タブ(falcon_dropmovie アドオンが作っている)。
 #
 # ★**移すのでなく、両方に出す。**レンダープロパティ側は Blender の作法どおりの置き場で、
-#   消すと他の記述や手の記憶と食い違う。描く中身は下の各クラスの draw() をそのまま
-#   使い回すので、二重管理にはならない(片方だけ直る事故が起きない)。
+#   消すと他の記述や手の記憶と食い違う。描く中身は上の _falcon_draw_* を呼ぶだけなので、
+#   二重管理にはならない(片方だけ直る事故が起きない)。
 class FalconSidebarPanel:
-    """N パネルの Falcon タブへ出すための土台。描画は親クラスのものを使う。"""
+    """N パネルの Falcon タブへ出すための土台。描画は同じ関数を呼ぶ。"""
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Falcon"
@@ -2949,39 +3125,95 @@ class FalconSidebarPanel:
         return context.engine in cls.COMPAT_ENGINES
 
 
-class VIEW3D_PT_falcon_cyclesf(FalconSidebarPanel, CYCLES_RENDER_PT_falcon, Panel):
+class FalconSidebarClassicChild(FalconSidebarPanel):
+    """簡単表示が OFF の時だけ出るサイドバーの子(=今までの並び)。"""
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.engine in cls.COMPAT_ENGINES
+                and not _falcon_simple_panel(context))
+
+
+class FalconSidebarAdvancedChild(FalconSidebarPanel):
+    """簡単表示が ON の時だけ出るサイドバーの子(「詳細」の下)。"""
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf_advanced"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.engine in cls.COMPAT_ENGINES
+                and _falcon_simple_panel(context))
+
+
+class VIEW3D_PT_falcon_cyclesf(FalconSidebarPanel, Panel):
     bl_label = "CyclesF"
     bl_order = 100
 
+    def draw_header_preset(self, context):
+        _falcon_draw_header_preset(self.layout)
 
-class VIEW3D_PT_falcon_cyclesf_photon(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_photon, Panel):
-    bl_label = "コースティクス (Photon)"
+    def draw(self, context):
+        if _falcon_simple_panel(context):
+            _falcon_draw_simple(self.layout, context)
+        else:
+            _falcon_draw_classic(self.layout, context)
+
+
+class VIEW3D_PT_falcon_cyclesf_advanced(FalconSidebarAdvancedChild, Panel):
+    bl_label = "詳細"
     bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_status(self.layout, context)
 
 
-class VIEW3D_PT_falcon_cyclesf_lt(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_lt, Panel):
-    bl_label = "ライトトレース (LT・FQ静止画)"
-    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+class VIEW3D_PT_falcon_cyclesf_photon(_FalconPhoton, FalconSidebarClassicChild, Panel):
+    pass
 
 
-class VIEW3D_PT_falcon_cyclesf_presets(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_presets, Panel):
-    bl_label = "用途プリセット"
-    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+class VIEW3D_PT_falcon_cyclesf_lt(_FalconLT, FalconSidebarClassicChild, Panel):
+    pass
 
 
-class VIEW3D_PT_falcon_cyclesf_culling(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_culling, Panel):
-    bl_label = "自動カリング (シーン痩身)"
-    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+class VIEW3D_PT_falcon_cyclesf_presets(_FalconPresets, FalconSidebarClassicChild, Panel):
+    pass
 
 
-class VIEW3D_PT_falcon_cyclesf_temporal(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_temporal, Panel):
-    bl_label = "アニメのちらつき除去 (Temporal)"
-    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+class VIEW3D_PT_falcon_cyclesf_culling(_FalconCulling, FalconSidebarClassicChild, Panel):
+    pass
 
 
-class VIEW3D_PT_falcon_cyclesf_sharc(FalconSidebarPanel, CYCLES_RENDER_PT_falcon_sharc, Panel):
-    bl_label = "SHARC キャッシュ (実験的)"
-    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+class VIEW3D_PT_falcon_cyclesf_temporal(_FalconTemporal, FalconSidebarClassicChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_sharc(_FalconSharc, FalconSidebarClassicChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_presets(_FalconPresets, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_photon(_FalconPhoton, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_lt(_FalconLT, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_culling(_FalconCulling, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_temporal(_FalconTemporal, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_sharc(_FalconSharc, FalconSidebarAdvancedChild, Panel):
+    pass
 
 
 classes = (
@@ -2996,7 +3228,23 @@ classes = (
     CYCLES_RENDER_PT_falcon_culling,
     CYCLES_RENDER_PT_falcon_temporal,
     CYCLES_RENDER_PT_falcon_sharc,
+    # 簡単表示(falcon_simple_panel=True)の時だけ poll が通る組。
+    # 既定 False では1枚も出ないので、見た目は今までと同じ。
+    CYCLES_RENDER_PT_falcon_advanced,
+    CYCLES_RENDER_PT_falcon_adv_presets,
+    CYCLES_RENDER_PT_falcon_adv_photon,
+    CYCLES_RENDER_PT_falcon_adv_lt,
+    CYCLES_RENDER_PT_falcon_adv_culling,
+    CYCLES_RENDER_PT_falcon_adv_temporal,
+    CYCLES_RENDER_PT_falcon_adv_sharc,
     VIEW3D_PT_falcon_cyclesf,
+    VIEW3D_PT_falcon_cyclesf_advanced,
+    VIEW3D_PT_falcon_cyclesf_adv_presets,
+    VIEW3D_PT_falcon_cyclesf_adv_photon,
+    VIEW3D_PT_falcon_cyclesf_adv_lt,
+    VIEW3D_PT_falcon_cyclesf_adv_culling,
+    VIEW3D_PT_falcon_cyclesf_adv_temporal,
+    VIEW3D_PT_falcon_cyclesf_adv_sharc,
     VIEW3D_PT_falcon_cyclesf_presets,
     VIEW3D_PT_falcon_cyclesf_photon,
     VIEW3D_PT_falcon_cyclesf_lt,
