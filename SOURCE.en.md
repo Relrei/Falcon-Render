@@ -7,17 +7,17 @@ this build** (whether it was paid or free). For the exact license text, the bund
 
 ## The corresponding source
 
-- Base: Blender `v5.2.0` (`fbe6228777e`)
+- Base: Blender `v5.2.1` (`9e2066aef7e`)
 - Modified parts: the above with the Falcon commits layered on top
-- The commit of this build: `5eb3ab668e4`
+- The commit of this build: `5a1ade52865`
 
 ## How to get it
 
-**`falcon-render-v0.3-beta-src.tar.xz` is placed in the same location as this build.**
+**`falcon-render-v0.4-src.tar.xz` is placed in the same location as this build.**
 Anyone who downloaded the build can get that as well.
 
 ```bash
-tar xf falcon-render-v0.3-beta-src.tar.xz
+tar xf falcon-render-v0.4-src.tar.xz
 ```
 
 The contents are a snapshot at the time of the build. The commit history from development is not
@@ -45,6 +45,8 @@ cmake -G Ninja \
   -DCYCLES_CUDA_BINARIES_ARCH=sm_86 \
   -DOPTIX_ROOT_DIR=<path to the OptiX SDK> \
   -DWITH_FALCON_SHARC=ON \
+  -DFALCON_BUILD_FLAVOR=release \
+  -DFALCON_DIST=ON \
   ..
 ninja -j6
 ```
@@ -59,7 +61,7 @@ ninja -j6
 **https://github.com/Relrei/blender-cyclesf-falcon**
 
 The source corresponding to this build is available either from the bundled
-`falcon-render-v0.3-beta-src.tar.xz` or from the **`v0.3-beta` tag** on GitHub —
+`falcon-render-v0.4-src.tar.xz` or from the **`v0.4` tag** on GitHub —
 they are the same tree.
 
 The source is public because it should be, not because GPL forces a minimum:

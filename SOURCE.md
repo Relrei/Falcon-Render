@@ -7,17 +7,17 @@ Blender は GNU GPL なので、**このビルドに対応するソースコー�
 
 ## 対応するソース
 
-- ベース: Blender `v5.2.0` (`fbe6228777e`)
+- ベース: Blender `v5.2.1` (`9e2066aef7e`)
 - 改変部分: 上記に Falcon 系のコミットを重ねたもの
-- このビルドのコミット: `5eb3ab668e4`
+- このビルドのコミット: `5a1ade52865`
 
 ## 入手方法
 
-**このビルドと同じ場所に `falcon-render-v0.3-beta-src.tar.xz` を置いてあります。**
+**このビルドと同じ場所に `falcon-render-v0.4-src.tar.xz` を置いてあります。**
 ビルドをダウンロードした人は、誰でもそちらも取得できます。
 
 ```bash
-tar xf falcon-render-v0.3-beta-src.tar.xz
+tar xf falcon-render-v0.4-src.tar.xz
 ```
 
 中身はビルド時点のスナップショットです。開発中のコミット履歴は含みません
@@ -34,8 +34,8 @@ git submodule update --init --checkout lib/linux_x64
 
 **https://github.com/Relrei/blender-cyclesf-falcon**
 
-このビルドに対応するソースは、同梱の `falcon-render-v0.3-beta-src.tar.xz` と
-**タグ `v0.3-beta`**(GitHub)のどちらでも同じものが取れます。
+このビルドに対応するソースは、同梱の `falcon-render-v0.4-src.tar.xz` と
+**タグ `v0.4`**(GitHub)のどちらでも同じものが取れます。
 
 ソースを公開しているのは、GPL が最低限そう求めているからではありません
 (GPL が求めるのは**バイナリを受け取った人へ渡すこと**だけです)。
@@ -56,11 +56,16 @@ cmake -G Ninja \
   -DCYCLES_CUDA_BINARIES_ARCH=sm_86 \
   -DOPTIX_ROOT_DIR=<OptiX SDK のパス> \
   -DWITH_FALCON_SHARC=ON \
+  -DFALCON_BUILD_FLAVOR=release \
+  -DFALCON_DIST=ON \
   ..
 ninja -j6
 ```
 
 - `-DWITH_FALCON_SHARC=ON` が要ります(既定 OFF)
+- `-DFALCON_DIST=ON` を付けると `Falcon Render v0.4` と名乗ります。
+  付けない場合は版を名乗らない `Falcon Render`(開発者の手元の最新)になります
+- `-DFALCON_BUILD_FLAVOR=release` は GPU の実験機能をビルドから外します(配布物はこちら)
 - CUDA カーネルを触った場合は `touch intern/cycles/kernel/device/cuda/kernel.cu` してから
   ビルドしないと再コンパイルされません
 - 並列数は 6 程度に抑えてください(それ以上はメモリを使い切ります)

@@ -1,19 +1,33 @@
-# Falcon Render v0.3 beta
+# Falcon Render v0.4
 
 *[日本語版はこちら / Japanese version](README.md)*
 
-A rendering-focused build based on Blender 5.2.0 LTS. It changes the caustics
-computation and the speed of preview rendering. Target environment: Linux x86_64 / NVIDIA GPU.
+A modified build based on Blender 5.2.1 LTS. It changes the caustics computation and
+the speed of preview rendering, and **v0.4 adds changes to video editing (the VSE)**.
+Target environment: Linux x86_64 / NVIDIA GPU.
 
-Version shown at startup: `Falcon Render (5.2LTS)`
-(the part in parentheses is the version of Blender it is built on. The product version number is not part of the display name. It is separate from the version number of the distribution package)
+Version shown at startup: `Falcon Render v0.4`
 
 ---
 
 ## About this release (demo version, free)
 
-**v0.3 beta is a demo version distributed free of charge. There are no feature restrictions.**
+**v0.4 is a demo version distributed free of charge. There are no feature restrictions.**
 Everything listed under "Differences from the standard build" below is usable in this package.
+
+**How to read the name (settled 2026-09-01)**
+
+- **`Falcon Render v0.4`** = this package. **Cut out and adjusted for distribution**
+- **`Falcon Render`** (no version number) = the developer's own latest, moving in real time. Not distributed
+
+So **a version number means it is a distributed build.** The bundled `FALCON_FLAVOR` file
+records the build kind (`release`) and the list of experimental GPU features compiled in.
+**In a distributed build that list is always empty.**
+
+Features still being moved to the GPU (sculpt brushes on the GPU, sculpt-draw welding,
+the order engine's dedicated mode) are **not present in the build at all** — setting
+environment variables will not enable them. The order of work is
+**personal use → separated build → paid release**, and **GPU processing is a paid-release feature**.
 
 Later releases are planned to be distributed for a fee. The form will be **older versions free,
 the latest version paid**, and because it is distributed under the same GPL as Blender,
@@ -21,11 +35,43 @@ the latest version paid**, and because it is distributed under the same GPL as B
 
 ---
 
-## Changes in v0.3
+## Changes in v0.4
+
+**This release is about video editing (the VSE).** Details and measured numbers are in
+[RELEASE_NOTES_v0.4.md](RELEASE_NOTES_v0.4.md).
+
+| | What changed | Effect |
+|---|---|---|
+| **Cut-only export** | Streams packets through with no decode/encode (fast path) | FHD **6.8x** / WQHD **9.5x** |
+| **Playback** | Prefetching decode | **5.6x** (52.2 → 9.40ms per frame) |
+| **Color correction** | Rewritten so auto-vectorization applies | **3.8x** (pixels identical to before) |
+| **Preview** | Strip modifiers run at preview resolution | **13x** at 25% |
+| **Video export** | GPU encoding (NVENC) on by default; falls back to CPU if it cannot open | — |
+| **Memory** | Releases caches when the machine runs low on free memory | peak **2450 → 1443MB** |
+| **Sequence saving** | Saving overlaps with rendering | EXR **230 → 42ms** |
+
+Render side:
+
+- **Base moved to Blender 5.2.1 LTS** (v0.3 was 5.2.0 LTS)
+- **Camera culling follows the Render Region** (it used to ignore the region and compare
+  against the whole frame). ⚠ A light outside the region is culled together with its
+  lighting. Nothing changes at the default margin
+- **Vulkan: no longer crashes when GPU memory allocation fails**
+- Viewport GPU memory is evicted during final renders (on by default)
+
+### Display name
+
+This package shows **`Falcon Render v0.4`** at startup.
+**A version number means it is a distributed build** (see "About this release" above).
+
+<details>
+<summary>Changes in v0.3 (history)</summary>
+
+### Changes in v0.3
 
 This is a fix-centered update. **It includes the bug that made GPU rendering unusable in v0.2.**
 
-### ★Fixed the bug that made GPU rendering unusable in the distributed package
+#### ★Fixed the bug that made GPU rendering unusable in the distributed package
 
 The v0.2 package was missing 2 headers required to assemble the GPU kernel.
 The GPU kernel reads and compiles its source at run time, so **the build and the CPU
@@ -34,7 +80,7 @@ render both succeed, and only the GPU render fails**. If you could not use v0.2 
 To stop this from happening again, we built a check into the packaging procedure that verifies
 the kernel is self-contained using only the distributed source.
 
-### Closed 3 issues triggerable by opening someone else's `.blend`
+#### Closed 3 issues triggerable by opening someone else's `.blend`
 
 Settings specific to this build that are written in a `.blend` were used as-is, without validation at load time.
 
@@ -49,7 +95,7 @@ Settings specific to this build that are written in a `.blend` were used as-is, 
 We also added an inspector that lists what will be executed and the values specific to this build,
 so you can look before opening someone else's file.
 
-### A "target face count" for remeshing
+#### A "target face count" for remeshing
 
 - You can now specify the face count directly (it hits the target in 1 pass from the projected area)
 - When combined with adaptivity, it iterates to approach the target
@@ -57,7 +103,7 @@ so you can look before opening someone else's file.
 - **Fixed UVs and vertex colors being lost**
 - If the target is too large, it does not run at all instead of warning (because it would never return)
 
-### Faster sculpt drawing (welding on by default)
+#### Faster sculpt drawing (welding on by default)
 
 Vertices at the same position are now merged before being sent to the GPU. This is on by default.
 
@@ -70,7 +116,7 @@ Vertices at the same position are now merged before being sent to the GPU. This 
 Under conditions where merging is not possible — flat shading, face sets, UV texture display and
 so on — it automatically falls back to the previous behavior. `FALCON_DRAW_WELD=0` turns it off.
 
-### Caustics fixes
+#### Caustics fixes
 
 - The sun is now shot as a "disk" (it used to bake the sun as a point light)
 - Point lights, area lights (ellipse, spread) and spots (radius, edge falloff) now each shoot photons with the correct shape
@@ -82,9 +128,12 @@ so on — it automatically falls back to the previous behavior. `FALCON_DRAW_WEL
 - Stopped light tracing from also adding the full amount to the back side of the receiver surface
 - **Fixed light tracing brightening the whole image uniformly when a light is given a size**
 
-### Display name
+#### Display name
 
 The startup display is now `Falcon Render (5.2LTS)` (the part in parentheses is the version of Blender it is built on).
+
+
+</details>
 
 ---
 
@@ -101,7 +150,14 @@ The startup display is now `Falcon Render (5.2LTS)` (the part in parentheses is 
 | LT recompositing | The intensity and blur of the caustics layer can be readjusted in 0.1 seconds (previously this required re-running the render, 197 seconds) |
 | DLSS-RR | NVIDIA's denoiser. Conditions apply (see below). Suppresses flicker in animation |
 | Remesh target face count | Runs voxel remeshing with a directly specified face count. Can be combined with adaptivity |
-| Welding of duplicate vertices in sculpt drawing | Merges vertices at the same position before sending them to the GPU. On by default (`FALCON_DRAW_WELD=0` turns it off) |
+| **VSE fast path** | Cut-only exports pass through without re-encoding. FHD 6.8x / WQHD 9.5x |
+| **VSE prefetching decode** | Playback 5.6x (52.2ms → 9.40ms per frame) |
+| **Faster VSE color correction** | 3.8x. Output pixels identical to before |
+| **VSE preview downscale** | Strip modifiers run at preview resolution. 13x at 25% |
+| **GPU video encoding** | NVENC. Combinations it cannot open fall back to CPU automatically |
+| **VSE memory-pressure release** | Drops caches when free memory runs low. Peak 2450 → 1443MB |
+| **Overlapped saving** | Hides save latency in sequence exports. EXR 230 → 42ms |
+| **Render Region culling** | Camera culling follows the Render Region |
 
 ---
 
@@ -117,8 +173,8 @@ There are 9 such settings and 61 panel strings. Translating them is on the list;
 ## Installation
 
 ```bash
-tar xf falcon-render-v0.3-beta-linux-x86_64.tar.xz
-cd falcon-render-v0.3-beta-linux-x86_64
+tar xf falcon-render-v0.4-linux-x86_64.tar.xz
+cd falcon-render-v0.4-linux-x86_64
 ./falcon-render.sh
 ```
 
@@ -141,7 +197,8 @@ launch script sets the following 2 things.
 DLSS-RR is an optional feature that can be used only when the environment requirements are met,
 and it is **disabled by default**. All the other features work without DLSS.
 
-**This package does not bundle the DLSS runtime library** (same as v0.2).
+**This package does not bundle the DLSS runtime library** (the same as every release since v0.1).
+Not one byte of NVIDIA code is in the package; the contents are counted right before the archive is made.
 Because the Linux version of DLSS is designed so that the driver loads only signed libraries,
 DLSS appears in the denoiser options only when you place a legitimately obtained
 `libnvidia-ngx-dlssd.so` directly in the extracted directory.
@@ -152,7 +209,7 @@ DLSS appears in the denoiser options only when you place a legitimately obtained
 > and approved beforehand, §6.2(c)).
 > **We will not bundle it until those 2 are done.**
 
-DLSS 4.5 RR is expected to be officially integrated in Blender 5.3 (planned for autumn 2026)
+DLSS RR is expected to be officially integrated in Blender 5.3 (planned for 2026-11-10)
 (a patch has already been submitted from NVIDIA to upstream). Once integrated, this procedure will not be needed.
 **However, as of 2026-08-12 it is not yet in the 5.3.0 Alpha (`main.8eb257c2b2df`).**
 We confirmed that the denoiser options are only OptiX and OpenImageDenoise, and that no

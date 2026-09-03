@@ -48,6 +48,24 @@ The normal path is unchanged (the caustics output for the same scene matches byt
   The pixel index of a photon path is "the photon's emission index", so writing it scatters the value across the whole frame
 - **After the fix**: the all-pixel pedestal went from +0.078 to **−0.0009**. The control regions are 0.996–1.000 relative to the reference
 
+## [v0.4] Video editing (VSE)
+
+Properties of the v0.4 VSE speedups that are **known and deliberately kept**.
+
+- **Only the copied ranges of a fast-path export are bit-identical.** The joins are
+  re-encoded, so their image quality differs from the source (roughly crf 16). The copied
+  ranges match the source bit for bit (verified on 240 of 240 frames).
+- **Fast-path output is slightly larger** than a normal export, because copied ranges keep
+  the source bitrate.
+- **The fast path silently falls back to the normal export when its conditions do not hold**:
+  the output codec differs from the source, variable frame rate, interlaced, rotation
+  metadata, HDR, or any effect or modifier applied. **Falling back is not a failure.**
+- **DNxHD export can fail.** This happens in **stock Blender 5.2 as well** — an existing
+  upstream bug, unrelated to GPU encoding.
+- **With camera culling following the Render Region, a light outside the region is culled
+  together with its lighting.** Nothing changes at the default margin (1.0), so existing
+  files are unaffected. It can be turned off in the panel (Simplify > Culling).
+
 ## Unresolved
 
 - With **glass that interpenetrates the receiver surface**, the glass body itself becomes excessively
@@ -125,5 +143,5 @@ This repository is for build distribution and documentation, and does not contai
 the Cycles / DLSS-RR integration that actually performs the rendering (see [SOURCE.en.md](SOURCE.en.md)
 for details). Investigating the cause of this problem and fixing the implementation therefore has to be
 done on the side of the separate (local) repository created by extracting
-`falcon-render-v0.3-beta-src.tar.xz`. On this repository side, we only record the symptoms and track
+`falcon-render-v0.4-src.tar.xz`. On this repository side, we only record the symptoms and track
 the state of the isolation work.
