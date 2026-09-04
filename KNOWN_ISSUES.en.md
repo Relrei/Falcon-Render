@@ -66,12 +66,14 @@ Properties of the v0.4 VSE speedups that are **known and deliberately kept**.
   together with its lighting.** Nothing changes at the default margin (1.0), so existing
   files are unaffected. It can be turned off in the panel (Simplify > Culling).
 
-## [v0.4] DLSS-RR: the first frame after a camera switch is grainy (2026-09-04, diagnosed, fix in progress)
+## [v0.4] DLSS-RR: the first frame after a camera switch is grainy (2026-09-04, **fixed in the dev build**, ships with the next release)
 
 - **Symptom**: in sequence renders, only the frames where a camera-bound marker switches the view (e.g. 603 / 812 / 966) keep grainy noise; it recovers within 1–2 frames. The first frame is weakly affected too
 - **Cause**: DLSS-RR's temporal history becomes invalid at the switch, so that frame has one frame of accumulation. The same frames also re-create the NGX feature, so they are slow (20–37 s vs a 3.5 s median)
 - **VSE / NVENC export is not involved** (the output PNG already has it)
-- **Planned fix**: on the switch frame, run DLSS several times on the same inputs to warm the history (no re-render). A render option "pre-render at camera switch" will appear when the scene has 2+ cameras and camera-bound markers
+- **Actual cause (found 12:1x)**: camera-switch detection **never ran in final renders** — background renders rebuild `BlenderSession` per frame, and the previous camera was kept in a non-static member, so it always read "no switch". The viewport reuses the session, which is why it looked fine there
+- **Fix** (`3fac0c4680a`): switch state is process-global; on a cut (camera-bound marker / transform jump) the stale history is dropped. Tree frame 812: hf 0.0458 (1.88× its neighbours) → **0.0241 (0.96×)**, zero extra cost. The option "pre-render at camera switch" appears when the scene has 2+ cameras and camera-bound markers (default ON)
+- ⚠ Re-running DLSS on the same inputs **does not work**: grain goes but brightness halves and takes 5 frames to recover (`FALCON_DLSS_CUT_WARMUP` ≥2 kept as an experiment knob)
 - **Reference numbers (FHD 32 spp, 1391 frames overnight)**: DLSS's extra cost is **almost entirely one-time initialisation** (+12–25 s on frame 1, 2–3 s from frame 2 on). A single-still benchmark makes DLSS look slow; in sequences it is in OIDN's band. Quality on this scene: OIDN wins in every band (RMSE 0.0121 vs 0.0149), so the current rule is **OIDN for final output, DLSS when time matters**
 
 ## Unresolved
