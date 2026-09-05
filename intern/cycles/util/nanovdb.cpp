@@ -9,6 +9,9 @@
 #  include "util/log.h"
 #  include "util/openvdb.h"
 
+#  include <cstdlib>
+#  include <cstring>
+
 #  include <openvdb/tools/Activate.h>
 
 #  include <nanovdb/util/ForEach.h>
@@ -190,6 +193,66 @@ openvdb::MaskGrid::Ptr nanovdb_to_openvdb_mask(const nanovdb::GridHandle<> &hand
   return op.mask_grid;
 }
 
+/* Falcon: 箱を求めるためだけの OpenVDB マスク作り直しを飛ばす。
+ *
+ * 既定 (volume_biased=False) では境界メッシュは箱の6面しか作らないのに、その箱を求めるために
+ * 毎コマ全グリッドを NanoVDB -> OpenVDB マスクへ戻して和を取り、活性ボクセルの bbox を
+ * 評価していた。この段だけが解像度に対して res^2.74 で伸びる (2026-09-04 実測)。
+ * NanoVDB は同じ bbox を自分のヘッダに持っているので、そこから読む。
+ *
+ * ⚠ ただし bbox は StatsMode::Disable では書かれない (GridStats.h: Disable は即 return し、
+ *   葉の mBBoxDif は 0 のまま、根の mBBox は空)。openvdb_to_nanovdb 側で StatsMode::BBox を
+ *   選ばせる必要がある。 */
+
+bool falcon_volume_bbox_fast()
+{
+  /* 空文字は「未設定」でなく「有効」。無効にするのは明示的な "0" だけ。 */
+  const char *value = getenv("FALCON_VOLUME_BBOX_FAST");
+  return value ? strcmp(value, "0") != 0 : true;
+}
+
+struct NanoBBoxOp {
+  openvdb::CoordBBox bbox;
+  openvdb::math::Transform::Ptr transform;
+
+  template<typename NanoBuildT> bool operator()(const nanovdb::NanoGrid<NanoBuildT> &grid)
+  {
+    /* 変換の組み立ては NanoToOpenVDBMask::operator() と同一。ここがずれると頂点がずれる。 */
+    const nanovdb::GridData *grid_data = reinterpret_cast<const nanovdb::GridData *>(&grid);
+    const nanovdb::Map &nanoMap = grid_data->mMap;
+    auto mat = openvdb::math::Mat4<double>::identity();
+    mat.setMat3(openvdb::math::Mat3<double>(nanoMap.mMatD));
+    mat = mat.transpose(); /* The 3x3 in nanovdb is transposed relative to openvdb's 3x3. */
+    mat.setTranslation(openvdb::math::Vec3<double>(nanoMap.mVecD));
+    transform = openvdb::math::Transform::createLinearTransform(mat);
+
+    /* nanovdb の CoordBBox は max が内包 (inclusive)。openvdb の
+     * evalActiveVoxelBoundingBox と同じ約束。空のグリッドでは min>max の反転した箱が返り、
+     * openvdb::CoordBBox::empty() が真になる。
+     * Grid::indexBBox() はこの版ではコメントアウトされているので GridData 側から読む。 */
+    const nanovdb::CoordBBox &nb = grid_data->indexBBox();
+    bbox = openvdb::CoordBBox(openvdb::Coord(nb.min()[0], nb.min()[1], nb.min()[2]),
+                              openvdb::Coord(nb.max()[0], nb.max()[1], nb.max()[2]));
+    return true;
+  }
+};
+
+bool nanovdb_grid_bbox_and_transform(const nanovdb::GridHandle<> &handle,
+                                     openvdb::CoordBBox &bbox,
+                                     openvdb::math::Transform::Ptr &transform)
+{
+  NanoBBoxOp op;
+  if (!nanovdb_grid_type_operation(handle, op)) {
+    return false;
+  }
+  if (!op.transform) {
+    return false;
+  }
+  bbox = op.bbox;
+  transform = op.transform;
+  return true;
+}
+
 /* Convert OpenVDB to NanoVDB grid. */
 
 struct ToNanoOp {
@@ -218,18 +281,22 @@ struct ToNanoOp {
       using nanovdb::StatsMode;
 #    endif
 
+      /* Falcon: StatsMode::Disable だと活性ボクセルの bbox が書かれない (葉の mBBoxDif が 0 の
+       * まま、根の mBBox は空)。BBox は最小・最大の統計を取らず bbox だけ埋めるので、
+       * 葉あたり 64語の走査で済む。これが nanovdb_grid_bbox_and_transform の前提。 */
+      const StatsMode stats_mode = falcon_volume_bbox_fast() ? StatsMode::BBox :
+                                                               StatsMode::Disable;
+      (void)stats_mode; /* 速度グリッド (Vec3f) の実体化では使われない。 */
       if constexpr (std::is_same_v<GridType, openvdb::FloatGrid>) {
         typename GridType::ConstPtr floatgrid = apply_clipping<GridType>(grid);
         if (precision == 0) {
-          nanogrid = createNanoGrid<openvdb::FloatGrid, nanovdb::FpN>(*floatgrid,
-                                                                      StatsMode::Disable);
+          nanogrid = createNanoGrid<openvdb::FloatGrid, nanovdb::FpN>(*floatgrid, stats_mode);
         }
         else if (precision == 16) {
-          nanogrid = createNanoGrid<openvdb::FloatGrid, nanovdb::Fp16>(*floatgrid,
-                                                                       StatsMode::Disable);
+          nanogrid = createNanoGrid<openvdb::FloatGrid, nanovdb::Fp16>(*floatgrid, stats_mode);
         }
         else {
-          nanogrid = createNanoGrid<openvdb::FloatGrid, float>(*floatgrid, StatsMode::Disable);
+          nanogrid = createNanoGrid<openvdb::FloatGrid, float>(*floatgrid, stats_mode);
         }
       }
       else if constexpr (std::is_same_v<GridType, openvdb::Vec3fGrid>) {
@@ -241,8 +308,7 @@ struct ToNanoOp {
       }
       else if constexpr (std::is_same_v<GridType, openvdb::Vec4fGrid>) {
         typename GridType::ConstPtr floatgrid = apply_clipping<GridType>(grid);
-        nanogrid = createNanoGrid<openvdb::Vec4fGrid, nanovdb::Vec4f>(*floatgrid,
-                                                                      StatsMode::Disable);
+        nanogrid = createNanoGrid<openvdb::Vec4fGrid, nanovdb::Vec4f>(*floatgrid, stats_mode);
       }
 #  else
       /* OpenVDB 10. */

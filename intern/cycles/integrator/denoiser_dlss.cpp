@@ -1045,6 +1045,45 @@ bool DLSSDenoiser::denoise_run(const DenoiseContext &context, const DenoisePass 
     pending_reset_ = false;
   }
 
+  /* ★Cut warm-up (2026-09-04). A cut throws the temporal history away, so RR
+   * reconstructs that frame from a history one evaluation deep. Measured on the
+   * tree film: hf (3x3 box residual, RMS) 0.0212 on ordinary frames and 0.0458
+   * on frame 812, back to 0.0230 one frame later; the same at 966 and, weakly,
+   * at 603 and 0.
+   *
+   * The idea this knob implements: RR's history is its own *output*, not the
+   * noisy input it was handed, so handing it the very same inputs again should
+   * deepen the history without rendering anything -- the second evaluation
+   * filtering against the first one's result. It costs one evaluate each (a few
+   * ms) instead of a re-render.
+   *
+   * ★It does not work, and the default is 1 (= off) because of it. Measured on
+   * frames 700..816 of the tree film, x4 gets the high-frequency residual of
+   * the cut frame right (0.02521, 1.05x its neighbours) but the picture comes
+   * out at *half* the brightness -- mean 0.0834 where the shot settles at 0.169
+   * -- and climbs back over five frames (0.137/0.148/0.149/0.151). One
+   * evaluation (this knob at 1) is correct on both counts on the same frames:
+   * hf 0.02413 (0.96x its neighbours) and mean 0.1621 from the first frame.
+   * Repeating the evaluate loses energy; it is left here as a measured dead end
+   * and an experiment knob, not as a default.
+   *
+   * FALCON_DLSS_CUT_WARMUP: 0 = do not even detect the cut (the behaviour
+   * before 2026-09-04, see BlenderSession::clear_denoiser_history_on_cut), 1 =
+   * detect it and drop the history, N>1 = also run the evaluate N times. The
+   * scene switch "カメラ切り替え時の事前レンダリング" (DenoiseParams::cut_warmup,
+   * final renders only) gates the whole thing. Pre-roll passes are excluded:
+   * their point is to chain *independent* estimates and they run this path
+   * several times over already. */
+  int num_evaluations = 1;
+  if (is_reset && !preroll_pass_ && params_.cut_warmup) {
+    static const int warmup_count = getenv("FALCON_DLSS_CUT_WARMUP") ?
+                                        atoi(getenv("FALCON_DLSS_CUT_WARMUP")) :
+                                        1;
+    if (warmup_count > 1) {
+      num_evaluations = warmup_count;
+    }
+  }
+
   last_num_samples_ = context.num_samples;
   last_frame_ = frame_;
   params->Set(NVSDK_NGX_Parameter_Reset, is_reset ? 1 : 0);
@@ -1229,16 +1268,53 @@ bool DLSSDenoiser::denoise_run(const DenoiseContext &context, const DenoisePass 
     }
   }
 
-  const NVSDK_NGX_Result result = NVSDK_NGX_CUDA.EvaluateFeature(handle_, params, nullptr);
+  NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
+  for (int i = 0; i < num_evaluations; i++) {
+    if (i > 0) {
+      /* The repeats are the same picture at the same instant: nothing moved, so
+       * the history must not be warped by the inter-frame motion the guiding
+       * preprocess wrote into the motion texture. The scale is the only thing
+       * that can say so per evaluation, and the SDK's own helper drives it, so
+       * zero here means "these vectors are worth nothing this time round".
+       * Reset has to drop to 0 as well or every repeat would throw away what
+       * the previous one just built. */
+      params->Set(NVSDK_NGX_Parameter_Reset, 0);
+      params->Set(NVSDK_NGX_Parameter_MV_Scale_X, 0.0f);
+      params->Set(NVSDK_NGX_Parameter_MV_Scale_Y, 0.0f);
+    }
+    result = NVSDK_NGX_CUDA.EvaluateFeature(handle_, params, nullptr);
+    if (NVSDK_NGX_FAILED(result)) {
+      break;
+    }
+  }
+
+  if (num_evaluations > 1 && NVSDK_NGX_SUCCEED(result)) {
+    fprintf(stderr, "DLSS cut warm-up: frame %d, x%d\n", frame_, num_evaluations);
+    fflush(stderr);
+    /* A warmed history is several evaluations deep on a picture that never
+     * moved, which is the same shape the pre-roll calls poisoned (see the mode
+     * 2 note above): reprojecting it onto the next, moving frame can ghost.
+     * Off by default, because starting the next frame cold only moves the noisy
+     * frame one place along -- which is the thing being fixed here. Measure the
+     * frames after a cut before turning it on: FALCON_DLSS_CUT_WARMUP_POISON=1
+     * makes the frame after a warm-up start cold instead. */
+    static const bool warmup_poison = getenv("FALCON_DLSS_CUT_WARMUP_POISON") ?
+                                          atoi(getenv("FALCON_DLSS_CUT_WARMUP_POISON")) != 0 :
+                                          false;
+    if (warmup_poison) {
+      preroll_history_poisoned_ = true;
+    }
+  }
 
   if (getenv("FALCON_DLSS_DEBUG")) {
     fprintf(stderr,
-            "[dlss] evaluate %dx%d samples=%d reset=%d carry=%d result=%d\n",
+            "[dlss] evaluate %dx%d samples=%d reset=%d carry=%d evals=%d result=%d\n",
             context.buffer_params.width,
             context.buffer_params.height,
             context.num_samples,
             is_reset ? 1 : 0,
             use_carry_history(context) ? 1 : 0,
+            num_evaluations,
             int(result));
   }
 

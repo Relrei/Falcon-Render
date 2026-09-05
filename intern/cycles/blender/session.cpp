@@ -45,6 +45,8 @@ DeviceTypeMask BlenderSession::device_override = DEVICE_MASK_ALL;
 bool BlenderSession::headless = false;
 bool BlenderSession::print_render_stats = false;
 bool BlenderSession::dlss_history_warmed_this_job = false;
+const void *BlenderSession::last_cut_camera_ = nullptr;
+int BlenderSession::last_cut_frame_ = INT_MIN;
 
 BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
                                blender::UserDef &b_userpref,
@@ -360,6 +362,15 @@ void BlenderSession::clear_denoiser_history_on_cut()
                                                       (const void *)b_scene->camera;
   const int cut_frame = b_scene->r.cfra;
 
+  /* The cut state is process-global (see session.h), so a new job has to clear
+   * it or the first frame of this render would be compared against the last
+   * camera of the previous one. The start frame of the range is the same signal
+   * render() uses for dlss_history_warmed_this_job. */
+  if (background && cut_frame == b_scene->r.sfra) {
+    last_cut_camera_ = nullptr;
+    last_cut_frame_ = INT_MIN;
+  }
+
   /* The frame number is what tells DLSS-RR "new frame" from "more samples on
    * the same frame"; this runs once per render/update, before the denoise. */
   session->set_denoiser_frame(cut_frame);
@@ -390,11 +401,34 @@ void BlenderSession::clear_denoiser_history_on_cut()
                           (std::abs(cut_frame - last_cut_frame_) > frame_tolerance) &&
                           (!playing || cut_on_playback);
 
-  if ((last_cut_camera_ != nullptr && cut_camera != last_cut_camera_) || frame_jump) {
+  /* A camera-bound marker switching cameras is the cut we can name exactly, and
+   * acting on it means both dropping the history (it cannot be reprojected
+   * across a cut) and warming it back up (a dropped history leaves the frame
+   * noisy -- that is what the switch pays for). So one switch governs both:
+   * "カメラ切り替え時の事前レンダリング" on the scene, and FALCON_DLSS_CUT_WARMUP
+   * =0 as the revert to the behaviour before 2026-09-04, where the switch was
+   * never even detected in a final render. (1, the default, = detect and drop
+   * the history; >1 additionally repeats the evaluate, which measured worse --
+   * see the cut warm-up note in denoiser_dlss.cpp.)
+   *
+   * ★Not detecting it is not the harmless half of the choice. Measured on
+   * frames 700..816: with the switch undetected the previous shot bleeds into
+   * the new one for five frames (mean 0.246 at the cut against the 0.169 the
+   * shot settles at, still 0.187 five frames later), and the high-frequency
+   * residual reads *low* because a ghost is smooth. The timeline-jump branch is not
+   * gated: it exists to stop the history ghosting across a scrub. */
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+  static const int cut_warmup_env = getenv("FALCON_DLSS_CUT_WARMUP") ?
+                                        atoi(getenv("FALCON_DLSS_CUT_WARMUP")) :
+                                        1;
+  const bool camera_switch = (last_cut_camera_ != nullptr && cut_camera != last_cut_camera_) &&
+                             cut_warmup_env != 0 && get_boolean(cscene, "denoising_cut_warmup");
+
+  if (camera_switch || frame_jump) {
     if (getenv("FALCON_DLSS_DEBUG")) {
       fprintf(stderr, "[cut] -> clear history (camera=%d frame=%d playing=%d)\n",
-              int(last_cut_camera_ != nullptr && cut_camera != last_cut_camera_),
-              int(frame_jump), int(playing));
+              int(camera_switch), int(frame_jump), int(playing));
     }
     session->clear_denoiser_temporal_history();
   }

@@ -111,6 +111,13 @@ class DenoiseParams : public Node {
    * shorter, so it may want a different count). 0 = use preroll_passes. */
   int preroll_passes_cut = 0;
 
+  /* DLSS-RR: warm the history up on the frame that opens a cut (a timeline
+   * marker bound to another camera) instead of handing RR a one-evaluation-deep
+   * history. Only final renders set this -- the viewport resets constantly and
+   * would pay the cost on every navigation step. Off by default in the struct
+   * so a DenoiseParams that nobody filled in cannot switch it on. */
+  bool cut_warmup = false;
+
   static const NodeEnum *get_type_enum();
   static const NodeEnum *get_prefilter_enum();
   static const NodeEnum *get_quality_enum();

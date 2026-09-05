@@ -166,6 +166,26 @@ def show_preview_denoise_active(context):
     return True
 
 
+
+def _has_camera_cuts(context):
+    """カメラが2台以上あり、カメラを束縛したマーカーが1つ以上あるか。
+
+    この2つが揃った時だけ「カメラ切り替え」が起きる = 履歴が捨てられる所がある。
+    """
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return False
+    cams = 0
+    for ob in scene.objects:
+        if ob.type == 'CAMERA':
+            cams += 1
+            if cams >= 2:
+                break
+    if cams < 2:
+        return False
+    return any(m.camera is not None for m in scene.timeline_markers)
+
+
 def show_denoise_active(context):
     cscene = context.scene.cycles
     if not cscene.use_denoising:
@@ -414,6 +434,11 @@ class CYCLES_RENDER_PT_sampling_render_denoise(CyclesButtonsPanel, Panel):
                          text="初回蓄積レンダリング回数")
                 sub.prop(cscene, "denoising_preroll_passes_cut",
                          text="カット時(0=初回と同じ)")
+                # カット(マーカーでカメラが切り替わる所)が実際に有るシーンでだけ出す。
+                # カメラが1台しか無い/束縛マーカーが無いシーンでは効きようがない。
+                if _has_camera_cuts(context):
+                    sub.prop(cscene, "denoising_cut_warmup",
+                             text="カメラ切り替え時の事前レンダリング")
             else:
                 col.label(text="DLSS対応GPUが見つからない", icon='INFO')
 

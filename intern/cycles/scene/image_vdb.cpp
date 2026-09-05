@@ -8,13 +8,27 @@
 #include "util/log.h"
 #include "util/nanovdb.h"
 #include "util/openvdb.h"
+#include "util/time.h"
 #include "util/types_image.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #ifdef WITH_OPENVDB
 #  include <openvdb/tools/Dense.h>
 #endif
 
 CCL_NAMESPACE_BEGIN
+
+/* Falcon: VDB の読み込みが何にかかっているかを段ごとに出す (FALCON_VOLUME_LOAD_TIMING=1)。
+ * 内訳が分からないまま「密な float の往復をやめる」を書くと、実は createNanoGrid が
+ * 支配していた、という外し方をする。 */
+static bool falcon_volume_load_timing()
+{
+  const char *value = getenv("FALCON_VOLUME_LOAD_TIMING");
+  return value && strcmp(value, "0") != 0;
+}
 
 #ifdef WITH_OPENVDB
 VDBImageLoader::VDBImageLoader(openvdb::GridBase::ConstPtr grid_,
@@ -53,7 +67,13 @@ bool VDBImageLoader::load_metadata(ImageMetaData &metadata,
   metadata.channels = openvdb_num_channels(grid);
 
   /* Convert OpenVDB to NanoVDB grid. */
+  const bool timing = falcon_volume_load_timing();
+  const double t_nano = timing ? time_dt() : 0.0;
   nanogrid = openvdb_to_nanovdb(grid, precision, clipping);
+  if (timing) {
+    printf("FALCON_VOLTIME %s openvdb_to_nanovdb %.4f\n", grid_name.c_str(), time_dt() - t_nano);
+    fflush(stdout);
+  }
   if (!nanogrid) {
     grid.reset();
     return false;
@@ -239,6 +259,9 @@ void VDBImageLoader::grid_from_dense_voxels(const size_t width,
                                             Transform transform_3d)
 {
 #ifdef WITH_OPENVDB
+  const bool timing = falcon_volume_load_timing();
+  const double t_dense = timing ? time_dt() : 0.0;
+
   /* TODO: Create NanoVDB grid directly? */
   if (channels == 1) {
     grid = create_grid<openvdb::FloatGrid>(voxels, width, height, depth, transform_3d, clipping);
@@ -248,6 +271,12 @@ void VDBImageLoader::grid_from_dense_voxels(const size_t width,
   }
   else if (channels == 4) {
     grid = create_grid<openvdb::Vec4fGrid>(voxels, width, height, depth, transform_3d, clipping);
+  }
+
+  if (timing) {
+    printf("FALCON_VOLTIME %s copyFromDense(%zux%zux%zu ch%d) %.4f\n",
+           grid_name.c_str(), width, height, depth, channels, time_dt() - t_dense);
+    fflush(stdout);
   }
 
   /* Clipping already applied, no need to do it again. */

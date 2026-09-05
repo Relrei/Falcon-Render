@@ -29,6 +29,11 @@
 
 #include <OpenImageIO/filesystem.h>
 
+#include "util/time.h"
+
+#include <cstdlib>
+#include <cstring>
+
 CCL_NAMESPACE_BEGIN
 
 NODE_DEFINE(Volume)
@@ -153,7 +158,27 @@ class VolumeMeshBuilder {
   openvdb::MaskGrid::Ptr topology_grid;
   bool first_grid;
 
-  VolumeMeshBuilder();
+  /* Falcon: 箱6面しか作らない場合 (ray_marching == false) の速い経路。
+   *
+   * 既定は volume_biased=False なので最後に作るのは箱の6面だけなのに、その箱を求めるためだけに
+   * 毎コマ全グリッドを NanoVDB -> OpenVDB マスクへ戻し、和を取り、膨張させ、活性ボクセルの
+   * bbox を評価していた。この段だけが解像度に対して res^2.74 で伸びる (2026-09-04 実測・
+   * res 48/96/160 で 0.011/0.066/0.299 s、60コマ通しで 0.014 -> 1.083 s)。
+   *
+   * NanoVDB は同じ bbox を自分のヘッダに持っているので、そこから読んで union するだけにする。
+   * 膨張 (dilateActiveValues) は添字空間で pad_size ボクセルの 26近傍を pad_size 回なので、
+   * 箱としては各軸 ±pad_size ちょうど = CoordBBox::expand(pad_size)。
+   *
+   * 変換の違うグリッドが混ざる場合だけは、従来どおり片方を再標本化しないと同じ箱にならないので
+   * fast_failed を立てて呼び出し側に作り直させる (実際には起こらない場合がほとんど)。
+   *
+   * 戻す口: FALCON_VOLUME_BBOX_FAST=0 */
+  bool fast_bbox;
+  bool fast_failed;
+  openvdb::CoordBBox fast_box;
+  openvdb::math::Transform::Ptr fast_transform;
+
+  explicit VolumeMeshBuilder(const bool use_fast_bbox);
 
   void add_grid(const nanovdb::GridHandle<> &grid);
 
@@ -170,15 +195,49 @@ class VolumeMeshBuilder {
   void convert_quads_to_tris(const vector<QuadData> &quads, vector<int> &tris);
 
   bool empty_grid() const;
+
+  /* 頂点を作るのに使う変換。速い経路では NanoVDB のヘッダから組んだもの、
+   * 従来経路ではマスクグリッドのもの。両者は同じ手順で組んである。 */
+  const openvdb::math::Transform &active_transform() const
+  {
+    return fast_bbox ? *fast_transform : topology_grid->transform();
+  }
 };
 
-VolumeMeshBuilder::VolumeMeshBuilder()
+VolumeMeshBuilder::VolumeMeshBuilder(const bool use_fast_bbox)
 {
   first_grid = true;
+  fast_bbox = use_fast_bbox;
+  fast_failed = false;
 }
 
 void VolumeMeshBuilder::add_grid(const nanovdb::GridHandle<> &nanogrid)
 {
+  if (fast_bbox) {
+    openvdb::CoordBBox bbox;
+    openvdb::math::Transform::Ptr transform;
+    if (!nanovdb_grid_bbox_and_transform(nanogrid, bbox, transform)) {
+      fast_failed = true;
+      return;
+    }
+
+    if (first_grid) {
+      fast_transform = transform;
+      fast_box = bbox;
+      first_grid = false;
+      return;
+    }
+
+    if (*fast_transform != *transform) {
+      /* 変換が違う: 従来経路は resampleToMatch で片方を作り直すので、箱だけでは合わせられない。 */
+      fast_failed = true;
+      return;
+    }
+
+    fast_box.expand(bbox);
+    return;
+  }
+
   /* set the transform of our grid from the first one */
   openvdb::MaskGrid::Ptr grid = nanovdb_to_openvdb_mask(nanogrid);
 
@@ -204,6 +263,22 @@ void VolumeMeshBuilder::add_grid(const nanovdb::GridHandle<> &nanogrid)
 
 void VolumeMeshBuilder::add_padding(const int pad_size)
 {
+  if (fast_bbox) {
+    /* 26近傍の膨張を pad_size 回 = 箱としては各軸 ±pad_size。 */
+    int pad = pad_size;
+
+    /* 門をわざと落とすための口 (未設定なら何もしない)。負の値で箱が縮む = 煙が切れる。
+     * 門が本当に効いているかを確かめる時だけ使う。 */
+    if (const char *brk = getenv("FALCON_VOLUME_BBOX_BREAK")) {
+      pad += atoi(brk);
+    }
+
+    if (pad != 0 && !fast_box.empty()) {
+      fast_box.expand(pad);
+    }
+    return;
+  }
+
   openvdb::tools::dilateActiveValues(topology_grid->tree(),
                                      pad_size,
                                      openvdb::tools::NN_FACE_EDGE_VERTEX,
@@ -313,7 +388,8 @@ void VolumeMeshBuilder::generate_vertices_and_quads(vector<ccl::int3> &vertices_
     return;
   }
 
-  openvdb::CoordBBox bbox = topology_grid->evalActiveVoxelBoundingBox();
+  const openvdb::CoordBBox bbox = fast_bbox ? fast_box :
+                                             topology_grid->evalActiveVoxelBoundingBox();
   const int3 min = make_int3(bbox.min().x(), bbox.min().y(), bbox.min().z());
   const int3 max = make_int3(bbox.max().x(), bbox.max().y(), bbox.max().z());
 
@@ -344,8 +420,9 @@ void VolumeMeshBuilder::convert_object_space(const vector<int3> &vertices,
 {
   out_vertices.reserve(vertices.size());
 
+  const openvdb::math::Transform &tfm = active_transform();
   for (size_t i = 0; i < vertices.size(); ++i) {
-    openvdb::math::Vec3d p = topology_grid->indexToWorld(
+    openvdb::math::Vec3d p = tfm.indexToWorld(
         openvdb::math::Vec3d(vertices[i].x, vertices[i].y, vertices[i].z));
     const float3 vertex = make_float3((float)p.x(), (float)p.y(), (float)p.z());
     out_vertices.push_back(vertex);
@@ -358,7 +435,7 @@ void VolumeMeshBuilder::convert_quads_to_tris(const vector<QuadData> &quads, vec
    * will have reversed winding order. Here we compensate for that by flipping the
    * triangle order. */
   const bool negative_scale =
-      topology_grid->transform().baseMap()->getAffineMap()->getMat4().det() < 0.0;
+      active_transform().baseMap()->getAffineMap()->getMat4().det() < 0.0;
 
   int index_offset = 0;
   tris.resize(quads.size() * 6);
@@ -376,6 +453,9 @@ void VolumeMeshBuilder::convert_quads_to_tris(const vector<QuadData> &quads, vec
 
 bool VolumeMeshBuilder::empty_grid() const
 {
+  if (fast_bbox) {
+    return !fast_transform || fast_box.empty();
+  }
   return !topology_grid ||
          (!topology_grid->tree().hasActiveTiles() && topology_grid->tree().leafCount() == 0);
 }
@@ -648,39 +728,65 @@ void GeometryManager::create_volume_mesh(const Scene *scene, Volume *volume, Pro
   }
 
 #if defined(WITH_OPENVDB) && defined(WITH_NANOVDB)
+  const bool ray_marching = scene->integrator->get_volume_ray_marching();
+
+  /* Falcon: 箱6面しか作らない場合は NanoVDB のヘッダの bbox をそのまま使う。
+   * ray_marching では葉ごとの箱が要るので従来どおりマスクを作る。 */
+  const bool want_fast_bbox = !ray_marching && falcon_volume_bbox_fast();
+  const int base_pad_size = pad_size;
+
   /* Create volume mesh builder. */
-  VolumeMeshBuilder builder;
+  VolumeMeshBuilder builder(want_fast_bbox);
 
-  for (Attribute &attr : volume->attributes.attributes) {
-    if (attr.element != ATTR_ELEMENT_VOXEL) {
-      continue;
+  auto add_all_grids = [&]() {
+    pad_size = base_pad_size;
+
+    for (Attribute &attr : volume->attributes.attributes) {
+      if (attr.element != ATTR_ELEMENT_VOXEL) {
+        continue;
+      }
+
+      ImageHandle &handle = attr.data_voxel_for_write();
+
+      if (handle.empty()) {
+        continue;
+      }
+
+      /* Create NanoVDB grid handle from image memory. */
+      device_image *image = handle.vdb_image_memory();
+      if (image == nullptr || image->host_pointer == nullptr ||
+          image->info.data_type == IMAGE_DATA_TYPE_NANOVDB_EMPTY ||
+          !is_nanovdb_type(image->info.data_type))
+      {
+        continue;
+      }
+
+      nanovdb::GridHandle grid(
+          nanovdb::HostBuffer::createFull(image->memory_size(), image->host_pointer));
+
+      /* Add padding based on the maximum velocity vector. */
+      if (attr.std == ATTR_STD_VOLUME_VELOCITY && scene->need_motion() != Scene::MOTION_NONE) {
+        pad_size = max(pad_size,
+                       estimate_required_velocity_padding(grid, volume->get_velocity_scale()));
+      }
+
+      builder.add_grid(grid);
     }
+  };
 
-    ImageHandle &handle = attr.data_voxel_for_write();
+  const char *timing_env = getenv("FALCON_VOLUME_LOAD_TIMING");
+  const bool timing = timing_env && strcmp(timing_env, "0") != 0;
+  const double t_grids = timing ? time_dt() : 0.0;
 
-    if (handle.empty()) {
-      continue;
-    }
+  add_all_grids();
 
-    /* Create NanoVDB grid handle from image memory. */
-    device_image *image = handle.vdb_image_memory();
-    if (image == nullptr || image->host_pointer == nullptr ||
-        image->info.data_type == IMAGE_DATA_TYPE_NANOVDB_EMPTY ||
-        !is_nanovdb_type(image->info.data_type))
-    {
-      continue;
-    }
+  const double t_after_grids = timing ? time_dt() : 0.0;
 
-    nanovdb::GridHandle grid(
-        nanovdb::HostBuffer::createFull(image->memory_size(), image->host_pointer));
-
-    /* Add padding based on the maximum velocity vector. */
-    if (attr.std == ATTR_STD_VOLUME_VELOCITY && scene->need_motion() != Scene::MOTION_NONE) {
-      pad_size = max(pad_size,
-                     estimate_required_velocity_padding(grid, volume->get_velocity_scale()));
-    }
-
-    builder.add_grid(grid);
+  if (builder.fast_failed) {
+    /* 速い経路では合わせられない組み合わせだった。従来の経路で作り直す。 */
+    LOG_DEBUG << "Falcon: 速い bbox 経路を諦めて OpenVDB マスクへ戻した (" << volume->name << ")";
+    builder = VolumeMeshBuilder(false);
+    add_all_grids();
   }
 
   /* If nothing to build, early out. */
@@ -694,8 +800,33 @@ void GeometryManager::create_volume_mesh(const Scene *scene, Volume *volume, Pro
   /* Create mesh. */
   vector<float3> vertices;
   vector<int> indices;
-  const bool ray_marching = scene->integrator->get_volume_ray_marching();
   builder.create_mesh(vertices, indices, ray_marching);
+
+  if (timing) {
+    printf("FALCON_VOLTIME %s volume_mesh fast=%d add_grids %.4f create_mesh %.4f\n",
+           volume->name.c_str(),
+           (int)builder.fast_bbox,
+           t_after_grids - t_grids,
+           time_dt() - t_after_grids);
+    fflush(stdout);
+  }
+
+  /* Falcon: 門 G2 用。作った箱の頂点をそのまま出す (FALCON_VOLUME_MESH_DUMP を立てた時だけ)。 */
+  if (getenv("FALCON_VOLUME_MESH_DUMP")) {
+    string dump = string_printf("FALCON_VOLMESH %s fast=%d nv=%d ntri=%d",
+                                volume->name.c_str(),
+                                (int)builder.fast_bbox,
+                                (int)vertices.size(),
+                                (int)(indices.size() / 3));
+    for (const float3 &v : vertices) {
+      dump += string_printf(" (%.9g,%.9g,%.9g)", (double)v.x, (double)v.y, (double)v.z);
+    }
+    for (const int i : indices) {
+      dump += string_printf(" %d", i);
+    }
+    printf("%s\n", dump.c_str());
+    fflush(stdout);
+  }
 
   volume->resize_mesh(vertices.size(), indices.size() / 3);
   volume->used_shaders.clear();

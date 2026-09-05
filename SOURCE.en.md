@@ -9,15 +9,15 @@ this build** (whether it was paid or free). For the exact license text, the bund
 
 - Base: Blender `v5.2.1` (`9e2066aef7e`)
 - Modified parts: the above with the Falcon commits layered on top
-- The commit of this build: `5a1ade52865`
+- The commit of this build: `957dabbedd93` (public snapshot = tag `v0.4.1`)
 
 ## How to get it
 
-**`falcon-render-v0.4-src.tar.xz` is placed in the same location as this build.**
+**`falcon-render-v0.4.1-src.tar.xz` is placed in the same location as this build.**
 Anyone who downloaded the build can get that as well.
 
 ```bash
-tar xf falcon-render-v0.4-src.tar.xz
+tar xf falcon-render-v0.4.1-src.tar.xz
 ```
 
 The contents are a snapshot at the time of the build. The commit history from development is not
@@ -58,12 +58,11 @@ ninja -j6
 
 ## The source is also public on GitHub
 
-**https://github.com/Relrei/Falcon-Render** (this repo: `main`, tag `v0.4-r2`)
+**https://github.com/Relrei/Falcon-Render** (this repo: `main`, tag `v0.4.1`)
 > 2026-09-04: the source now lives in this same repo (`main` = the snapshot series on Blender 5.2.1). The old `blender-cyclesf-falcon` is archived (read-only, history kept).
 
-
 The source corresponding to this build is available either from the bundled
-`falcon-render-v0.4-src.tar.xz` or from the **`v0.4` tag** on GitHub —
+`falcon-render-v0.4.1-src.tar.xz` or from the **`v0.4.1` tag** on GitHub —
 they are the same tree.
 
 The source is public because it should be, not because GPL forces a minimum:

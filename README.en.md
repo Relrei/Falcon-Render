@@ -1,23 +1,23 @@
-# Falcon Render v0.4
+# Falcon Render v0.4.1
 
 *[日本語版はこちら / Japanese version](README.md)*
 
 A modified build based on Blender 5.2.1 LTS. It changes the caustics computation and
-the speed of preview rendering, and **v0.4 adds changes to video editing (the VSE)**.
+the speed of preview rendering, video editing (VSE, v0.4), and **v0.4.1 makes animation rendering with DLSS Ray Reconstruction practical**.
 Target environment: Linux x86_64 / NVIDIA GPU.
 
-Version shown at startup: `Falcon Render v0.4`
+Version shown at startup: `Falcon Render v0.4.1`
 
 ---
 
 ## About this release (demo version, free)
 
-**v0.4 is a demo version distributed free of charge. There are no feature restrictions.**
+**v0.4.1 is a demo version distributed free of charge. There are no feature restrictions.**
 Everything listed under "Differences from the standard build" below is usable in this package.
 
 **How to read the name (settled 2026-09-01)**
 
-- **`Falcon Render v0.4`** = this package. **Cut out and adjusted for distribution**
+- **`Falcon Render v0.4.1`** = this package. **Cut out and adjusted for distribution**
 - **`Falcon Render`** (no version number) = the developer's own latest, moving in real time. Not distributed
 
 So **a version number means it is a distributed build.** The bundled `FALCON_FLAVOR` file
@@ -34,6 +34,28 @@ the latest version paid**, and because it is distributed under the same GPL as B
 **the source for the version you receive always comes with it**.
 
 ---
+
+## Changes in v0.4.1
+
+**The theme of this release is animation rendering with DLSS-RR (Ray Reconstruction).**
+Details and measurements: [RELEASE_NOTES_v0.4.1.md](RELEASE_NOTES_v0.4.1.md) (Japanese).
+
+| | What | Effect |
+|---|---|---|
+| **Grain right after a camera cut** | Cut detection never fired in final renders; fixed | residual 1.88x of neighbour → **0.96x**, cost 0 s |
+| **Cost of image sequences** | NGX initialisation happens once per job | 1391 frames in **83.6 min** (median 3.51 s/frame) |
+| **Smoke / VDB frames** | Removed the per-frame NanoVDB→OpenVDB bounds rebuild | res160 **−18 to −29%** |
+| **Persistent Data** | On by default | — |
+| **VSE export** | One line in Output properties says whether fast path / GPU encode were used | — |
+| **Launch & UI (Linux)** | On Hyprland / Sway the launcher starts via XWayland (avoids the stuck-Super-key click bug and the 320x240 file browser). First launch only: Resolution Scale 1.25 and File Browser = Maximized Area | revert with `FALCON_FORCE_X11=0` / change in Preferences |
+
+> DLSS binaries are not bundled (same as v0.4). Place a legitimately obtained `libnvidia-ngx-dlssd.so`
+> next to the executable to enable it (see "About DLSS" below).
+> **Single-frame accuracy is better with OIDN** (measured, see the release notes). Choose DLSS-RR for
+> 4K viewport speed and stable image sequences.
+
+<details>
+<summary>Changes in v0.4 (history)</summary>
 
 ## Changes in v0.4
 
@@ -59,9 +81,11 @@ Render side:
 - **Vulkan: no longer crashes when GPU memory allocation fails**
 - Viewport GPU memory is evicted during final renders (on by default)
 
+</details>
+
 ### Display name
 
-This package shows **`Falcon Render v0.4`** at startup.
+This package shows **`Falcon Render v0.4.1`** at startup.
 **A version number means it is a distributed build** (see "About this release" above).
 
 <details>
@@ -173,8 +197,8 @@ There are 9 such settings and 61 panel strings. Translating them is on the list;
 ## Installation
 
 ```bash
-tar xf falcon-render-v0.4-linux-x86_64.tar.xz
-cd falcon-render-v0.4-linux-x86_64
+tar xf falcon-render-v0.4.1-linux-x86_64.tar.xz
+cd falcon-render-v0.4.1-linux-x86_64
 ./falcon-render.sh
 ```
 
@@ -184,6 +208,9 @@ launch script sets the following 2 things.
 - `OPTIX_CACHE_PATH`: if unset, OptiX recompiles 10 MB of PTX on the first render and
   stalls for up to 20 minutes. If you force-quit while it is working, the cache is not saved and the same wait happens again
 - `__NGX_DISABLE_UPDATER=1`: disables the network wait caused by the DLSS update check
+- On Hyprland / Sway / river (wlroots compositors) it **starts via XWayland** (v0.4.1). Native Wayland there can leave the
+  OS key latched so clicks stop working (Blender #161108) and opens the file browser at 320x240 (#162315).
+  `FALCON_FORCE_X11=0 ./falcon-render.sh` forces native Wayland; `FALCON_FORCE_X11=1` forces XWayland on other desktops
 
 ### System requirements
 

@@ -116,8 +116,17 @@ class BlenderSession {
   /* Drop the DLSS-RR history when the frame that follows cannot be reached from
    * the last one by motion vectors (marker camera switch, timeline jump). */
   void clear_denoiser_history_on_cut();
-  const void *last_cut_camera_ = nullptr;
-  int last_cut_frame_ = INT_MIN;
+  /* ★These have to be process-global for the same reason dlss_history_warmed_
+   * this_job is (see its declaration): a background animation render builds a
+   * fresh BlenderSession for every frame, so a per-instance member is back at
+   * its initial value on the frame that opens a cut and the comparison below
+   * can never fire. Measured 2026-09-04: the marker camera switches of the tree
+   * film (603/812/966) were never detected in the final render, so the history
+   * was neither dropped nor warmed there and those frames came out at twice the
+   * high-frequency residual of their neighbours. Reset at the start frame of a
+   * job (see clear_denoiser_history_on_cut). */
+  static const void *last_cut_camera_;
+  static int last_cut_frame_;
 
   /* Viewport: drop the carried history when the camera jumped too far for the motion vectors to
    * explain (see clear_denoiser_history_on_jump). */

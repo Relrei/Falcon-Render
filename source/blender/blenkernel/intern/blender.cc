@@ -159,7 +159,7 @@ static void blender_version_init()
    * 配布の版を上げる時は、下の1行だけ書き換える。ここ以外に文言を増やさないこと。
    * 土台の Blender の版は表示に出さない(.desktop と README に書く)。 */
 #ifdef FALCON_DIST_BUILD
-  const char *kFalconName = "Falcon Render v0.4";
+  const char *kFalconName = "Falcon Render v0.4.1";
 #else
   const char *kFalconName = "Falcon Render";
 #endif

@@ -66,15 +66,28 @@ Properties of the v0.4 VSE speedups that are **known and deliberately kept**.
   together with its lighting.** Nothing changes at the default margin (1.0), so existing
   files are unaffected. It can be turned off in the panel (Simplify > Culling).
 
-## [v0.4] DLSS-RR: the first frame after a camera switch is grainy (2026-09-04, **fixed in the dev build**, ships with the next release)
+## [v0.4] DLSS-RR: grain on the frame right after a camera cut — fixed in v0.4.1
 
-- **Symptom**: in sequence renders, only the frames where a camera-bound marker switches the view (e.g. 603 / 812 / 966) keep grainy noise; it recovers within 1–2 frames. The first frame is weakly affected too
-- **Cause**: DLSS-RR's temporal history becomes invalid at the switch, so that frame has one frame of accumulation. The same frames also re-create the NGX feature, so they are slow (20–37 s vs a 3.5 s median)
-- **VSE / NVENC export is not involved** (the output PNG already has it)
-- **Actual cause (found 12:1x)**: camera-switch detection **never ran in final renders** — background renders rebuild `BlenderSession` per frame, and the previous camera was kept in a non-static member, so it always read "no switch". The viewport reuses the session, which is why it looked fine there
-- **Fix** (`3fac0c4680a`): switch state is process-global; on a cut (camera-bound marker / transform jump) the stale history is dropped. Tree frame 812: hf 0.0458 (1.88× its neighbours) → **0.0241 (0.96×)**, zero extra cost. The option "pre-render at camera switch" appears when the scene has 2+ cameras and camera-bound markers (default ON)
-- ⚠ Re-running DLSS on the same inputs **does not work**: grain goes but brightness halves and takes 5 frames to recover (`FALCON_DLSS_CUT_WARMUP` ≥2 kept as an experiment knob)
-- **Reference numbers (FHD 32 spp, 1391 frames overnight)**: DLSS's extra cost is **almost entirely one-time initialisation** (+12–25 s on frame 1, 2–3 s from frame 2 on). A single-still benchmark makes DLSS look slow; in sequences it is in OIDN's band. Quality on this scene: OIDN wins in every band (RMSE 0.0121 vs 0.0149), so the current rule is **OIDN for final output, DLSS when time matters**
+- **Symptom**: in image-sequence renders only the frame right after a camera switch keeps grain (tree frames 812 / 966 / 603 ...).
+  Re-rendering a short range (5–17 frames) does not reproduce it, which hid the cause
+- **Cause**: the cut detection (`clear_denoiser_history_on_cut()`) compared against a "previous camera" stored on
+  `BlenderSession`, and sequence renders recreate the session per frame, so the comparison was always false =
+  **it never fired in final renders** (the viewport reuses the session, so it worked there)
+- **Fix**: remember the detection per job. Cost 0 s. High-frequency residual at frame 812: 1.88x of the neighbour → 0.96x,
+  brightness at its true value (0.162; a ghost would give 0.246). UI "Pre-render on camera switch" (on by default;
+  shown only in scenes with 2+ cameras and a camera-bound marker). Revert with `FALCON_DLSS_CUT_WARMUP=0`
+- ⚠ Looking at the grain number alone, "no detection (ghost)" looks smoother. Read it together with brightness
+
+## [v0.4.1] Known properties of DLSS-RR that we keep as they are
+
+- **Single-frame accuracy is better with OIDN** (same 32spp, error vs a 256spp reference: tree frame 0 DLSS 0.01492 vs OIDN 0.01212 /
+  frame 700 0.05058 vs 0.03685; classroom points the same way). Choose DLSS-RR for 4K viewport speed and stable sequences
+- **Only the first frame of a job costs +12–25 s** (NGX initialisation). From the second frame on, 2–3 s/frame (FHD 32spp)
+- In the edge band of frame 700 DLSS scores worse than no denoising, but the 256spp reference is itself noisy, so we do not conclude
+- On Linux with wlroots compositors (Hyprland etc.), handing focus to Blender with `SUPER+←` or `SUPER+digit` can leave the
+  **OS key latched so clicks stop working** (upstream Blender #161108 / Hyprland #4478). Press and release Super once to clear it;
+  entering the window with the mouse does not trigger it.
+  **The v0.4.1 `falcon-render.sh` starts via XWayland on wlroots compositors, so it no longer happens from there** (`FALCON_FORCE_X11=0` restores native Wayland)
 
 ## Unresolved
 

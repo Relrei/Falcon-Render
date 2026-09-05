@@ -11,7 +11,12 @@
 #include "blender/util.h"
 
 #include "util/log.h"
+#include "util/time.h"
 #include "util/vector.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "BLI_bounds.hh"
 
@@ -85,9 +90,26 @@ class BlenderSmokeLoader : public VDBImageLoader {
     Transform transform_3d = transform_translate(-texspace_loc - half_voxel) *
                              transform_scale(texspace_size);
 
+    /* Falcon: RNA からの密な float 配列の読み出しだけを分けて測る
+     * (FALCON_VOLUME_LOAD_TIMING=1)。 */
+    const char *timing_env = getenv("FALCON_VOLUME_LOAD_TIMING");
+    const bool timing = timing_env && strcmp(timing_env, "0") != 0;
+    const double t_rna = timing ? time_dt() : 0.0;
+
     vector<float> voxels;
     if (!get_voxels(width, height, depth, channels, voxels)) {
       return;
+    }
+
+    if (timing) {
+      printf("FALCON_VOLTIME %s rna_dense(%zux%zux%zu ch%d) %.4f\n",
+             Attribute::standard_name(attribute),
+             width,
+             height,
+             depth,
+             channels,
+             time_dt() - t_rna);
+      fflush(stdout);
     }
 
     grid_from_dense_voxels(width, height, depth, channels, voxels.data(), transform_3d);

@@ -9,6 +9,9 @@
 #include "BLI_assert.h"
 #include "BLI_utildefines.h"
 
+/* ★色 → 値 の暗黙変換で使う輝度の係数(下の convert() を参照)。 */
+#include "IMB_colormanagement.hh"
+
 namespace blender::nodes::materialx {
 
 NodeItem::NodeItem(MaterialX::GraphElement *graph) : graph_(graph) {}
@@ -568,6 +571,32 @@ NodeItem NodeItem::convert(Type to_type) const
   }
 
   if (to_type == Type::Float) {
+    /* ★Blender の暗黙の型変換に合わせる(2026-09-05・door-mat)。
+     *
+     *   赤(成分 0)だけを取っていたので、赤が強い色ほど大きくずれていた。
+     *   classroom の `varnishedWoodDoor` では茶色の木目 (0.336, 0.081, 0.023) が
+     *   ColorRamp の入力になっており、輝度 0.131 のはずが 0.336 = **2.6 倍**。
+     *   ランプで増幅されて 3.65 倍 → 上書きの overlay を通って**アルベドが 2.02 倍**
+     *   になり、扉が白く飛んでいた(Cycles 0.328 対 Rapid 0.665・実測)。
+     *
+     *   Blender 側の正解:
+     *     色 → 値   … 輝度 `linear_rgb_to_gray()`
+     *                 (`intern/cycles/kernel/svm/convert.h` NODE_CONVERT_CF /
+     *                  GPU は `rgbtobw`。係数は色管理から取る)
+     *     ベクトル → 値 … 3 成分の平均(同 NODE_CONVERT_VF = `average()`) */
+    switch (from_type) {
+      case Type::Color3:
+      case Type::Color4: {
+        float c[3];
+        IMB_colormanagement_get_luminance_coefficients(c);
+        return (*this)[0] * val(c[0]) + (*this)[1] * val(c[1]) + (*this)[2] * val(c[2]);
+      }
+      case Type::Vector3:
+      case Type::Vector4:
+        return ((*this)[0] + (*this)[1] + (*this)[2]) / val(3.0f);
+      default:
+        break;
+    }
     return (*this)[0];
   }
 

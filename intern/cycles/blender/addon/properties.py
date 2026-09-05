@@ -617,6 +617,18 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         "0で「初回と同じ回数」",
         min=0, max=16, default=0,
     )
+    denoising_cut_warmup: BoolProperty(
+        name="カメラ切り替え時の事前レンダリング",
+        description="タイムラインのマーカーでカメラが切り替わるコマを検出して、"
+        "DLSSの時間履歴をそこで作り直す。"
+        "カットの前後はモーションベクタで繋がらないので履歴は引き継げないが、"
+        "最終レンダーではこの切り替わりが検出されておらず、"
+        "前のショットが5コマほど新しいショットに滲んで残っていた"
+        "(実測: カットのコマの明るさ 0.246 / 本来 0.169)。"
+        "OFFで2026-09-04以前の挙動に戻る。"
+        "追加のレンダー時間は無い(デノイザの状態を入れ替えるだけ)",
+        default=True,
+    )
     denoising_warmup_frames: IntProperty(
         name="ウォームアップ枚数",
         description="アニメの開始フレームと各カットの直前に、実フレームをこの枚数だけ焼いて捨てる。"

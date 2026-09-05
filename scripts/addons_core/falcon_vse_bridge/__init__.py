@@ -582,23 +582,79 @@ class FALCON_OT_vse_edit(Operator):
 # UI
 # -----------------------------------------------------------------------------
 
-def _draw_output(self, context):
-    layout = self.layout
+def in_sequencer_context(context):
+    """今の画面に既に Sequencer が居るか。
+
+    ★居るなら「VSE で編集」の**ボタンは出さない** — 本人 (2026-09-04)
+      「VSE に居るのに VSE に共有する項目がなぜかある」。
+      移り先が今居る所と同じなので、押しても何も起きないように見える。
+      足す口そのものは Sequencer の「追加 > レンダー出力」に在る。
+    """
+    screen = getattr(context, "screen", None)
+    if screen is not None:
+        for area in screen.areas:
+            if area.type == 'SEQUENCE_EDITOR':
+                return True
+    workspace = getattr(context, "workspace", None)
+    if workspace is not None and workspace.name == "Video Editing":
+        return True
+    return False
+
+
+def last_export_info(scene):
+    """直近の書き出しで何が効いたか(RNA が C++ 側から読む1行)。
+
+    素の Blender には無いので、その時は空。
+    """
+    render = getattr(scene, "render", None)
+    if render is None:
+        return ""
+    return (getattr(render, "falcon_last_export_info", "") or "").strip()
+
+
+def output_rows(context):
+    """`_draw_output` が出す物の一覧。
+
+    ★描画そのものは門から見えないので、**出す物の決め方をここ1箇所に寄せる**。
+      `("prop", 名前)` / `("label", 文)` / `("separator", None)` /
+      `("operator", bl_idname)`。
+    """
     scene = context.scene
-    layout.separator()
-    layout.use_property_split = False
-    column = layout.column()
-    column.prop(scene, "falcon_output_name")
+    rows = [("prop", "falcon_output_name")]
 
     path = preview_path(scene)
     if path:
-        row = column.row()
-        row.active = False
-        row.label(text=path)
+        rows.append(("label", path))
 
-    column.separator()
-    column.prop(scene, "falcon_vse_share_output")
-    column.operator("falcon.vse_edit", icon='SEQUENCE')
+    rows.append(("separator", None))
+    rows.append(("prop", "falcon_vse_share_output"))
+
+    info = last_export_info(scene)
+    if info:
+        rows.append(("label", info))
+
+    if not in_sequencer_context(context):
+        rows.append(("operator", "falcon.vse_edit"))
+    return rows
+
+
+def _draw_output(self, context):
+    layout = self.layout
+    layout.separator()
+    layout.use_property_split = False
+    column = layout.column()
+    scene = context.scene
+    for kind, value in output_rows(context):
+        if kind == "prop":
+            column.prop(scene, value)
+        elif kind == "label":
+            row = column.row()
+            row.active = False
+            row.label(text=value)
+        elif kind == "separator":
+            column.separator()
+        elif kind == "operator":
+            column.operator(value, icon='SEQUENCE')
 
 
 def _draw_sequencer_add(self, context):

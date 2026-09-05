@@ -36,6 +36,7 @@
 #  include "BLI_string_utf8.h"
 #  include "BLI_utildefines.h"
 
+#  include "BKE_falcon_export_info.hh"
 #  include "BKE_image.hh"
 #  include "BKE_main.hh"
 #  include "BKE_path_templates.hh"
@@ -1152,6 +1153,12 @@ static AVStream *alloc_video_stream(MovieWriter *context,
     context->video_codec = nullptr;
     return nullptr;
   }
+
+  /* ★ここが「GPU で符号化したか」が決まる唯一の所。上の三段(深さ・その符号化器が
+   * 在るか・本当に開くか)のどれで落ちても黙って CPU に戻るので、**決まった後の
+   * 実物の名前**を残す。出力プロパティに1行で出る。 */
+  blender::bke::falcon_export_info_set_encoder(
+      &scene, BLI_str_endswith(codec->name, "_nvenc"), codec->name);
 
   context->video_codec = avcodec_alloc_context3(codec);
   AVCodecContext *c = context->video_codec;

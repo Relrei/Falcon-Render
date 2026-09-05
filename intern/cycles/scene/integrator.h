@@ -163,6 +163,7 @@ class Integrator : public Node {
   NODE_SOCKET_API(bool, denoiser_carry_history);
   NODE_SOCKET_API(int, denoiser_preroll_passes);
   NODE_SOCKET_API(int, denoiser_preroll_passes_cut);
+  NODE_SOCKET_API(bool, denoiser_cut_warmup);
 
 #ifdef WITH_FALCON_SHARC
   /* Falcon knobs. These used to be read straight from the environment inside

@@ -157,6 +157,15 @@ int RenderScheduler::get_dlss_preroll_passes() const
       /* The env var explicitly asked for zero: no pre-roll on cuts at all. */
       return 0;
     }
+    if (denoiser_params_.cut_warmup) {
+      /* ★The cut is already handled on the denoiser side: the warm-up runs RR
+       * several times over the same inputs, which costs a few milliseconds
+       * instead of re-rendering the frame. Falling through to preroll_passes
+       * here would silently add those re-renders on every cut of a film (the
+       * opening frame still gets them -- there is no history there at all).
+       * Set the count above, or FALCON_DLSS_PREROLL_CUT, to ask for both. */
+      return 0;
+    }
   }
 
   const char *env = getenv("FALCON_DLSS_PREROLL");

@@ -36,6 +36,7 @@
 #include "BLI_mutex.hh"
 #include "BLI_rect.h"
 #include "BLI_set.hh"
+#include "BLI_string.h"
 #include "BLI_string_utf8.h"
 #include "BLI_threads.h"
 #include "BLI_time.h"
@@ -50,6 +51,7 @@
 #include "BKE_camera.h"
 #include "BKE_colortools.hh"
 #include "BKE_compositor.hh"
+#include "BKE_falcon_export_info.hh"
 #include "BKE_global.hh"
 #include "BKE_image.hh"
 #include "BKE_image_format.hh"
@@ -2706,6 +2708,25 @@ static void touch_file(const char *filepath)
   }
 }
 
+namespace {
+
+/* 直近の書き出しの「何が効いたか」を溜める。抜け道が多い関数なので、
+ * 掛かった秒だけは RAII で必ず書く(★早い返しが5箇所ある)。 */
+struct FalconExportTimer {
+  const Scene *scene;
+  double start;
+  FalconExportTimer(const Scene *scene_) : scene(scene_), start(BLI_time_now_seconds())
+  {
+    blender::bke::falcon_export_info_begin(scene_);
+  }
+  ~FalconExportTimer()
+  {
+    blender::bke::falcon_export_info_end(scene, BLI_time_now_seconds() - start);
+  }
+};
+
+}  // namespace
+
 void RE_RenderAnim(Render *re,
                    Main *bmain,
                    Scene *scene,
@@ -2715,6 +2736,8 @@ void RE_RenderAnim(Render *re,
                    int efra,
                    int tfra)
 {
+  FalconExportTimer falcon_export_timer(scene);
+
   if (sfra == efra) {
     CLOG_INFO(&LOG, "Rendering single frame");
   }
@@ -2789,6 +2812,12 @@ void RE_RenderAnim(Render *re,
                     fp_report.total_frames,
                     fp_report.copied_frames,
                     fp_report.reencoded_frames);
+        char falcon_detail[128];
+        SNPRINTF(falcon_detail,
+                 "%d cuts, %d frames",
+                 int(cuts.size()),
+                 fp_report.total_frames);
+        blender::bke::falcon_export_info_set_fastpath(scene, true, falcon_detail);
         BKE_image_format_free(&image_format);
         render_pipeline_free(re);
         scene->r.cfra = cfra_old;
@@ -2797,6 +2826,10 @@ void RE_RenderAnim(Render *re,
       }
     }
     CLOG_INFO(&LOG, "Fast path not used: %s", reason);
+    blender::bke::falcon_export_info_set_fastpath(scene, false, reason);
+  }
+  else {
+    blender::bke::falcon_export_info_set_fastpath(scene, false, "動画の書き出しではない");
   }
 
   if (is_movie && do_write_file) {

@@ -591,6 +591,7 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
     integrator->set_denoiser_carry_history(denoise_params.carry_history);
     integrator->set_denoiser_preroll_passes(denoise_params.preroll_passes);
     integrator->set_denoiser_preroll_passes_cut(denoise_params.preroll_passes_cut);
+    integrator->set_denoiser_cut_warmup(denoise_params.cut_warmup);
   }
 
 #ifdef WITH_FALCON_SHARC
@@ -1399,6 +1400,9 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
       denoising.preroll_passes = get_int(cscene, "denoising_preroll_passes");
       /* The same count for the frame that opens each cut; 0 = reuse the above. */
       denoising.preroll_passes_cut = get_int(cscene, "denoising_preroll_passes_cut");
+      /* Warm the RR history up on the frame a camera-bound marker opens (see
+       * BlenderSession::clear_denoiser_history_on_cut). Final renders only. */
+      denoising.cut_warmup = get_boolean(cscene, "denoising_cut_warmup");
 
       switch ((DenoiserDLSSQuality)get_enum(
           cscene, "denoising_upscale_quality", DENOISER_DLSS_MODE_NUM, DENOISER_DLSS_MODE_DLAA))

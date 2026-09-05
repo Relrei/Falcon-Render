@@ -332,6 +332,7 @@ NODE_DEFINE(Integrator)
   SOCKET_BOOLEAN(denoiser_carry_history, "Denoiser Carry History", false);
   SOCKET_INT(denoiser_preroll_passes, "Denoiser Preroll Passes", 4);
   SOCKET_INT(denoiser_preroll_passes_cut, "Denoiser Preroll Passes Cut", 0);
+  SOCKET_BOOLEAN(denoiser_cut_warmup, "Denoiser Cut Warmup", true);
 
 #ifdef WITH_FALCON_SHARC
   /* Falcon knobs, see integrator.h. Defaults repeat the values device_update()
@@ -1523,6 +1524,7 @@ DenoiseParams Integrator::get_denoise_params() const
   denoise_params.carry_history = denoiser_carry_history;
   denoise_params.preroll_passes = denoiser_preroll_passes;
   denoise_params.preroll_passes_cut = denoiser_preroll_passes_cut;
+  denoise_params.cut_warmup = denoiser_cut_warmup;
 
   return denoise_params;
 }

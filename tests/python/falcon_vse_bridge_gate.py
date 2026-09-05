@@ -443,6 +443,83 @@ check("ws/追加メニュー経路でストリップが1本", len(strips(scene))
       "n=%d" % len(strips(scene)))
 
 
+# --- 出力プロパティに何を出すか(本人 2026-09-04「VSE に居るのに VSE に共有する
+#     項目がなぜかある」)----------------------------------------------------
+#
+# ★描画そのものは門から見えないので、`output_rows()` に「何を出すか」を寄せてある。
+#   ここでは偽の context を渡して、その一覧を読む。
+
+class _FakeArea:
+    def __init__(self, area_type):
+        self.type = area_type
+
+
+class _FakeScreen:
+    def __init__(self, types):
+        self.areas = [_FakeArea(t) for t in types]
+
+
+class _FakeWorkspace:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeContext:
+    def __init__(self, scene, types, workspace_name="Layout"):
+        self.scene = scene
+        self.screen = _FakeScreen(types)
+        self.workspace = _FakeWorkspace(workspace_name)
+
+
+def _kinds(rows, kind):
+    return [value for k, value in rows if k == kind]
+
+
+_scene = bpy.context.scene
+
+_rows_plain = _m.output_rows(_FakeContext(_scene, ['VIEW_3D', 'PROPERTIES', 'OUTLINER']))
+check("ui/Sequencer が居ない画面では「VSE で編集」が出る",
+      "falcon.vse_edit" in _kinds(_rows_plain, "operator"),
+      str(_rows_plain))
+
+_rows_vse = _m.output_rows(_FakeContext(_scene, ['SEQUENCE_EDITOR', 'PROPERTIES']))
+check("ui/Sequencer が居る画面では「VSE で編集」を出さない",
+      "falcon.vse_edit" not in _kinds(_rows_vse, "operator"),
+      str(_rows_vse))
+
+_rows_ws = _m.output_rows(
+    _FakeContext(_scene, ['VIEW_3D', 'PROPERTIES'], workspace_name="Video Editing"))
+check("ui/Video Editing のワークスペースでも出さない",
+      "falcon.vse_edit" not in _kinds(_rows_ws, "operator"),
+      str(_rows_ws))
+
+# ★ボタンを消しても、共有そのもののつまみは残っていること。
+check("ui/共有のチェックは Sequencer 側でも残る",
+      "falcon_vse_share_output" in _kinds(_rows_vse, "prop"), str(_rows_vse))
+check("ui/出力名の欄も Sequencer 側で残る",
+      "falcon_output_name" in _kinds(_rows_vse, "prop"), str(_rows_vse))
+
+# 直近の書き出しの1行(Falcon の版だけ)。ここまでで動画を書き出している。
+_HAS_INFO = hasattr(_scene.render, "falcon_last_export_info")
+if _HAS_INFO:
+    _info = _m.last_export_info(_scene)
+    check("ui/直近の書き出しの1行が空でない", bool(_info), repr(_info))
+    check("ui/その1行が出力プロパティに並ぶ",
+          _info in _kinds(_rows_plain, "label"), repr(_info))
+
+# 壊し門: 1行が空なら label は出ない(出しっぱなしになっていないこと)。
+_saved_last_export_info = _m.last_export_info
+_m.last_export_info = lambda scene: ""
+try:
+    _rows_empty = _m.output_rows(_FakeContext(_scene, ['VIEW_3D']))
+finally:
+    _m.last_export_info = _saved_last_export_info
+check("ui/1行が空なら label を出さない",
+      len(_kinds(_rows_empty, "label")) == len(_kinds(_rows_plain, "label")) - (1 if _HAS_INFO else 0),
+      str(_rows_empty))
+
+
+
 # --- 結果 -------------------------------------------------------------------
 
 print()
